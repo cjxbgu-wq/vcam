@@ -1,6 +1,7 @@
 #import "GPUImageProcessor.h"
 #import <CoreImage/CoreImage.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <dlfcn.h>
 
 // 手动声明 VideoToolbox 类型和函数（不依赖 SDK 头文件，避免类型冲突）
 typedef struct OpaqueVTPixelTransferSession *VTPixelTransferSessionRef;
