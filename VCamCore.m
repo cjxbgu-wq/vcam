@@ -1,6 +1,9 @@
 #import "VCamCore.h"
 #import "GPUImageProcessor.h"
 #import "LocalVideoPlayer.h"
+#import <CoreImage/CoreImage.h>
+#import <VideoToolbox/VideoToolbox.h>
+#import <CoreGraphics/CoreGraphics.h>
 
 // 对标 vcameracrack 的 VCamCore
 // 关键改进（基于逆向分析）：

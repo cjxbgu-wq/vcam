@@ -1,4 +1,6 @@
 #import "GPUImageProcessor.h"
+#import <CoreImage/CoreImage.h>
+#import <CoreGraphics/CoreGraphics.h>
 
 // VTPixelRotationSession 私有 API 类型定义
 typedef OSStatus (*VTPixelRotationSessionCreateFunc)(CFAllocatorRef, VTPixelRotationSessionRef *);
