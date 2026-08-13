@@ -1,4 +1,5 @@
 #import "NSQueue.h"
+#import <CoreMedia/CoreMedia.h>
 
 @interface NSQueue ()
 @property (nonatomic, strong) NSRecursiveLock *lock;
