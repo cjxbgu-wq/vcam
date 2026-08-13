@@ -1,0 +1,9 @@
+Package: com.vcam.plus
+Name: VCamPlus
+Version: 1.0.0
+Architecture: iphoneos-arm64e
+Description: VCam camera replacement tweak
+Maintainer: vcam
+Author: vcam
+Section: Tweaks
+Depends: mobilesubstrate

@@ -1,0 +1,13 @@
+.theos/
+*.o
+*.deb
+_reverse_deb/
+extract_deb.py
+analyze_dylib.py
+ssh_exec.py
+download_and_deploy.py
+VCamPlus_latest.deb
+vcam_decoder_log.txt
+vcam_player_log.txt
+vcam_core_log.txt
+vcam_diag.txt
