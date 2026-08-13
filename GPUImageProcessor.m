@@ -2,13 +2,19 @@
 #import <CoreImage/CoreImage.h>
 #import <CoreGraphics/CoreGraphics.h>
 
+// 手动声明 VideoToolbox 类型和函数（不依赖 SDK 头文件，避免类型冲突）
+typedef struct OpaqueVTPixelTransferSession *VTPixelTransferSessionRef;
+typedef struct OpaqueVTPixelRotationSession *VTPixelRotationSessionRef;
+OSStatus VTPixelTransferSessionCreate(CFAllocatorRef, VTPixelTransferSessionRef *);
+OSStatus VTPixelTransferSessionTransferImage(VTPixelTransferSessionRef, CVPixelBufferRef, CVPixelBufferRef);
+
 // VTPixelRotationSession 私有 API 类型定义
 typedef OSStatus (*VTPixelRotationSessionCreateFunc)(CFAllocatorRef, VTPixelRotationSessionRef *);
 typedef OSStatus (*VTPixelRotationSessionTransferImageFunc)(VTPixelRotationSessionRef, CVPixelBufferRef, CVPixelBufferRef);
 
 @interface GPUImageProcessor ()
-@property (nonatomic, assign) VTPixelTransferSessionRef pixelTransferSession;
-@property (nonatomic, assign) VTPixelRotationSessionRef pixelRotationSession;
+@property (nonatomic, assign) CFTypeRef pixelTransferSession;
+@property (nonatomic, assign) CFTypeRef pixelRotationSession;
 @property (nonatomic, strong) CIContext *preprocessContext;
 @property (nonatomic, assign) CVPixelBufferPoolRef bgraBufferPool;
 @property (nonatomic, assign) size_t preprocessWidth;
@@ -43,7 +49,9 @@ typedef OSStatus (*VTPixelRotationSessionTransferImageFunc)(VTPixelRotationSessi
 
 - (void)setupPixelTransferSession {
     if (_pixelTransferSession) return;
-    OSStatus status = VTPixelTransferSessionCreate(kCFAllocatorDefault, &_pixelTransferSession);
+    VTPixelTransferSessionRef session = NULL;
+    OSStatus status = VTPixelTransferSessionCreate(kCFAllocatorDefault, &session);
+    _pixelTransferSession = session;
     if (status == noErr) {
         NSLog(@"[vcam] VTPixelTransferSession created successfully");
     } else {
@@ -64,7 +72,9 @@ typedef OSStatus (*VTPixelRotationSessionTransferImageFunc)(VTPixelRotationSessi
         return;
     }
 
-    OSStatus status = _createRotationSession(kCFAllocatorDefault, &_pixelRotationSession);
+    VTPixelRotationSessionRef rotSession = NULL;
+    OSStatus status = _createRotationSession(kCFAllocatorDefault, &rotSession);
+    _pixelRotationSession = rotSession;
     if (status == noErr) {
         _rotationApiAvailable = YES;
         NSLog(@"[vcam] VTPixelRotationSession created successfully");
@@ -202,7 +212,7 @@ typedef OSStatus (*VTPixelRotationSessionTransferImageFunc)(VTPixelRotationSessi
     if (!src || !dst) return NO;
 
     if (_pixelTransferSession) {
-        OSStatus status = VTPixelTransferSessionTransferImage(_pixelTransferSession, src, dst);
+        OSStatus status = VTPixelTransferSessionTransferImage((VTPixelTransferSessionRef)_pixelTransferSession, src, dst);
         if (status == noErr) return YES;
     }
 

@@ -1,8 +1,10 @@
 #import <Foundation/Foundation.h>
 #import <CoreVideo/CoreVideo.h>
-#import <VideoToolbox/VideoToolbox.h>
 #import <CoreImage/CoreImage.h>
 #import <CoreGraphics/CoreGraphics.h>
+
+// VideoToolbox 类型用 CFTypeRef 避免头文件冲突，.m 中 cast 回具体类型
+// VTPixelTransferSessionRef / VTPixelRotationSessionRef
 
 // 图像处理器：旋转、镜像、缩放、格式转换
 // 对标 vcameracrack 的 GPUImageProcessor
@@ -28,7 +30,7 @@
 
 @property (nonatomic, assign) NSInteger rotationAngle; // 0/90/180/270
 @property (nonatomic, assign) BOOL mirrored;
-@property (nonatomic, readonly) VTPixelTransferSessionRef pixelTransferSession;
-@property (nonatomic, readonly) VTPixelRotationSessionRef pixelRotationSession;
+@property (nonatomic, readonly) CFTypeRef pixelTransferSession;
+@property (nonatomic, readonly) CFTypeRef pixelRotationSession;
 
 @end

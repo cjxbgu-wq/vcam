@@ -2,9 +2,12 @@
 #import "GPUImageProcessor.h"
 #import "LocalVideoPlayer.h"
 #import <CoreImage/CoreImage.h>
-#import <VideoToolbox/VideoToolbox.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <CoreVideo/CoreVideo.h>
+
+// 手动声明 VideoToolbox 类型和函数
+typedef struct OpaqueVTPixelTransferSession *VTPixelTransferSessionRef;
+OSStatus VTPixelTransferSessionTransferImage(VTPixelTransferSessionRef, CVPixelBufferRef, CVPixelBufferRef);
 
 // 对标 vcameracrack 的 VCamCore
 // 关键改进（基于逆向分析）：
@@ -291,7 +294,7 @@ static void vcam_core_log(NSString *msg) {
                                 CVPixelBufferCreate(kCFAllocatorDefault, w, h, strongSelf.targetFormat, NULL, &strongSelf.preallocYUV420fBuffer);
                             }
 
-                            VTPixelTransferSessionRef prerenderXferSession = strongSelf.gpuProcessor.pixelTransferSession;
+                            VTPixelTransferSessionRef prerenderXferSession = (VTPixelTransferSessionRef)strongSelf.gpuProcessor.pixelTransferSession;
                             if (strongSelf.preallocYUV420fBuffer && prerenderXferSession) {
                                 OSStatus xferStatus = VTPixelTransferSessionTransferImage(
                                     prerenderXferSession,
@@ -424,7 +427,7 @@ static void vcam_core_log(NSString *msg) {
     }
 
     // 路径 2：格式不匹配 → VTPixelTransferSession 转换（BGRA→YUV）
-    VTPixelTransferSessionRef xferSession = _gpuProcessor.pixelTransferSession;
+    VTPixelTransferSessionRef xferSession = (VTPixelTransferSessionRef)_gpuProcessor.pixelTransferSession;
     if (repFormat == kCVPixelFormatType_32BGRA && xferSession) {
         OSStatus xferStatus = VTPixelTransferSessionTransferImage(
             xferSession, prerendered, origPixelBuffer);
