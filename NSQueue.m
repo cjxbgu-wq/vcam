@@ -1,114 +1,179 @@
+//
+//  NSQueue.m
+//  VCamPlus
+//
+//  对标 vcameracrack.dylib 的 NSQueue 实现
+//  关键点：NSRecursiveLock + 双模式 + currentFrame 缓存
+//
+
 #import "NSQueue.h"
-#import <CoreMedia/CoreMedia.h>
+
+// mediaserverd 中 NSLog 不可见，用文件日志
+static volatile int32_t vcamQueueLogCount = 0;
+static void vcam_queue_log(NSString *msg) {
+    int32_t n = __sync_add_and_fetch(&vcamQueueLogCount, 1);
+    if (n > 50) return;  // 限制日志量避免 I/O 阻塞
+    @try {
+        NSString *logPath = @"/tmp/vcam_queue_log.txt";
+        NSString *ts = [NSDate date].description;
+        NSString *entry = [NSString stringWithFormat:@"[%@] %@\n", ts, msg];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:logPath];
+        if (!fh) {
+            [entry writeToFile:logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        } else {
+            [fh seekToEndOfFile];
+            [fh writeData:[entry dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        }
+    } @catch (NSException *e) {}
+}
 
 @interface NSQueue ()
-@property (nonatomic, strong) NSRecursiveLock *lock;
+// 逆向特征：使用 NSRecursiveLock（不是 NSLock），支持嵌套锁
+@property (nonatomic, strong) NSRecursiveLock *bufferLock;
 @property (nonatomic, strong) NSMutableArray *pixelBuffers;
 @property (nonatomic, strong) NSMutableArray *sampleBuffers;
 @property (nonatomic, assign) NSUInteger capacity;
+// 当前帧缓存（最新的帧，peek/getCurrentFrame 用）
+@property (nonatomic, assign) CVPixelBufferRef currentPixelBuffer;
+@property (nonatomic, assign) CMSampleBufferRef currentSampleBuffer;
 @end
 
 @implementation NSQueue
 
-- (instancetype)initWithCapacity:(NSUInteger)capacity {
+- (instancetype)initWithCapacity:(NSUInteger)capacity pixelBufferMode:(BOOL)pixelBufferMode {
     self = [super init];
     if (self) {
-        _capacity = capacity > 0 ? capacity : 5;
-        _lock = [[NSRecursiveLock alloc] init];
-        _pixelBuffers = [[NSMutableArray alloc] initWithCapacity:_capacity];
-        _sampleBuffers = [[NSMutableArray alloc] initWithCapacity:_capacity];
+        _capacity = capacity;
+        _isPixelBufferMode = pixelBufferMode;
+        _bufferLock = [[NSRecursiveLock alloc] init];
+        _pixelBuffers = [[NSMutableArray alloc] init];
+        _sampleBuffers = [[NSMutableArray alloc] init];
+        _currentPixelBuffer = NULL;
+        _currentSampleBuffer = NULL;
+        vcam_queue_log([NSString stringWithFormat:@"[vcam] NSQueue initialized with capacity: %lu (SampleBuffer mode)", (unsigned long)capacity]);
     }
     return self;
+}
+
+- (void)dealloc {
+    [self clearFrameQueue];
+    vcam_queue_log(@"[vcam] NSQueue deallocated");
+}
+
+- (NSUInteger)count {
+    [_bufferLock lock];
+    NSUInteger c = _isPixelBufferMode ? _pixelBuffers.count : _sampleBuffers.count;
+    [_bufferLock unlock];
+    return c;
 }
 
 #pragma mark - PixelBuffer 模式
 
 - (void)enqueuePixelBuffer:(CVPixelBufferRef)buffer {
     if (!buffer) return;
-    CVPixelBufferRetain(buffer);
-    [_lock lock];
+    [_bufferLock lock];
+    // NSMutableArray addObject 会 retain
     [_pixelBuffers addObject:(__bridge id)buffer];
-    // 超容量则丢弃最旧帧
+    // 超过容量时移除最旧的
     while (_pixelBuffers.count > _capacity) {
         [_pixelBuffers removeObjectAtIndex:0];
     }
-    [_lock unlock];
-    CVPixelBufferRelease(buffer);
+    // 更新 currentPixelBuffer（保留最新帧用于 peek/getCurrentFrame）
+    if (_currentPixelBuffer) {
+        CVPixelBufferRelease(_currentPixelBuffer);
+    }
+    _currentPixelBuffer = buffer;
+    CVPixelBufferRetain(_currentPixelBuffer);
+    [_bufferLock unlock];
 }
 
-- (CVPixelBufferRef)dequeuePixelBuffer {
-    [_lock lock];
-    if (_pixelBuffers.count == 0) {
-        [_lock unlock];
-        return NULL;
+- (CVPixelBufferRef)dequeuePixelBuffer CF_RETURNS_RETAINED {
+    [_bufferLock lock];
+    CVPixelBufferRef buffer = NULL;
+    if (_pixelBuffers.count > 0) {
+        buffer = (__bridge CVPixelBufferRef)_pixelBuffers[0];
+        CVPixelBufferRetain(buffer);  // 返回给调用者，需要 retain
+        [_pixelBuffers removeObjectAtIndex:0];  // NSMutableArray release
     }
-    // 取最新帧
-    CVPixelBufferRef buf = (CVPixelBufferRef)CFBridgingRetain([_pixelBuffers lastObject]);
-    [_pixelBuffers removeAllObjects];
-    [_lock unlock];
-    return buf;
+    [_bufferLock unlock];
+    return buffer;
 }
 
 - (CVPixelBufferRef)peekPixelBuffer {
-    [_lock lock];
-    if (_pixelBuffers.count == 0) {
-        [_lock unlock];
-        return NULL;
+    // 不 retain，不移除，调用者不应长期持有
+    [_bufferLock lock];
+    CVPixelBufferRef buffer = NULL;
+    if (_pixelBuffers.count > 0) {
+        buffer = (__bridge CVPixelBufferRef)_pixelBuffers[0];
     }
-    CVPixelBufferRef buf = (__bridge CVPixelBufferRef)[_pixelBuffers lastObject];
-    if (buf) CVPixelBufferRetain(buf);
-    [_lock unlock];
-    return buf;
+    [_bufferLock unlock];
+    return buffer;
 }
 
-- (CVPixelBufferRef)copyCurrentFrame {
-    return [self peekPixelBuffer];
+- (CVPixelBufferRef)copyCurrentFrame CF_RETURNS_RETAINED {
+    // 返回当前帧的 retain 副本
+    [_bufferLock lock];
+    CVPixelBufferRef buffer = NULL;
+    if (_currentPixelBuffer) {
+        buffer = _currentPixelBuffer;
+        CVPixelBufferRetain(buffer);
+    }
+    [_bufferLock unlock];
+    return buffer;
+}
+
+- (CVPixelBufferRef)getCurrentFrame {
+    // 无锁快速访问（用于 hot path，调用者需确保线程安全）
+    // 逆向特征：hot path 不加锁以减少延迟
+    return _currentPixelBuffer;
 }
 
 #pragma mark - SampleBuffer 模式
 
 - (void)enqueueSampleBuffer:(CMSampleBufferRef)buffer {
     if (!buffer) return;
-    CFRetain(buffer);
-    [_lock lock];
+    [_bufferLock lock];
     [_sampleBuffers addObject:(__bridge id)buffer];
     while (_sampleBuffers.count > _capacity) {
         [_sampleBuffers removeObjectAtIndex:0];
     }
-    [_lock unlock];
-    CFRelease(buffer);
-}
-
-- (CMSampleBufferRef)dequeueSampleBuffer {
-    [_lock lock];
-    if (_sampleBuffers.count == 0) {
-        [_lock unlock];
-        return NULL;
+    if (_currentSampleBuffer) {
+        CFRelease(_currentSampleBuffer);
     }
-    CMSampleBufferRef buf = (CMSampleBufferRef)CFBridgingRetain([_sampleBuffers lastObject]);
-    [_sampleBuffers removeAllObjects];
-    [_lock unlock];
-    return buf;
+    _currentSampleBuffer = buffer;
+    CFRetain(_currentSampleBuffer);
+    [_bufferLock unlock];
 }
 
-#pragma mark - 通用
+- (CMSampleBufferRef)dequeueSampleBuffer CF_RETURNS_RETAINED {
+    [_bufferLock lock];
+    CMSampleBufferRef buffer = NULL;
+    if (_sampleBuffers.count > 0) {
+        buffer = (__bridge CMSampleBufferRef)_sampleBuffers[0];
+        CFRetain(buffer);
+        [_sampleBuffers removeObjectAtIndex:0];
+    }
+    [_bufferLock unlock];
+    return buffer;
+}
 
-- (void)clear {
-    [_lock lock];
+#pragma mark - 清空
+
+- (void)clearFrameQueue {
+    [_bufferLock lock];
     [_pixelBuffers removeAllObjects];
     [_sampleBuffers removeAllObjects];
-    [_lock unlock];
-}
-
-- (NSUInteger)count {
-    [_lock lock];
-    NSUInteger c = _pixelBuffers.count + _sampleBuffers.count;
-    [_lock unlock];
-    return c;
-}
-
-- (void)dealloc {
-    [self clear];
+    if (_currentPixelBuffer) {
+        CVPixelBufferRelease(_currentPixelBuffer);
+        _currentPixelBuffer = NULL;
+    }
+    if (_currentSampleBuffer) {
+        CFRelease(_currentSampleBuffer);
+        _currentSampleBuffer = NULL;
+    }
+    vcam_queue_log(@"[vcam] NSQueue cleared");
+    [_bufferLock unlock];
 }
 
 @end

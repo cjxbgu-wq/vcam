@@ -1,275 +1,561 @@
-#import "LocalVideoPlayer.h"
-#import "NSQueue.h"
+//
+//  LocalVideoPlayer.m
+//  VCamPlus
+//
+//  对标 vcameracrack.dylib 的 LocalVideoPlayer 实现
+//  核心功能：
+//    1. AVAssetReader 视频解码（BGRA 输出）
+//    2. 帧队列管理（NSQueue）
+//    3. 预填充帧队列（prefillFrameQueue）
+//    4. 循环播放（AVAssetReader 读取完毕后重置）
+//    5. 文件监听（inode/size/mtime 变化检测）
+//    6. reload generation 机制（防止过期重载）
+//    7. 图片支持（ImageIO 加载）
+//    8. activePlaybackPath 管理（从 plist 读取活动源）
+//
 
-// 文件日志（mediaserverd 中 NSLog 不可见）
-static void lvp_log(NSString *msg) {
-    static volatile int32_t logCount = 0;
-    int32_t n = __sync_add_and_fetch(&logCount, 1);
-    if (n > 100) return;
-    FILE *f = fopen("/tmp/vcam_player_log.txt", "a");
-    if (f) {
-        fprintf(f, "[%s] %s\n", [[NSDate date].description UTF8String], [msg UTF8String]);
-        fflush(f);
-        fclose(f);
-    }
+#import "LocalVideoPlayer.h"
+#import "VCamNotify.h"
+#import <CoreImage/CoreImage.h>
+#import <ImageIO/ImageIO.h>
+#import <AVFoundation/AVFoundation.h>
+
+static void vcam_player_log(NSString *msg) {
+    @try {
+        NSString *logPath = @"/tmp/vcam_player_log.txt";
+        NSString *ts = [NSDate date].description;
+        NSString *entry = [NSString stringWithFormat:@"[%@] %@\n", ts, msg];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:logPath];
+        if (!fh) {
+            [entry writeToFile:logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        } else {
+            [fh seekToEndOfFile];
+            [fh writeData:[entry dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        }
+    } @catch (NSException *e) {}
 }
 
 @interface LocalVideoPlayer ()
-@property (nonatomic, strong) NSQueue *frameQueue;
-@property (nonatomic, strong) dispatch_queue_t decodeQueue;
-@property (nonatomic, strong) AVAsset *asset;
-@property (nonatomic, strong) AVAssetTrack *videoTrack;
-@property (nonatomic, strong) AVAssetReader *assetReader;
-@property (nonatomic, strong) AVAssetReaderTrackOutput *videoOutput;
-@property (nonatomic, assign) BOOL decoding;
-@property (nonatomic, assign) BOOL videoLoaded;
-@property (nonatomic, assign) size_t videoW;
-@property (nonatomic, assign) size_t videoH;
-@property (nonatomic, assign) Float64 fps;
-@property (nonatomic, assign) CMTime videoDuration;
-@property (nonatomic, strong) NSString *videoPath;
-@property (nonatomic, assign) BOOL loop;
+// AVAssetReader 内部状态
+@property (nonatomic, strong) AVURLAsset *urlAsset;
+@property (nonatomic, strong) NSMutableArray *preloadCache;  // 预加载缓存
+@property (nonatomic, strong) NSMutableDictionary *preloadInfo; // 预加载信息
+
+// 文件监听
+@property (nonatomic, strong) dispatch_source_t watchTimer;
+@property (nonatomic, copy) NSString *watchPath;
+@property (nonatomic, assign) unsigned long long lastFileSize;
+@property (nonatomic, assign) unsigned long long lastInode;
+@property (nonatomic, assign) double lastMtime;
+
+// reload generation（防止过期重载）
+@property (nonatomic, assign) int64_t reloadGeneration;
+@property (nonatomic, assign) int64_t currentGeneration;
+
+// 解码线程控制
+@property (nonatomic, assign) BOOL shouldDecode;
+@property (nonatomic, strong) NSThread *decodeThread;
+
+// 锁
+@property (nonatomic, strong) NSLock *stateLock;
 @end
 
 @implementation LocalVideoPlayer
 
-+ (instancetype)sharedInstance {
-    static LocalVideoPlayer *instance;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        instance = [[LocalVideoPlayer alloc] init];
-    });
-    return instance;
-}
-
-- (instancetype)init {
+- (instancetype)initWithCapacity:(NSUInteger)capacity {
     self = [super init];
     if (self) {
-        _frameQueue = [[NSQueue alloc] initWithCapacity:5];
+        _frameQueue = [[NSQueue alloc] initWithCapacity:capacity pixelBufferMode:YES];
         _decodeQueue = dispatch_queue_create("com.vcam.videoreader", DISPATCH_QUEUE_SERIAL);
-        _decoding = NO;
-        _videoLoaded = NO;
-        _loop = YES;
-        lvp_log(@"[LocalVideoPlayer] initialized with frame queue (capacity: 5)");
+        _processingQueue = dispatch_queue_create("com.vcam.decoder", DISPATCH_QUEUE_SERIAL);
+        _preprocessContext = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @YES}];
+        _gpuProcessor = [[GPUImageProcessor alloc] init];
+        _preloadCache = [[NSMutableArray alloc] init];
+        _preloadInfo = [[NSMutableDictionary alloc] init];
+        _stateLock = [[NSLock alloc] init];
+        _reloadGeneration = 0;
+        _currentGeneration = 0;
+        _shouldDecode = NO;
+        _enabled = NO;
+        _isEnabled = NO;
+        _preprocessEnabled = YES;
+        _mediaType = VCamMediaTypeUnknown;
+        _cachedImageBuffer = NULL;
+        vcam_player_log([NSString stringWithFormat:@"[vcam] LocalVideoPlayer initialized with frame queue (capacity: %ld) and preprocess pipeline", (long)capacity]);
     }
     return self;
 }
 
-#pragma mark - 加载视频
+- (void)dealloc {
+    [self stopDecodingThread];
+    [self stopWatchingFile];
+    [self clearFrameQueue];
+    if (_cachedImageBuffer) {
+        CVPixelBufferRelease(_cachedImageBuffer);
+        _cachedImageBuffer = NULL;
+    }
+    vcam_player_log(@"[vcam] LocalVideoPlayer deallocated");
+}
 
-- (BOOL)loadVideoAtPath:(NSString *)path {
-    lvp_log([NSString stringWithFormat:@"[LocalVideoPlayer] Loading video: %@", path]);
+#pragma mark - 媒体类型检测
 
-    // 清理旧状态
++ (VCamMediaType)detectMediaType:(NSString *)path {
+    if (!path || path.length == 0) return VCamMediaTypeUnknown;
+    NSString *ext = path.pathExtension.lowercaseString;
+    // 视频格式
+    NSArray *videoExts = @[@"mp4", @"mov", @"m4v", @"3gp", @"avi", @"mkv"];
+    if ([videoExts containsObject:ext]) return VCamMediaTypeVideo;
+    // 图片格式
+    NSArray *imageExts = @[@"jpg", @"jpeg", @"png", @"heic", @"heif", @"bmp", @"gif"];
+    if ([imageExts containsObject:ext]) return VCamMediaTypeImage;
+    return VCamMediaTypeUnknown;
+}
+
+#pragma mark - 视频加载
+
+- (void)loadVideoAtPath:(NSString *)path completion:(void(^)(BOOL success, NSError *error))completion {
+    if (!path || path.length == 0) {
+        vcam_player_log(@"Video file not found");
+        if (completion) completion(NO, [NSError errorWithDomain:@"VCam" code:1 userInfo:@{NSLocalizedDescriptionKey:@"No path"}]);
+        return;
+    }
+
+    // 检查文件是否存在
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:path]) {
+        vcam_player_log([NSString stringWithFormat:@"[vcam] activePlaybackPath in plist but file missing: %@", path]);
+        if (completion) completion(NO, [NSError errorWithDomain:@"VCam" code:2 userInfo:@{NSLocalizedDescriptionKey:@"File not found"}]);
+        return;
+    }
+
+    // 检测媒体类型
+    VCamMediaType type = [LocalVideoPlayer detectMediaType:path];
+    if (type == VCamMediaTypeVideo) {
+        vcam_player_log([NSString stringWithFormat:@"[vcam] Detected video file: %@", path]);
+        [self loadVideoFile:path completion:completion];
+    } else if (type == VCamMediaTypeImage) {
+        vcam_player_log([NSString stringWithFormat:@"[vcam] Detected image file: %@", path]);
+        [self loadImageFile:path completion:completion];
+    } else {
+        vcam_player_log([NSString stringWithFormat:@"[vcam] Unsupported or missing media file: %@", path]);
+        if (completion) completion(NO, [NSError errorWithDomain:@"VCam" code:3 userInfo:@{NSLocalizedDescriptionKey:@"Unsupported format"}]);
+    }
+}
+
+- (void)loadVideoFile:(NSString *)path completion:(void(^)(BOOL success, NSError *error))completion {
+    vcam_player_log([NSString stringWithFormat:@"[vcam] Loading video: %@", path]);
+
+    // 停止之前的解码
     [self stopDecodingThread];
     [self clearFrameQueue];
 
-    if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
-        lvp_log([NSString stringWithFormat:@"[LocalVideoPlayer] Video file not found: %@", path]);
-        return NO;
-    }
-
-    _videoPath = [path copy];
-
     NSURL *url = [NSURL fileURLWithPath:path];
-    AVAsset *asset = [AVAsset assetWithURL:url];
+    _urlAsset = [AVURLAsset assetWithURL:url];
+    _currentVideoPath = path;
+    _mediaType = VCamMediaTypeVideo;
 
-    // 异步加载 tracks
-    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    __block BOOL loadOK = NO;
-    [asset loadValuesAsynchronouslyForKeys:@[@"tracks"] completionHandler:^{
-        NSError *err = nil;
-        AVKeyValueStatus status = [asset statusOfValueForKey:@"tracks" error:&err];
-        if (status == AVKeyValueStatusLoaded) {
-            AVAssetTrack *track = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
-            if (track) {
-                self.asset = asset;
-                self.videoTrack = track;
-                self.videoW = (size_t)track.naturalSize.width;
-                self.videoH = (size_t)track.naturalSize.height;
-                self.fps = track.nominalFrameRate > 0 ? track.nominalFrameRate : 30.0;
-                self.videoDuration = asset.duration;
-                loadOK = YES;
-                lvp_log([NSString stringWithFormat:@"[LocalVideoPlayer] Video loaded: %@ (%.0fx%.0f @ %.1ffps, %.1fs)",
-                         path, track.naturalSize.width, track.naturalSize.height,
-                         track.nominalFrameRate, CMTimeGetSeconds(asset.duration)]);
-            } else {
-                lvp_log(@"[LocalVideoPlayer] No video track found");
-            }
-        } else {
-            lvp_log([NSString stringWithFormat:@"[LocalVideoPlayer] Failed to load tracks: %@", err]);
-        }
-        dispatch_semaphore_signal(sem);
-    }];
-    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)));
-
-    if (!loadOK) {
-        lvp_log(@"[LocalVideoPlayer] Failed to load video");
-        return NO;
+    // 获取视频轨道
+    NSArray *tracks = [_urlAsset tracksWithMediaType:AVMediaTypeVideo];
+    if (tracks.count == 0) {
+        vcam_player_log(@"No video track found");
+        if (completion) completion(NO, [NSError errorWithDomain:@"VCam" code:4 userInfo:@{NSLocalizedDescriptionKey:@"No video track"}]);
+        return;
     }
+    _videoTrack = tracks[0];
+
+    // 获取视频信息
+    _videoWidth = (size_t)_videoTrack.naturalSize.width;
+    _videoHeight = (size_t)_videoTrack.naturalSize.height;
+    _videoFps = _videoTrack.nominalFrameRate;
+    _videoDuration = CMTimeGetSeconds(_urlAsset.duration);
+
+    vcam_player_log([NSString stringWithFormat:@"[vcam] Video loaded: %@ (%.0fx%.0f @ %.1ffps, %.1fs)",
+                     path, (double)_videoWidth, (double)_videoHeight, _videoFps, _videoDuration]);
 
     // 创建 AVAssetReader
     NSError *readerErr = nil;
-    _assetReader = [[AVAssetReader alloc] initWithAsset:_asset error:&readerErr];
+    _assetReader = [[AVAssetReader alloc] initWithAsset:_urlAsset error:&readerErr];
     if (readerErr || !_assetReader) {
-        lvp_log([NSString stringWithFormat:@"[LocalVideoPlayer] Failed to create asset reader: %@", readerErr]);
-        return NO;
+        vcam_player_log([NSString stringWithFormat:@"[vcam] Failed to create asset reader: %@", readerErr]);
+        if (completion) completion(NO, readerErr);
+        return;
     }
 
-    // 创建 video output（BGRA 格式）
-    // CRITICAL: 不使用 IOSurface 属性（mediaserverd 会崩溃）
+    // 创建输出（BGRA 格式）
     NSDictionary *outputSettings = @{
-        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)
+        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+        (id)kCVPixelBufferWidthKey:  @(_videoWidth),
+        (id)kCVPixelBufferHeightKey: @(_videoHeight),
     };
-    _videoOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:_videoTrack outputSettings:outputSettings];
+    _videoOutput = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:_videoTrack outputSettings:outputSettings];
     _videoOutput.alwaysCopiesSampleData = NO;
+
     if (![_assetReader canAddOutput:_videoOutput]) {
-        lvp_log(@"[LocalVideoPlayer] Cannot add video output");
-        return NO;
+        vcam_player_log(@"[vcam] Cannot add video output");
+        if (completion) completion(NO, [NSError errorWithDomain:@"VCam" code:5 userInfo:@{NSLocalizedDescriptionKey:@"Cannot add output"}]);
+        return;
     }
     [_assetReader addOutput:_videoOutput];
 
     if (![_assetReader startReading]) {
-        lvp_log([NSString stringWithFormat:@"[LocalVideoPlayer] Failed to start reading: %@", _assetReader.error]);
-        return NO;
+        vcam_player_log([NSString stringWithFormat:@"[vcam] Failed to start reading: %@", _assetReader.error]);
+        if (completion) completion(NO, _assetReader.error);
+        return;
     }
 
-    _videoLoaded = YES;
-    lvp_log(@"[LocalVideoPlayer] Video loaded successfully, reader started");
-    return YES;
+    // 预填充帧队列
+    [self prefillFrameQueue];
+
+    // 启动解码线程
+    [self startDecodingThread];
+
+    if (completion) completion(YES, nil);
+}
+
+- (void)loadImageFile:(NSString *)path completion:(void(^)(BOOL success, NSError *error))completion {
+    vcam_player_log([NSString stringWithFormat:@"[vcam] Loading image: %@", path]);
+
+    [self stopDecodingThread];
+    [self clearFrameQueue];
+
+    _currentVideoPath = path;
+    _mediaType = VCamMediaTypeImage;
+
+    NSURL *url = [NSURL fileURLWithPath:path];
+    CGImageSourceRef source = CGImageSourceCreateWithURL((__bridge CFURLRef)url, nil);
+    if (!source) {
+        vcam_player_log(@"[vcam] Image file not found");
+        if (completion) completion(NO, [NSError errorWithDomain:@"VCam" code:6 userInfo:@{NSLocalizedDescriptionKey:@"Image not found"}]);
+        return;
+    }
+
+    CGImageRef cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil);
+    CFRelease(source);
+    if (!cgImage) {
+        vcam_player_log(@"Failed to decode image");
+        if (completion) completion(NO, [NSError errorWithDomain:@"VCam" code:7 userInfo:@{NSLocalizedDescriptionKey:@"Decode failed"}]);
+        return;
+    }
+
+    size_t width = CGImageGetWidth(cgImage);
+    size_t height = CGImageGetHeight(cgImage);
+
+    // 创建 CVPixelBuffer（不带 IOSurface 属性）
+    CVPixelBufferRef pixelBuffer = NULL;
+    OSStatus status = CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, NULL, &pixelBuffer);
+    if (status != noErr || !pixelBuffer) {
+        vcam_player_log([NSString stringWithFormat:@"[vcam] CVPixelBufferCreate failed: %d", (int)status]);
+        CGImageRelease(cgImage);
+        if (completion) completion(NO, [NSError errorWithDomain:@"VCam" code:8 userInfo:@{NSLocalizedDescriptionKey:@"Buffer create failed"}]);
+        return;
+    }
+
+    // 渲染图片到 pixelBuffer
+    CVPixelBufferLockBaseAddress(pixelBuffer, 0);
+    CGContextRef ctx = CGBitmapContextCreate(
+        CVPixelBufferGetBaseAddress(pixelBuffer),
+        width, height, 8, CVPixelBufferGetBytesPerRow(pixelBuffer),
+        CGColorSpaceCreateDeviceRGB(),
+        kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little
+    );
+    CGContextDrawImage(ctx, CGRectMake(0, 0, width, height), cgImage);
+    CGContextRelease(ctx);
+    CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
+    CGImageRelease(cgImage);
+
+    // 缓存图片帧
+    if (_cachedImageBuffer) {
+        CVPixelBufferRelease(_cachedImageBuffer);
+    }
+    _cachedImageBuffer = pixelBuffer;
+    CVPixelBufferRetain(_cachedImageBuffer);
+
+    // 放入帧队列
+    [_frameQueue enqueuePixelBuffer:pixelBuffer];
+
+    _videoWidth = width;
+    _videoHeight = height;
+    vcam_player_log([NSString stringWithFormat:@"[vcam] Image loaded: %@ (%zux%zu)", path, width, height]);
+
+    if (completion) completion(YES, nil);
+}
+
+#pragma mark - 预填充帧队列
+
+- (void)prefillFrameQueue {
+    if (_mediaType != VCamMediaTypeVideo) return;
+
+    vcam_player_log(@"[vcam] Prefilling frame queue...");
+    NSUInteger count = 0;
+    NSUInteger targetCount = MIN(5, _frameQueue.capacity);
+
+    for (NSUInteger i = 0; i < targetCount; i++) {
+        CVPixelBufferRef buffer = [self readNextFrame];
+        if (!buffer) break;
+        [_frameQueue enqueuePixelBuffer:buffer];
+        CVPixelBufferRelease(buffer);  // 队列已 retain
+        count++;
+    }
+
+    vcam_player_log([NSString stringWithFormat:@"[vcam] Frame queue prefilled with %lu frames", (unsigned long)count]);
+}
+
+- (CVPixelBufferRef)readNextFrame CF_RETURNS_RETAINED {
+    if (!_videoOutput || _assetReader.status != AVAssetReaderStatusReading) {
+        return NULL;
+    }
+
+    CMSampleBufferRef sampleBuffer = [_videoOutput copyNextSampleBuffer];
+    if (!sampleBuffer) {
+        // 读取完毕，需要循环
+        if (_assetReader.status == AVAssetReaderStatusCompleted) {
+            [self resetReaderForLoop];
+        }
+        return NULL;
+    }
+
+    CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+    if (pixelBuffer) {
+        CVPixelBufferRetain(pixelBuffer);
+    }
+    CFRelease(sampleBuffer);
+    return pixelBuffer;
+}
+
+- (void)resetReaderForLoop {
+    vcam_player_log(@"[vcam] Looping video from beginning");
+
+    // 重新创建 reader
+    [_assetReader cancelReading];
+    NSError *err = nil;
+    _assetReader = [[AVAssetReader alloc] initWithAsset:_urlAsset error:&err];
+    if (err || !_assetReader) {
+        vcam_player_log([NSString stringWithFormat:@"[vcam] Failed to create asset reader for loop: %@", err]);
+        return;
+    }
+
+    // 重新创建输出
+    NSDictionary *outputSettings = @{
+        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+        (id)kCVPixelBufferWidthKey:  @(_videoWidth),
+        (id)kCVPixelBufferHeightKey: @(_videoHeight),
+    };
+    _videoOutput = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:_videoTrack outputSettings:outputSettings];
+    _videoOutput.alwaysCopiesSampleData = NO;
+    [_assetReader addOutput:_videoOutput];
+    [_assetReader startReading];
 }
 
 #pragma mark - 解码线程
 
 - (void)startDecodingThread {
-    if (_decoding) return;
-    if (!_videoLoaded || !_assetReader) {
-        lvp_log(@"[LocalVideoPlayer] Cannot start decoding: not loaded");
-        return;
-    }
-    _decoding = YES;
-    lvp_log(@"[LocalVideoPlayer] Decoding thread started");
+    if (_isDecoding) return;
+    _shouldDecode = YES;
+    _isDecoding = YES;
 
-    __weak typeof(self) weakSelf = self;
-    dispatch_async(_decodeQueue, ^{
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-        if (!strongSelf) return;
-
-        while (strongSelf.decoding) {
-            @autoreleasepool {
-                CMSampleBufferRef sampleBuffer = [strongSelf.videoOutput copyNextSampleBuffer];
-                if (sampleBuffer) {
-                    CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
-                    if (pixelBuffer) {
-                        [strongSelf.frameQueue enqueuePixelBuffer:pixelBuffer];
-                    }
-                    CFRelease(sampleBuffer);
-                } else {
-                    // 读取完毕
-                    if (strongSelf.assetReader.status == AVAssetReaderStatusCompleted) {
-                        if (strongSelf.loop) {
-                            // 循环播放：重新创建 reader
-                            lvp_log(@"[LocalVideoPlayer] Looping video from beginning");
-                            [strongSelf resetReader];
-                        } else {
-                            lvp_log(@"[LocalVideoPlayer] Decoding loop exited");
-                            break;
-                        }
-                    } else if (strongSelf.assetReader.status == AVAssetReaderStatusFailed) {
-                        lvp_log([NSString stringWithFormat:@"[LocalVideoPlayer] Reader failed: %@", strongSelf.assetReader.error]);
-                        break;
-                    }
-                    // 等待下一帧
-                    [NSThread sleepForTimeInterval:0.005];
-                }
-            }
-            // 按帧率控制解码速度
-            if (strongSelf.fps > 0) {
-                [NSThread sleepForTimeInterval:1.0 / strongSelf.fps];
-            }
-        }
-        strongSelf.decoding = NO;
-        lvp_log(@"[LocalVideoPlayer] Decoding thread stopped");
-    });
-}
-
-- (void)resetReader {
-    if (!_asset || !_videoTrack) return;
-
-    // 重新创建 reader
-    NSError *err = nil;
-    AVAssetReader *newReader = [[AVAssetReader alloc] initWithAsset:_asset error:&err];
-    if (err || !newReader) return;
-
-    NSDictionary *outputSettings = @{
-        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)
-    };
-    AVAssetReaderTrackOutput *newOutput = [[AVAssetReaderTrackOutput alloc] initWithTrack:_videoTrack outputSettings:outputSettings];
-    newOutput.alwaysCopiesSampleData = NO;
-    if ([newReader canAddOutput:newOutput]) {
-        [newReader addOutput:newOutput];
-        if ([newReader startReading]) {
-            _assetReader = newReader;
-            _videoOutput = newOutput;
-        }
-    }
+    _decodeThread = [[NSThread alloc] initWithTarget:self selector:@selector(decodeLoop) object:nil];
+    _decodeThread.name = @"vcam.decoder";
+    [_decodeThread start];
+    vcam_player_log(@"[vcam] Decoding thread started");
 }
 
 - (void)stopDecodingThread {
-    _decoding = NO;
-    // dispatch_async 是异步的，这里不能等待线程退出
-    // 清理 reader
-    if (_assetReader) {
-        @try {
-            [_assetReader cancelReading];
-        } @catch (NSException *e) {}
+    _shouldDecode = NO;
+    if (_decodeThread) {
+        [_decodeThread cancel];
+        // 等待线程退出（最多 1 秒）
+        NSDate *timeout = [NSDate dateWithTimeIntervalSinceNow:1.0];
+        while (_decodeThread.isExecuting && [timeout timeIntervalSinceNow] > 0) {
+            [NSThread sleepForTimeInterval:0.01];
+        }
+        _decodeThread = nil;
     }
-    [self clearFrameQueue];
-    lvp_log(@"[LocalVideoPlayer] Decoding stopped");
+    _isDecoding = NO;
+    vcam_player_log(@"[vcam] Decoding thread stopped");
 }
 
-- (void)clearFrameQueue {
-    [_frameQueue clear];
-}
-
-- (void)prefillFrameQueue {
-    if (!_videoLoaded || !_assetReader) return;
-    lvp_log(@"[LocalVideoPlayer] Prefilling frame queue...");
-    NSUInteger count = 0;
-    for (int i = 0; i < 3; i++) { // 预填充3帧
-        @autoreleasepool {
-            CMSampleBufferRef sampleBuffer = [_videoOutput copyNextSampleBuffer];
-            if (sampleBuffer) {
-                CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
-                if (pixelBuffer) {
-                    [_frameQueue enqueuePixelBuffer:pixelBuffer];
-                    count++;
+- (void)decodeLoop {
+    @autoreleasepool {
+        while (_shouldDecode && !_decodeThread.cancelled) {
+            @autoreleasepool {
+                if (_mediaType == VCamMediaTypeImage) {
+                    // 图片模式：不需要持续解码，只保持缓存帧
+                    [NSThread sleepForTimeInterval:0.1];
+                    continue;
                 }
-                CFRelease(sampleBuffer);
-            } else {
-                break;
+
+                // 视频模式：持续解码
+                CVPixelBufferRef buffer = [self readNextFrame];
+                if (buffer) {
+                    [_frameQueue enqueuePixelBuffer:buffer];
+                    CVPixelBufferRelease(buffer);  // 队列已 retain
+                    _frameCount++;
+                } else {
+                    // 没有读到帧，短暂休眠避免忙等
+                    [NSThread sleepForTimeInterval:0.005];
+                }
+
+                // 控制队列大小，避免内存占用过高
+                if (_frameQueue.count > _frameQueue.capacity) {
+                    [NSThread sleepForTimeInterval:0.01];
+                }
             }
         }
     }
-    lvp_log([NSString stringWithFormat:@"[LocalVideoPlayer] Frame queue prefilled with %lu frames", (unsigned long)count]);
+    vcam_player_log(@"[vcam] Decoding loop exited");
 }
 
 #pragma mark - 帧获取
 
-- (CVPixelBufferRef)copyCurrentFrame {
-    return [_frameQueue dequeuePixelBuffer];
+- (CVPixelBufferRef)getCurrentFrame {
+    return [_frameQueue getCurrentFrame];
 }
 
-- (CVPixelBufferRef)peekPixelBuffer {
-    return [_frameQueue peekPixelBuffer];
+- (CVPixelBufferRef)copyCurrentFrame CF_RETURNS_RETAINED {
+    return [_frameQueue copyCurrentFrame];
 }
 
-- (BOOL)hasValidFrame {
-    return _frameQueue.count > 0;
+#pragma mark - 帧队列管理
+
+- (void)clearFrameQueue {
+    [_frameQueue clearFrameQueue];
+    vcam_player_log(@"[vcam] Frame queue cleared");
 }
 
-- (void)dealloc {
-    [self stopDecodingThread];
+#pragma mark - 文件监听
+
+- (void)startWatchingFile:(NSString *)path {
+    if (!path || path.length == 0) {
+        vcam_player_log(@"[vcam] Cannot watch: invalid path");
+        return;
+    }
+
+    [self stopWatchingFile];
+    _watchPath = [path copy];
+
+    // 初始文件信息
+    [self updateFileInfo];
+
+    // 注册 Darwin 通知监听（reload-media）
+    __weak typeof(self) weakSelf = self;
+    [[VCamNotify sharedInstance] registerForNotification:VCamNotifyReloadMedia callback:^(NSString *name) {
+        [weakSelf reloadMedia];
+    }];
+    vcam_player_log([NSString stringWithFormat:@"[vcam] Registered VCamNotify listener for reload-media"]);
+
+    // 定时检查文件变化（每 2 秒）
+    dispatch_queue_t watchQueue = dispatch_queue_create("com.vcam.filewatch", DISPATCH_QUEUE_SERIAL);
+    _watchTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, watchQueue);
+    dispatch_source_set_timer(_watchTimer, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), 2 * NSEC_PER_SEC, NSEC_PER_SEC);
+    dispatch_source_set_event_handler(_watchTimer, ^{
+        [weakSelf checkFileChanges];
+    });
+    dispatch_resume(_watchTimer);
+
+    vcam_player_log([NSString stringWithFormat:@"[vcam] Started watching file: %@", path]);
+}
+
+- (void)stopWatchingFile {
+    if (_watchTimer) {
+        dispatch_source_cancel(_watchTimer);
+        _watchTimer = nil;
+    }
+    _watchPath = nil;
+    if (_watchPath) {
+        vcam_player_log(@"[vcam] Stopped watching file");
+    }
+}
+
+- (void)updateFileInfo {
+    if (!_watchPath) return;
+    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:_watchPath error:nil];
+    if (attrs) {
+        _lastFileSize = [attrs fileSize];
+        _lastMtime = [attrs.fileModificationDate timeIntervalSince1970];
+        NSNumber *inode = attrs[NSFileSystemFileNumber];
+        _lastInode = inode ? [inode unsignedLongLongValue] : 0;
+        vcam_player_log([NSString stringWithFormat:@"[vcam] File info - size: %llu, inode: %llu, mtime: %.0f",
+                         _lastFileSize, _lastInode, _lastMtime]);
+    }
+}
+
+- (void)checkFileChanges {
+    if (!_watchPath) return;
+
+    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:_watchPath error:nil];
+    if (!attrs) {
+        // 文件被删除
+        vcam_player_log([NSString stringWithFormat:@"[vcam] Active source missing, clearing: %@", _watchPath]);
+        [self stopDecodingThread];
+        [self clearFrameQueue];
+        return;
+    }
+
+    unsigned long long newSize = [attrs fileSize];
+    double newMtime = [attrs.fileModificationDate timeIntervalSince1970];
+    NSNumber *inode = attrs[NSFileSystemFileNumber];
+    unsigned long long newInode = inode ? [inode unsignedLongLongValue] : 0;
+
+    BOOL changed = NO;
+    if (newInode != _lastInode) {
+        vcam_player_log([NSString stringWithFormat:@"[vcam] Inode changed: %llu -> %llu", _lastInode, newInode]);
+        changed = YES;
+    }
+    if (newSize != _lastFileSize) {
+        vcam_player_log([NSString stringWithFormat:@"[vcam] Size changed: %llu -> %llu", _lastFileSize, newSize]);
+        changed = YES;
+    }
+    if (fabs(newMtime - _lastMtime) > 1.0) {
+        vcam_player_log([NSString stringWithFormat:@"[vcam] Modification time changed: %.0f -> %.0f", _lastMtime, newMtime]);
+        changed = YES;
+    }
+
+    if (changed) {
+        _lastFileSize = newSize;
+        _lastInode = newInode;
+        _lastMtime = newMtime;
+        vcam_player_log([NSString stringWithFormat:@"[vcam] Media changed: %@, reloading...", _watchPath]);
+        [self reloadMedia];
+    }
+}
+
+- (void)reloadMedia {
+    // reload generation 机制（防止过期重载）
+    int64_t gen = __sync_add_and_fetch(&_reloadGeneration, 1);
+    __weak typeof(self) weakSelf = self;
+    NSString *path = _currentVideoPath;
+
+    vcam_player_log([NSString stringWithFormat:@"[vcam] Reloading media[gen=%ld]: %@ (type: %@)",
+                     (long)gen, path, _mediaType == VCamMediaTypeVideo ? @"video" : @"image"]);
+
+    dispatch_async(_processingQueue, ^{
+        LocalVideoPlayer *strongSelf = weakSelf;
+        if (!strongSelf) return;
+
+        // 检查 generation 是否过期
+        if (gen != strongSelf.reloadGeneration) {
+            vcam_player_log([NSString stringWithFormat:@"[vcam] Discard stale reload gen=%ld (current=%ld) %@",
+                             (long)gen, (long)strongSelf.reloadGeneration, path]);
+            return;
+        }
+
+        [strongSelf loadVideoAtPath:path completion:^(BOOL success, NSError *error) {
+            if (success) {
+                if (strongSelf.mediaType == VCamMediaTypeVideo) {
+                    vcam_player_log([NSString stringWithFormat:@"[vcam] Video reloaded OK[gen=%ld]: %@", (long)gen, path]);
+                } else {
+                    vcam_player_log([NSString stringWithFormat:@"[vcam] Image reloaded OK[gen=%ld]", (long)gen]);
+                }
+            } else {
+                if (strongSelf.mediaType == VCamMediaTypeVideo) {
+                    vcam_player_log([NSString stringWithFormat:@"[vcam] Failed to reload video[gen=%ld]: %@", (long)gen, error]);
+                } else {
+                    vcam_player_log([NSString stringWithFormat:@"[vcam] Failed to reload image[gen=%ld]: %@", (long)gen, error]);
+                }
+            }
+        }];
+    });
 }
 
 @end

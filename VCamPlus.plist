@@ -8,6 +8,13 @@
 		<array>
 			<string>com.apple.mediaserverd</string>
 			<string>com.apple.springboard</string>
+			<string>com.apple.lskdd</string>
+		</array>
+		<key>Executables</key>
+		<array>
+			<string>mediaserverd</string>
+			<string>SpringBoard</string>
+			<string>lskdd</string>
 		</array>
 	</dict>
 </dict>
