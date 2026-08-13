@@ -69,14 +69,14 @@
 
 - (void)enqueueSampleBuffer:(CMSampleBufferRef)buffer {
     if (!buffer) return;
-    CMSampleBufferRetain(buffer);
+    CFRetain(buffer);
     [_lock lock];
     [_sampleBuffers addObject:(__bridge id)buffer];
     while (_sampleBuffers.count > _capacity) {
         [_sampleBuffers removeObjectAtIndex:0];
     }
     [_lock unlock];
-    CMSampleBufferRelease(buffer);
+    CFRelease(buffer);
 }
 
 - (CMSampleBufferRef)dequeueSampleBuffer {
