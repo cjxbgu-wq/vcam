@@ -13,7 +13,7 @@ VCamPlus_FILES = Tweak.m \
 	VCamNotify.m \
 	VCamFloatingBall.m
 
-VCamPlus_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-function -Wno-incompatible-pointer-types-discards-qualifiers -Wno-unused-but-set-variable
+VCamPlus_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-function -Wno-incompatible-pointer-types-discards-qualifiers -Wno-incompatible-function-pointer-types -Wno-unused-but-set-variable
 VCamPlus_LDFLAGS = -Wl,-platform_version,ios,15.0,15.6 -Wl,-undefined,dynamic_lookup -Wl,-weak_framework,UIKit
 VCamPlus_FRAMEWORKS = AVFoundation CoreMedia CoreVideo VideoToolbox CoreImage ImageIO Foundation
 # 不链接 CydiaSubstrate（RootHide/ElleKit 不提供）；MSHookMessageEx 用 extern 动态查找
