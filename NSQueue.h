@@ -21,6 +21,7 @@
 // 模式标记（YES=PixelBuffer, NO=SampleBuffer）
 @property (nonatomic, assign) BOOL isPixelBufferMode;
 @property (nonatomic, readonly) NSUInteger count;
+@property (nonatomic, readonly) NSUInteger capacity;
 
 // 初始化
 - (instancetype)initWithCapacity:(NSUInteger)capacity pixelBufferMode:(BOOL)pixelBufferMode;
