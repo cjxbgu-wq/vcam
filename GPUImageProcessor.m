@@ -293,7 +293,7 @@ static void vcam_gpu_log(NSString *msg) {
 
     // 设置旋转角度
     if (_rotationAngle != 0) {
-        VTSessionSetProperty(_pixelRotationSession, _rotationKeyInDegrees, @(_rotationAngle));
+        VTSessionSetProperty(_pixelRotationSession, _rotationKeyInDegrees, (__bridge CFTypeRef)@(_rotationAngle));
     }
     // 设置镜像
     VTSessionSetProperty(_pixelRotationSession, _flipHorizontalKey, _mirrored ? kCFBooleanTrue : kCFBooleanFalse);
