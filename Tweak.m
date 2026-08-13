@@ -3,6 +3,8 @@
 #import <objc/runtime.h>
 #import <dlfcn.h>
 #import <UIKit/UIKit.h>
+#import <CoreMedia/CoreMedia.h>
+#import <CoreVideo/CoreVideo.h>
 
 // ============================================================================
 // 对标 vcameracrack 的 Tweak.m
