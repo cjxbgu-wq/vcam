@@ -34,7 +34,7 @@ static void vcam_notify_log(NSString *msg) {
 - (void)dispatchCallbackForName:(NSString *)name;
 @end
 
-static void vcam_darwin_callback(CFNotificationCenterRef center, void *observer, CFStringRef name, void *object, CFDictionaryRef userInfo) {
+static void vcam_darwin_callback(CFNotificationCenterRef center, const void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
     if (observer && name) {
         VCamNotify *notify = (__bridge VCamNotify *)observer;
         [notify dispatchCallbackForName:(__bridge NSString *)name];
