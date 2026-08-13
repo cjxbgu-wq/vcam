@@ -230,10 +230,10 @@ static void vcam_core_log(NSString *msg) {
     if (!buffer) return NO;
     OSType format = CVPixelBufferGetPixelFormatType(buffer);
     // 格式白名单（逆向确认）：BGRA, 420v, 420f
-    // 不处理 -8f0, |xv0, |8f0 等私有格式
-    return format == kCVPixelFormatType_32BGRA              // BGRA
-        || format == kCVPixelFormatType_420YpCbCr8VideoRange  // 420v
-        || format == kCVPixelFormatType_420YpCbCr8FullRange;  // 420f
+    // Theos SDK 缺少 kCVPixelFormatType_420YpCbCr8VideoRange/FullRange 声明，用 FourCC 码代替
+    return format == kCVPixelFormatType_32BGRA  // BGRA
+        || format == '420v'                      // 420v (VideoRange)
+        || format == '420f';                     // 420f (FullRange)
 }
 
 #pragma mark - 帧写入
