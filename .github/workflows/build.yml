@@ -12,7 +12,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          brew install ldid fakeroot
+          brew install ldid fakeroot dpkg
           git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
 
       - name: Download iPhoneOS SDK
