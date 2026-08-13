@@ -265,7 +265,9 @@ static void vcam_core_log(NSString *msg) {
                             CVPixelBufferRelease(strongSelf.preallocBGRABuffer);
                         }
                         // CRITICAL: 不使用 IOSurface 属性
-                        CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_32BGRA, NULL, &strongSelf.preallocBGRABuffer);
+                        CVPixelBufferRef newBGRA = NULL;
+                        CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_32BGRA, NULL, &newBGRA);
+                        strongSelf.preallocBGRABuffer = newBGRA;
                     }
 
                     if (strongSelf.preallocBGRABuffer && strongSelf.gpuProcessor) {
@@ -291,7 +293,9 @@ static void vcam_core_log(NSString *msg) {
                                 if (strongSelf.preallocYUV420fBuffer) {
                                     CVPixelBufferRelease(strongSelf.preallocYUV420fBuffer);
                                 }
-                                CVPixelBufferCreate(kCFAllocatorDefault, w, h, strongSelf.targetFormat, NULL, &strongSelf.preallocYUV420fBuffer);
+                                CVPixelBufferRef newYUV = NULL;
+                                CVPixelBufferCreate(kCFAllocatorDefault, w, h, strongSelf.targetFormat, NULL, &newYUV);
+                                strongSelf.preallocYUV420fBuffer = newYUV;
                             }
 
                             VTPixelTransferSessionRef prerenderXferSession = (VTPixelTransferSessionRef)strongSelf.gpuProcessor.pixelTransferSession;
@@ -309,7 +313,8 @@ static void vcam_core_log(NSString *msg) {
                             }
                         }
 
-                        int32_t fc = __sync_add_and_fetch(&strongSelf.frameCount, 1);
+                        static volatile int32_t sFrameCount = 0;
+                        int32_t fc = __sync_add_and_fetch(&sFrameCount, 1);
                         if (fc <= 3) {
                             vcam_core_log(@"[VCamCore] Prerendered frame OK");
                         }
