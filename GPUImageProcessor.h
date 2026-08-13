@@ -1,6 +1,8 @@
 #import <Foundation/Foundation.h>
 #import <CoreVideo/CoreVideo.h>
 #import <VideoToolbox/VideoToolbox.h>
+#import <CoreImage/CoreImage.h>
+#import <CoreGraphics/CoreGraphics.h>
 
 // 图像处理器：旋转、镜像、缩放、格式转换
 // 对标 vcameracrack 的 GPUImageProcessor

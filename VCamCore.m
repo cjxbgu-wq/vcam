@@ -4,6 +4,7 @@
 #import <CoreImage/CoreImage.h>
 #import <VideoToolbox/VideoToolbox.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <CoreVideo/CoreVideo.h>
 
 // 对标 vcameracrack 的 VCamCore
 // 关键改进（基于逆向分析）：
@@ -117,8 +118,8 @@ static void vcam_core_log(NSString *msg) {
     OSType fmt = CVPixelBufferGetPixelFormatType(pixelBuffer);
     // 只支持 BGRA, 420v, 420f（对标 vcameracrack）
     return (fmt == kCVPixelFormatType_32BGRA ||
-            fmt == kCVPixelFormatType_420YpCbCr8VideoRange ||
-            fmt == kCVPixelFormatType_420YpCbCr8FullRange);
+            fmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
+            fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
 }
 
 #pragma mark - 状态轮询（plist 轮询，每秒检查 enabled 变化）
@@ -278,8 +279,8 @@ static void vcam_core_log(NSString *msg) {
                         if (oldBGRA) CVPixelBufferRelease(oldBGRA);
 
                         // 如果目标格式是 YUV，同时预渲染 YUV 帧
-                        if (strongSelf.targetFormat == kCVPixelFormatType_420YpCbCr8VideoRange ||
-                            strongSelf.targetFormat == kCVPixelFormatType_420YpCbCr8FullRange) {
+                        if (strongSelf.targetFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
+                            strongSelf.targetFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
 
                             if (!strongSelf.preallocYUV420fBuffer ||
                                 CVPixelBufferGetWidth(strongSelf.preallocYUV420fBuffer) != w ||
@@ -290,9 +291,10 @@ static void vcam_core_log(NSString *msg) {
                                 CVPixelBufferCreate(kCFAllocatorDefault, w, h, strongSelf.targetFormat, NULL, &strongSelf.preallocYUV420fBuffer);
                             }
 
-                            if (strongSelf.preallocYUV420fBuffer && strongSelf.gpuProcessor.pixelTransferSession) {
+                            VTPixelTransferSessionRef prerenderXferSession = strongSelf.gpuProcessor.pixelTransferSession;
+                            if (strongSelf.preallocYUV420fBuffer && prerenderXferSession) {
                                 OSStatus xferStatus = VTPixelTransferSessionTransferImage(
-                                    strongSelf.gpuProcessor.pixelTransferSession,
+                                    prerenderXferSession,
                                     strongSelf.preallocBGRABuffer,
                                     strongSelf.preallocYUV420fBuffer);
                                 if (xferStatus == noErr) {
@@ -422,9 +424,10 @@ static void vcam_core_log(NSString *msg) {
     }
 
     // 路径 2：格式不匹配 → VTPixelTransferSession 转换（BGRA→YUV）
-    if (repFormat == kCVPixelFormatType_32BGRA && _gpuProcessor.pixelTransferSession) {
+    VTPixelTransferSessionRef xferSession = _gpuProcessor.pixelTransferSession;
+    if (repFormat == kCVPixelFormatType_32BGRA && xferSession) {
         OSStatus xferStatus = VTPixelTransferSessionTransferImage(
-            _gpuProcessor.pixelTransferSession, prerendered, origPixelBuffer);
+            xferSession, prerendered, origPixelBuffer);
         if (xferStatus == noErr) {
             CVPixelBufferRelease(prerendered);
             return;
