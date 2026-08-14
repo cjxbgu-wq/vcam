@@ -37,6 +37,11 @@
                                 height:(size_t)height
                                 format:(OSType)format CF_RETURNS_RETAINED;
 
+// 缩放到目标尺寸的 BGRA（预渲染用）
+- (CVPixelBufferRef)scaleToBGRA:(CVPixelBufferRef)input
+                          width:(size_t)width
+                         height:(size_t)height CF_RETURNS_RETAINED;
+
 // 格式转换（BGRA -> YUV 等）
 - (BOOL)transferPixelBuffer:(CVPixelBufferRef)src toPixelBuffer:(CVPixelBufferRef)dst;
 
