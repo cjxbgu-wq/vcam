@@ -27,6 +27,25 @@ static void vcam_ball_log(NSString *msg) {
     } @catch (NSException *e) {}
 }
 
+#pragma mark - 触摸穿透 window
+// 全屏 UIWindow 会拦截所有触摸导致桌面无法滑动(App 图标拖不动)。
+// 覆写 hitTest: 只有悬浮球/面板区域接收触摸, 空白区域返回 nil 穿透到下层 window。
+@interface VCamOverlayWindow : UIWindow
+@end
+
+@implementation VCamOverlayWindow
+
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    // 命中 window 自身或 rootViewController.view(全屏空白容器) = 空白区域 → 穿透
+    if (hit == self || hit == self.rootViewController.view) {
+        return nil;
+    }
+    return hit;
+}
+
+@end
+
 #pragma mark - 悬浮球视图
 
 @interface VCamBallView : UIView
@@ -163,10 +182,10 @@ static void vcam_ball_log(NSString *msg) {
     }
 
     if (windowScene) {
-        _overlayWindow = [[UIWindow alloc] initWithWindowScene:windowScene];
+        _overlayWindow = [[VCamOverlayWindow alloc] initWithWindowScene:windowScene];
         vcam_ball_log([NSString stringWithFormat:@"[vcam] overlay window attached to scene: %@", windowScene]);
     } else {
-        _overlayWindow = [[UIWindow alloc] initWithFrame:screenBounds];
+        _overlayWindow = [[VCamOverlayWindow alloc] initWithFrame:screenBounds];
         vcam_ball_log(@"[vcam] overlay window: no scene found, fallback initWithFrame");
     }
     _overlayWindow.frame = screenBounds;
