@@ -292,8 +292,9 @@ static void vcam_core_log(NSString *msg) {
     OSType srcFormat = CVPixelBufferGetPixelFormatType(src);
     OSType dstFormat = CVPixelBufferGetPixelFormatType(dst);
 
-    // 路径1：格式和尺寸都匹配 → 直接 memcpy（最快）
-    if (srcFormat == dstFormat && srcW == dstW && srcH == dstH) {
+    // 路径1：格式和尺寸都匹配 且 非planar(BGRA) → 直接 memcpy（最快）
+    // planar 格式(420f/420v)的预渲染buffer和相机帧 bpr 可能不同(padding/alignment), memcpy 会错位, 用 VTPixelTransferSession
+    if (srcFormat == dstFormat && srcW == dstW && srcH == dstH && CVPixelBufferGetPlaneCount(src) == 0) {
         CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
         CVPixelBufferLockBaseAddress(dst, 0);
 
