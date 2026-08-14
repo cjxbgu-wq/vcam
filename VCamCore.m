@@ -156,12 +156,17 @@ static void vcam_core_log(NSString *msg) {
         return;
     }
 
-    // BGRA 相机帧优先用 BGRA 缓存, YUV 相机帧优先用 YUV 缓存(同格式转换最快), 缺失时互相回退
+    // 按目标格式选源缓存:
+    //   BGRA 目标 → BGRA 缓存
+    //   420v/420f 目标 → YUV(420f) 缓存优先(标准 YUV→YUV 转换最快), 回退 BGRA
+    //   |xv0/p420 等私有格式目标 → BGRA 缓存优先(VT 支持 BGRA->|xv0, 不支持 420f->|xv0 -12905)
     CVPixelBufferRef src = NULL;
     if (origFormat == kCVPixelFormatType_32BGRA) {
-        src = bgra ? bgra : yuv;
-    } else {
+        src = bgra;
+    } else if (origFormat == '420v' || origFormat == '420f') {
         src = yuv ? yuv : bgra;
+    } else {
+        src = bgra ? bgra : yuv;
     }
 
     // 3. 写入相机帧: VT transfer(CropSourceToCleanAperture 自动 crop fill) 主路径
@@ -241,10 +246,14 @@ static void vcam_core_log(NSString *msg) {
 - (BOOL)isSupportedVideoFormat:(CVPixelBufferRef)buffer {
     if (!buffer) return NO;
     OSType format = CVPixelBufferGetPixelFormatType(buffer);
-    // 逆向白名单: 只有 BGRA, 420v, 420f（不处理 |xv0/p420 等私有格式，让系统自行编码）
+    // 千面白名单: BGRA, 420v, 420f
+    // 另加回 |xv0(0x7c787630)/p420: 视频模式预览流是私有格式, 千面在管道层让系统自行编码,
+    // 我们的 hook 点直接遇到 |xv0 帧, VT 支持 BGRA->|xv0(已验证 status=0), 须用 BGRA 缓存做源
     return format == kCVPixelFormatType_32BGRA  // BGRA
         || format == '420v'                      // 420v (VideoRange)
-        || format == '420f';                      // 420f (FullRange)
+        || format == '420f'                      // 420f (FullRange)
+        || format == 0x7c787630                  // |xv0 (私有, 视频模式预览)
+        || format == 0x70343230;                 // p420 (私有 3-plane YUV)
 }
 
 #pragma mark - 帧写入
