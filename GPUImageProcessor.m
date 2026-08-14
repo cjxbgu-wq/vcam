@@ -110,7 +110,10 @@ static void vcam_gpu_log(NSString *msg) {
     if (_pixelTransferSession) return;
     OSStatus status = VTPixelTransferSessionCreate(kCFAllocatorDefault, &_pixelTransferSession);
     if (status == noErr) {
-        vcam_gpu_log(@"[vcam] VTPixelTransferSession created successfully");
+        // 配置 RealTime + ScalingMode（参考逆向 vcameracrack.dylib）
+        VTSessionSetProperty(_pixelTransferSession, CFSTR("RealTime"), kCFBooleanTrue);
+        VTSessionSetProperty(_pixelTransferSession, CFSTR("ScalingMode"), CFSTR("CropSourceToCleanAperture"));
+        vcam_gpu_log(@"[vcam] VTPixelTransferSession created (RealTime + CropSourceToCleanAperture)");
     } else {
         vcam_gpu_log([NSString stringWithFormat:@"[vcam] Failed to create VTPixelTransferSession: %d", (int)status]);
     }
