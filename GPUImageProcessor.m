@@ -150,6 +150,20 @@ static void vcam_gpu_log(NSString *msg) {
     }
 }
 
+- (void)setupRenderPrivateSession {
+    if (_renderPrivateSession) return;
+    // render 私有格式专用 session: 私有格式转换与标准格式共用 session 会污染 VT 内部
+    // pipeline 缓存, 导致标准格式流(照片 420f)几何在正确/错误间交替(反复拉伸)
+    OSStatus status = VTPixelTransferSessionCreate(kCFAllocatorDefault, &_renderPrivateSession);
+    if (status == noErr) {
+        VTSessionSetProperty(_renderPrivateSession, CFSTR("RealTime"), kCFBooleanTrue);
+        VTSessionSetProperty(_renderPrivateSession, CFSTR("ScalingMode"), CFSTR("CropSourceToCleanAperture"));
+        vcam_gpu_log(@"[vcam] Render-private VTPixelTransferSession created");
+    } else {
+        vcam_gpu_log([NSString stringWithFormat:@"[vcam] Failed to create render-private session: %d", (int)status]);
+    }
+}
+
 - (void)setupPixelRotationSession {
     if (_pixelRotationSession) return;
 
