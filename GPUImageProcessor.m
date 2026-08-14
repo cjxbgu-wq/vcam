@@ -193,69 +193,74 @@ static void vcam_gpu_log(NSString *msg) {
 - (CVPixelBufferPoolRef)getOrCreatePoolForWidth:(size_t)width height:(size_t)height format:(OSType)format {
     if (width == 0 || height == 0) return NULL;
 
-    NSString *key = [NSString stringWithFormat:@"%zu_%zu_%u", width, height, (unsigned)format];
-    id existing = _bgraBufferPoolMap[key];
-    if (existing) {
-        return (__bridge CVPixelBufferPoolRef)existing;
-    }
+    // 池字典非线程安全: render 线程(私有格式两步转换)与预渲染线程(convertFormat 回退)都会访问
+    @synchronized(self) {
+        NSString *key = [NSString stringWithFormat:@"%zu_%zu_%u", width, height, (unsigned)format];
+        id existing = _bgraBufferPoolMap[key];
+        if (existing) {
+            return (__bridge CVPixelBufferPoolRef)existing;
+        }
 
-    // 创建新池（关键约束：不能用 kCVPixelBufferIOSurfacePropertiesKey）
-    NSDictionary *poolAttributes = @{
-        (id)kCVPixelBufferPoolMinimumBufferCountKey: @2,
-    };
-    NSDictionary *pixelBufferAttributes = @{
-        (id)kCVPixelBufferWidthKey:  @(width),
-        (id)kCVPixelBufferHeightKey: @(height),
-        (id)kCVPixelBufferPixelFormatTypeKey: @(format),
-    };
+        // 创建新池（关键约束：不能用 kCVPixelBufferIOSurfacePropertiesKey）
+        NSDictionary *poolAttributes = @{
+            (id)kCVPixelBufferPoolMinimumBufferCountKey: @2,
+        };
+        NSDictionary *pixelBufferAttributes = @{
+            (id)kCVPixelBufferWidthKey:  @(width),
+            (id)kCVPixelBufferHeightKey: @(height),
+            (id)kCVPixelBufferPixelFormatTypeKey: @(format),
+        };
 
-    CVPixelBufferPoolRef pool = NULL;
-    OSStatus status = CVPixelBufferPoolCreate(
-        kCFAllocatorDefault,
-        (__bridge CFDictionaryRef)poolAttributes,
-        (__bridge CFDictionaryRef)pixelBufferAttributes,
-        &pool
-    );
-
-    if (status != noErr) {
-        // 回退：NULL pool attributes
-        status = CVPixelBufferPoolCreate(
+        CVPixelBufferPoolRef pool = NULL;
+        OSStatus status = CVPixelBufferPoolCreate(
             kCFAllocatorDefault,
-            NULL,
+            (__bridge CFDictionaryRef)poolAttributes,
             (__bridge CFDictionaryRef)pixelBufferAttributes,
             &pool
         );
-    }
 
-    if (status == noErr && pool) {
-        _bgraBufferPoolMap[key] = (__bridge id)pool;
-        vcam_gpu_log([NSString stringWithFormat:@"[vcam] Created buffer pool: %zux%zu fmt=%u (key=%@)", width, height, (unsigned)format, key]);
-        return pool;
-    }
+        if (status != noErr) {
+            // 回退：NULL pool attributes
+            status = CVPixelBufferPoolCreate(
+                kCFAllocatorDefault,
+                NULL,
+                (__bridge CFDictionaryRef)pixelBufferAttributes,
+                &pool
+            );
+        }
 
-    vcam_gpu_log([NSString stringWithFormat:@"[vcam] Failed to create buffer pool: %d, %zux%zu", (int)status, width, height]);
-    return NULL;
+        if (status == noErr && pool) {
+            _bgraBufferPoolMap[key] = (__bridge id)pool;
+            vcam_gpu_log([NSString stringWithFormat:@"[vcam] Created buffer pool: %zux%zu fmt=%u (key=%@)", width, height, (unsigned)format, key]);
+            return pool;
+        }
+
+        vcam_gpu_log([NSString stringWithFormat:@"[vcam] Failed to create buffer pool: %d, %zux%zu", (int)status, width, height]);
+        return NULL;
+    }
 }
 
 - (CVPixelBufferRef)getOrCreateBGRABufferWithWidth:(size_t)width height:(size_t)height CF_RETURNS_RETAINED {
-    CVPixelBufferPoolRef pool = [self getOrCreatePoolForWidth:width height:height format:kCVPixelFormatType_32BGRA];
+    @synchronized(self) {
+        CVPixelBufferPoolRef pool = [self getOrCreatePoolForWidth:width height:height format:kCVPixelFormatType_32BGRA];
 
-    CVPixelBufferRef buffer = NULL;
-    if (pool) {
-        OSStatus status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &buffer);
-        if (status == noErr && buffer) {
-            return buffer;
+        CVPixelBufferRef buffer = NULL;
+        if (pool) {
+            OSStatus status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &buffer);
+            if (status == noErr && buffer) {
+                return buffer;
+            }
+            vcam_gpu_log([NSString stringWithFormat:@"[vcam] Failed to get buffer from pool: %d", (int)status]);
         }
-        vcam_gpu_log([NSString stringWithFormat:@"[vcam] Failed to get buffer from pool: %d", (int)status]);
-    }
 
-    // 回退：直接创建（不带 IOSurface 属性）
-    OSStatus status = CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, NULL, &buffer);
-    if (status != noErr) {
-        vcam_gpu_log([NSString stringWithFormat:@"[vcam] Failed to create pixel buffer: %d, %zux%zu BGRA", (int)status, width, height]);
-        return NULL;
+        // 回退：直接创建（不带 IOSurface 属性）
+        OSStatus status = CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, NULL, &buffer);
+        if (status != noErr) {
+            vcam_gpu_log([NSString stringWithFormat:@"[vcam] Failed to create pixel buffer: %d, %zux%zu BGRA", (int)status, width, height]);
+            return NULL;
+        }
+        return buffer;
     }
-    return buffer;
 }
 
 - (void)configureWithWidth:(size_t)width height:(size_t)height format:(OSType)format {
