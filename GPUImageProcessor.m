@@ -70,6 +70,7 @@ static void vcam_gpu_log(NSString *msg) {
         _mirrored = NO;
         _rotationApiAvailable = NO;
         _pixelTransferSession = NULL;
+        _renderPrivateSession = NULL;
         _prerenderTransferSession = NULL;
         _pixelRotationSession = NULL;
         _bgraBufferPoolMap = [[NSMutableDictionary alloc] init];
@@ -104,6 +105,10 @@ static void vcam_gpu_log(NSString *msg) {
     if (_prerenderTransferSession) {
         InvalidateFunc invalidate = (InvalidateFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionInvalidate");
         if (invalidate) invalidate(_prerenderTransferSession);
+    }
+    if (_renderPrivateSession) {
+        InvalidateFunc invalidate = (InvalidateFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionInvalidate");
+        if (invalidate) invalidate(_renderPrivateSession);
     }
     // 释放所有缓冲池
     for (id key in _bgraBufferPoolMap) {
@@ -518,7 +523,23 @@ static void vcam_gpu_log(NSString *msg) {
 }
 
 - (BOOL)transferPixelBuffer:(CVPixelBufferRef)src toPixelBuffer:(CVPixelBufferRef)dst {
-    if (!src || !dst || !_pixelTransferSession) return NO;
+    if (!src || !dst) return NO;
+
+    // 按目标格式选 session: 私有格式转换用独立 session,
+    // 防止其 pipeline 状态污染标准格式流(照片 420f 几何反复抖动)
+    OSType dstFmt = CVPixelBufferGetPixelFormatType(dst);
+    BOOL privateTarget = !(dstFmt == kCVPixelFormatType_32BGRA || dstFmt == '420v' || dstFmt == '420f');
+    VTPixelTransferSessionRef session = privateTarget ? _renderPrivateSession : _pixelTransferSession;
+    if (!session) {
+        if (privateTarget) {
+            [self setupRenderPrivateSession];
+            session = _renderPrivateSession;
+        } else {
+            [self setupPixelTransferSession];
+            session = _pixelTransferSession;
+        }
+    }
+    if (!session) return NO;
 
     // 等比裁剪填充: VT 'CropSourceToCleanAperture' 语义是"源 CA 区域拉伸到目标全帧"(非等比!)
     // 通过把源的 clean aperture 设为"等比居中裁剪出的子区域"(与目标等比),
@@ -552,10 +573,10 @@ static void vcam_gpu_log(NSString *msg) {
         }
     }
 
-    OSStatus status = VTPixelTransferSessionTransferImage(_pixelTransferSession, src, dst);
+    OSStatus status = VTPixelTransferSessionTransferImage(session, src, dst);
     if (status != noErr) {
         vcam_gpu_log([NSString stringWithFormat:@"[vcam] VTPixelTransferSession failed: %d, format: %@",
-                      (int)status, [self stringForFormat:CVPixelBufferGetPixelFormatType(dst)]]);
+                      (int)status, [self stringForFormat:dstFmt]]);
         return NO;
     }
     return YES;
