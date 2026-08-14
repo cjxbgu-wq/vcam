@@ -42,6 +42,15 @@
                           width:(size_t)width
                          height:(size_t)height CF_RETURNS_RETAINED;
 
+// 预渲染用: 需要旋转/镜像时做变换(输出 BGRA), 否则原帧 retain 返回
+- (CVPixelBufferRef)rotateAndMirrorIfNeeded:(CVPixelBufferRef)input CF_RETURNS_RETAINED;
+
+// 预渲染用: 同尺寸格式转换(如 BGRA -> 420f), VT 主路径 + CoreImage 回退
+- (CVPixelBufferRef)convertFormat:(CVPixelBufferRef)input toFormat:(OSType)format CF_RETURNS_RETAINED;
+
+// writeFrame 回退路径: crop fill 渲染到任意格式目标 buffer
+- (BOOL)renderCropFill:(CVPixelBufferRef)input toPixelBuffer:(CVPixelBufferRef)dst;
+
 // 格式转换（BGRA -> YUV 等）
 - (BOOL)transferPixelBuffer:(CVPixelBufferRef)src toPixelBuffer:(CVPixelBufferRef)dst;
 

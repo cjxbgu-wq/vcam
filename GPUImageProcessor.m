@@ -107,10 +107,12 @@ static void vcam_gpu_log(NSString *msg) {
     if (_pixelTransferSession) return;
     OSStatus status = VTPixelTransferSessionCreate(kCFAllocatorDefault, &_pixelTransferSession);
     if (status == noErr) {
-        // 只设 RealTime（降低延迟）。不设 ScalingMode —— 预渲染已 crop fill 到目标尺寸，
-        // 同尺寸转换不需要额外缩放，CropSourceToCleanAperture 会导致画面位置偏移
+        // 对齐逆向 vcameracrack.dylib: RealTime + CropSourceToCleanAperture
+        // VT transfer 支持任意尺寸+格式组合, CropSourceToCleanAperture 自动做 crop fill 缩放
+        // (源缩放到完全填充目标, 超出部分裁剪, 无黑边, 硬件优化质量好)
         VTSessionSetProperty(_pixelTransferSession, CFSTR("RealTime"), kCFBooleanTrue);
-        vcam_gpu_log(@"[vcam] VTPixelTransferSession created (RealTime only, no ScalingMode)");
+        VTSessionSetProperty(_pixelTransferSession, CFSTR("ScalingMode"), CFSTR("CropSourceToCleanAperture"));
+        vcam_gpu_log(@"[vcam] VTPixelTransferSession created (RealTime + CropSourceToCleanAperture)");
     } else {
         vcam_gpu_log([NSString stringWithFormat:@"[vcam] Failed to create VTPixelTransferSession: %d", (int)status]);
     }
@@ -351,6 +353,79 @@ static void vcam_gpu_log(NSString *msg) {
     }
 
     return dst;
+}
+
+// 预渲染用: 需要旋转/镜像时做变换(输出 BGRA), 否则原帧 retain 返回
+- (CVPixelBufferRef)rotateAndMirrorIfNeeded:(CVPixelBufferRef)input CF_RETURNS_RETAINED {
+    if (!input) return NULL;
+    if (_rotationAngle == 0 && !_mirrored) {
+        return (CVPixelBufferRef)CVPixelBufferRetain(input);
+    }
+    if (!_rotationApiAvailable || !_pixelRotationSession) {
+        // 旋转 API 不可用, 回退原帧（不旋转）
+        return (CVPixelBufferRef)CVPixelBufferRetain(input);
+    }
+    size_t inW = CVPixelBufferGetWidth(input);
+    size_t inH = CVPixelBufferGetHeight(input);
+    size_t rotW = (_rotationAngle == 90 || _rotationAngle == 270) ? inH : inW;
+    size_t rotH = (_rotationAngle == 90 || _rotationAngle == 270) ? inW : inH;
+    CVPixelBufferRef r = [self rotateAndMirror:input width:rotW height:rotH];
+    if (!r) {
+        // 旋转失败, 回退原帧
+        return (CVPixelBufferRef)CVPixelBufferRetain(input);
+    }
+    return r;
+}
+
+// 预渲染用: 同尺寸格式转换(如 BGRA -> 420f), VT 主路径 + CoreImage 回退
+- (CVPixelBufferRef)convertFormat:(CVPixelBufferRef)input toFormat:(OSType)format CF_RETURNS_RETAINED {
+    if (!input) return NULL;
+    if (CVPixelBufferGetPixelFormatType(input) == format) {
+        return (CVPixelBufferRef)CVPixelBufferRetain(input);
+    }
+    size_t w = CVPixelBufferGetWidth(input);
+    size_t h = CVPixelBufferGetHeight(input);
+
+    // VT transfer 同尺寸格式转换
+    CVPixelBufferRef out = [self createBufferWithWidth:w height:h format:format];
+    if (out) {
+        if (_pixelTransferSession &&
+            VTPixelTransferSessionTransferImage(_pixelTransferSession, input, out) == noErr) {
+            return out;
+        }
+        CVPixelBufferRelease(out);
+    }
+
+    // CoreImage 回退
+    return [self convertWithCoreImage:input toFormat:format width:w height:h];
+}
+
+// writeFrame 回退路径: crop fill 渲染到任意格式目标 buffer（保持宽高比填满, 居中裁剪）
+- (BOOL)renderCropFill:(CVPixelBufferRef)input toPixelBuffer:(CVPixelBufferRef)dst {
+    if (!input || !dst || !_preprocessContext) return NO;
+
+    size_t inW = CVPixelBufferGetWidth(input);
+    size_t inH = CVPixelBufferGetHeight(input);
+    size_t w = CVPixelBufferGetWidth(dst);
+    size_t h = CVPixelBufferGetHeight(dst);
+    if (inW == 0 || inH == 0 || w == 0 || h == 0) return NO;
+
+    CIImage *image = [CIImage imageWithCVPixelBuffer:input];
+    if (!image) return NO;
+
+    CGFloat scale = MAX((CGFloat)w / (CGFloat)inW, (CGFloat)h / (CGFloat)inH);
+    CGFloat offsetX = ((CGFloat)w - (CGFloat)inW * scale) / 2.0;
+    CGFloat offsetY = ((CGFloat)h - (CGFloat)inH * scale) / 2.0;
+    CGAffineTransform t = CGAffineTransformMakeScale(scale, scale);
+    t = CGAffineTransformTranslate(t, offsetX / scale, offsetY / scale);
+    CIImage *scaled = [image imageByApplyingTransform:t];
+
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    [_preprocessContext render:scaled toCVPixelBuffer:dst
+                        bounds:CGRectMake(0, 0, (CGFloat)w, (CGFloat)h)
+                    colorSpace:colorSpace];
+    CGColorSpaceRelease(colorSpace);
+    return YES;
 }
 
 - (CVPixelBufferRef)convertWithCoreImage:(CVPixelBufferRef)input

@@ -43,8 +43,6 @@ static void vcam_core_log(NSString *msg) {
 @property (nonatomic, assign) size_t lastProcessedHeight;
 @property (nonatomic, assign) OSType lastProcessedFormat;
 @property (nonatomic, assign) BOOL prerenderActive;
-// 多格式预渲染: 每种格式对应尺寸的 BGRA buffer（key=FourCC NSNumber, value=__bridge CVPixelBufferRef）
-@property (nonatomic, strong) NSMutableDictionary *liveBGRAMap;
 @end
 
 @implementation VCamCore
@@ -78,14 +76,12 @@ static void vcam_core_log(NSString *msg) {
         _frameCount = 0;
         _pollingActive = NO;
         _lastEnabledState = NO;
-        _formatLockMap = [[NSMutableDictionary alloc] init];
         _cachedProcessedFrame = NULL;
         _lastProcessedFrameCount = 0;
         _lastProcessedWidth = 0;
         _lastProcessedHeight = 0;
         _lastProcessedFormat = 0;
         _prerenderActive = NO;
-        _liveBGRAMap = [[NSMutableDictionary alloc] init];
 
         // 初始化组件
         _gpuProcessor = [[GPUImageProcessor alloc] init];
@@ -131,8 +127,6 @@ static void vcam_core_log(NSString *msg) {
 - (void)renderReplacementToPixelBuffer:(CVPixelBufferRef)pixelBuffer {
     if (!pixelBuffer || !_enabled) return;
 
-    size_t origWidth = CVPixelBufferGetWidth(pixelBuffer);
-    size_t origHeight = CVPixelBufferGetHeight(pixelBuffer);
     OSType origFormat = CVPixelBufferGetPixelFormatType(pixelBuffer);
 
     // 诊断: 每 60 帧记录 render 入口
@@ -140,77 +134,49 @@ static void vcam_core_log(NSString *msg) {
     vcamRenderCount++;
     BOOL diagThisFrame = (vcamRenderCount % 60 == 1);
 
-    // 1. 格式白名单检查
+    // 1. 格式白名单检查（对齐逆向: 只有 BGRA/420v/420f）
     if (![self isSupportedVideoFormat:pixelBuffer]) {
         if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d SKIP whitelist fmt=0x%x", vcamRenderCount, (unsigned)origFormat]);
         return;
     }
 
-    // 2. 多格式锁定: key="format_w_h"（允许同格式不同尺寸，如 420f 1080x2340 和 420f 1440x1080）
-    NSString *fmtKey = [NSString stringWithFormat:@"%u_%zu_%zu", (unsigned)origFormat, origWidth, origHeight];
-    if (!_formatLockMap[fmtKey]) {
-        char fstr[5] = {0};
-        fstr[0] = (char)(origFormat >> 24);
-        fstr[1] = (char)(origFormat >> 16);
-        fstr[2] = (char)(origFormat >> 8);
-        fstr[3] = (char)origFormat;
-        vcam_core_log([NSString stringWithFormat:@"[vcam] Format locked: %zux%zu fmt=0x%x (%s)",
-                       origWidth, origHeight, (unsigned)origFormat, fstr]);
-        _formatLockMap[fmtKey] = @YES;
-        _targetWidth = origWidth;
-        _targetHeight = origHeight;
-        _targetFormat = origFormat;
-        _targetSizeKnown = YES;
-    }
-    // key 已包含尺寸，不需要检查 mismatch
-
-    // 3. 用预渲染的 liveBGRAMap 取对应 format+w+h 的 420f buffer
+    // 2. 按相机帧格式选预渲染缓存（视频原尺寸双格式, 对齐逆向）
     [_processLock lock];
-    id bgraObj = _liveBGRAMap[fmtKey];
-    if (!bgraObj) bgraObj = _liveBGRAMap[@(0)];  // 回退到原始尺寸
-    if (bgraObj) CFRetain((__bridge CFTypeRef)bgraObj);
+    CVPixelBufferRef bgra = _liveBGRAPixelBuffer;
+    if (bgra) CVPixelBufferRetain(bgra);
+    CVPixelBufferRef yuv = _liveYUVPixelBuffer;
+    if (yuv) CVPixelBufferRetain(yuv);
     [_processLock unlock];
 
-    if (bgraObj) {
-        CVPixelBufferRef liveBGRA = (__bridge CVPixelBufferRef)bgraObj;
-        size_t liveW = CVPixelBufferGetWidth(liveBGRA);
-        size_t liveH = CVPixelBufferGetHeight(liveBGRA);
-        if (liveW == origWidth && liveH == origHeight) {
-            // 尺寸匹配：writeFrame 处理格式转换（memcpy/VTPixelTransferSession/CoreImage）
-            [self writeFrame:liveBGRA toPixelBuffer:pixelBuffer];
-            [self cacheLastRenderedFrame:liveBGRA width:origWidth height:origHeight];
-            if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d OK wrote frame %zux%zu (prerendered)", vcamRenderCount, origWidth, origHeight]);
-            CFRelease((__bridge CFTypeRef)bgraObj);
-            _frameCount++;
-            return;
-        } else {
-            // 尺寸不匹配：实时缩放 + 格式转换
-            CVPixelBufferRef processedFrame = [_gpuProcessor processPixelBuffer:liveBGRA toWidth:origWidth height:origHeight format:origFormat];
-            if (processedFrame) {
-                [self writeFrame:processedFrame toPixelBuffer:pixelBuffer];
-                [self cacheLastRenderedFrame:processedFrame width:origWidth height:origHeight];
-                CVPixelBufferRelease(processedFrame);
-                if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d OK wrote frame %zux%zu (live resize)", vcamRenderCount, origWidth, origHeight]);
-                CFRelease((__bridge CFTypeRef)bgraObj);
-                _frameCount++;
-                return;
-            }
-        }
-        CFRelease((__bridge CFTypeRef)bgraObj);
+    if (!bgra && !yuv) {
+        if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d NO frame no cache", vcamRenderCount]);
+        return;
     }
 
-    // 4. 没有预渲染帧，用 _liveBGRAPixelBuffer/liveYUVPixelBuffer 回退
-    if (origFormat == kCVPixelFormatType_32BGRA && _liveBGRAPixelBuffer) {
-        [self writeFrame:_liveBGRAPixelBuffer toPixelBuffer:pixelBuffer];
-        if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d cache BGRA", vcamRenderCount]);
-        return;
+    // BGRA 相机帧优先用 BGRA 缓存, YUV 相机帧优先用 YUV 缓存(同格式转换最快), 缺失时互相回退
+    CVPixelBufferRef src = NULL;
+    if (origFormat == kCVPixelFormatType_32BGRA) {
+        src = bgra ? bgra : yuv;
+    } else {
+        src = yuv ? yuv : bgra;
     }
-    if (_liveYUVPixelBuffer) {
-        [self writeFrame:_liveYUVPixelBuffer toPixelBuffer:pixelBuffer];
-        if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d cache YUV", vcamRenderCount]);
-        return;
+
+    // 3. 写入相机帧: VT transfer(CropSourceToCleanAperture 自动 crop fill) 主路径
+    BOOL ok = [self writeFrame:src toPixelBuffer:pixelBuffer];
+    if (ok) {
+        _frameCount++;
+        if (diagThisFrame) {
+            vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d OK %zux%zu via %@",
+                           vcamRenderCount,
+                           CVPixelBufferGetWidth(pixelBuffer), CVPixelBufferGetHeight(pixelBuffer),
+                           (src == bgra) ? @"BGRA" : @"YUV"]);
+        }
+    } else if (diagThisFrame) {
+        vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d FAILED write, keep camera", vcamRenderCount]);
     }
-    if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d NO frame no cache", vcamRenderCount]);
+
+    if (bgra) CVPixelBufferRelease(bgra);
+    if (yuv) CVPixelBufferRelease(yuv);
 }
 
 - (BOOL)hasReplacementFrame {
@@ -242,8 +208,6 @@ static void vcam_core_log(NSString *msg) {
     _targetWidth = 0;
     _targetHeight = 0;
     _targetFormat = 0;
-    [_formatLockMap removeAllObjects];
-    [_liveBGRAMap removeAllObjects];
     [_processLock unlock];
     vcam_core_log(@"[vcam] Replacement frame cleared, real camera restored");
 }
@@ -282,63 +246,59 @@ static void vcam_core_log(NSString *msg) {
 
 #pragma mark - 帧写入
 
-- (void)writeFrame:(CVPixelBufferRef)src toPixelBuffer:(CVPixelBufferRef)dst {
-    if (!src || !dst) return;
+// 对齐逆向: VT transfer(CropSourceToCleanAperture 自动 crop fill 缩放+格式转换) 主路径
+// 失败回退 CoreImage crop fill, 再失败保留原相机帧(绝不输出未初始化 buffer 防绿屏)
+- (BOOL)writeFrame:(CVPixelBufferRef)src toPixelBuffer:(CVPixelBufferRef)dst {
+    if (!src || !dst) return NO;
 
+    // 路径1: VTPixelTransferSession（任意尺寸+格式组合, CropSourceToCleanAperture 自动 crop fill）
+    if ([_gpuProcessor transferPixelBuffer:src toPixelBuffer:dst]) {
+        return YES;
+    }
+
+    // 路径2: CoreImage crop fill 渲染（回退）
+    @try {
+        if ([_gpuProcessor renderCropFill:src toPixelBuffer:dst]) {
+            return YES;
+        }
+    } @catch (NSException *e) {
+        vcam_core_log([NSString stringWithFormat:@"[vcam] renderCropFill exception: %@", e]);
+    }
+
+    // 路径3: 同格式同尺寸非 planar memcpy（最后手段）
     size_t srcW = CVPixelBufferGetWidth(src);
     size_t srcH = CVPixelBufferGetHeight(src);
     size_t dstW = CVPixelBufferGetWidth(dst);
     size_t dstH = CVPixelBufferGetHeight(dst);
-    OSType srcFormat = CVPixelBufferGetPixelFormatType(src);
-    OSType dstFormat = CVPixelBufferGetPixelFormatType(dst);
-
-    // 路径1：格式和尺寸都匹配 且 非planar(BGRA) → 直接 memcpy（最快）
-    // planar 格式(420f/420v)的预渲染buffer和相机帧 bpr 可能不同(padding/alignment), memcpy 会错位, 用 VTPixelTransferSession
-    if (srcFormat == dstFormat && srcW == dstW && srcH == dstH && CVPixelBufferGetPlaneCount(src) == 0) {
+    if (CVPixelBufferGetPixelFormatType(src) == CVPixelBufferGetPixelFormatType(dst) &&
+        srcW == dstW && srcH == dstH && CVPixelBufferGetPlaneCount(src) == 0) {
         CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
         CVPixelBufferLockBaseAddress(dst, 0);
-
         void *srcBase = CVPixelBufferGetBaseAddress(src);
         void *dstBase = CVPixelBufferGetBaseAddress(dst);
-        size_t srcSize = CVPixelBufferGetDataSize(src);
-        size_t dstSize = CVPixelBufferGetDataSize(dst);
-
         if (srcBase && dstBase) {
-            size_t copySize = MIN(srcSize, dstSize);
-            memcpy(dstBase, srcBase, copySize);
+            memcpy(dstBase, srcBase, MIN(CVPixelBufferGetDataSize(src), CVPixelBufferGetDataSize(dst)));
+            CVPixelBufferUnlockBaseAddress(dst, 0);
+            CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+            return YES;
         }
-
         CVPixelBufferUnlockBaseAddress(dst, 0);
         CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
-        return;
     }
 
-    // 路径2：VTPixelTransferSession 转换
-    if ([_gpuProcessor transferPixelBuffer:src toPixelBuffer:dst]) {
-        return;
-    }
-
-    // 路径3：CoreImage 渲染（回退）
-    @try {
-        CIImage *image = [CIImage imageWithCVPixelBuffer:src];
-        if (image && _ciContext) {
-            [_ciContext render:image toCVPixelBuffer:dst];
-            return;
-        }
-    } @catch (NSException *e) {
-        vcam_core_log([NSString stringWithFormat:@"[vcam] CoreImage render failed: %@", e]);
-    }
-
-    // 路径4：所有方法都失败 → 保持原始相机帧（不显示黑屏）
-    // 不做任何操作，让原始相机帧通过
+    // 全部失败: 保留原始相机帧（不显示黑屏/绿屏）
+    return NO;
 }
 
 #pragma mark - 预渲染线程
 
+// 对齐逆向: 只产出视频原尺寸(旋转后互换)的 BGRA + 420f 双格式缓存
+// render 时由 VTPixelTransferSession(CropSourceToCleanAperture) 一步完成 crop fill 缩放+格式转换
+// (不再按相机帧格式做多尺寸缩放 —— 那会导致比例失真/性能差/未初始化 buffer 绿闪)
 - (void)startPrerenderThread {
     if (_prerenderActive) return;
     _prerenderActive = YES;
-    vcam_core_log(@"[vcam] Prerender thread started");
+    vcam_core_log(@"[vcam] Prerender thread started (native-size dual-format)");
     __weak typeof(self) weakSelf = self;
     dispatch_async(_prerenderQueue, ^{
         VCamCore *strongSelf = weakSelf;
@@ -351,39 +311,27 @@ static void vcam_core_log(NSString *msg) {
                     continue;
                 }
 
-                // 多格式预渲染：遍历 formatLockMap，为每种格式产出对应尺寸的 BGRA
-                [strongSelf.processLock lock];
-                NSDictionary *formatMap = [strongSelf.formatLockMap copy];
-                [strongSelf.processLock unlock];
-
-                if (formatMap.count == 0) {
-                    // 还没遇到相机帧，用视频原始尺寸，产出 BGRA
-                    size_t vw = CVPixelBufferGetWidth(frame);
-                    size_t vh = CVPixelBufferGetHeight(frame);
-                    CVPixelBufferRef processed = [strongSelf.gpuProcessor scaleToBGRA:frame width:vw height:vh];
-                    if (processed) {
-                        [strongSelf.processLock lock];
-                        strongSelf.liveBGRAMap[@(0)] = (__bridge_transfer id)processed;
-                        [strongSelf.processLock unlock];
-                    }
-                } else {
-                    // formatLockMap key = "format_w_h"，统一产出 BGRA（最快, writeFrame 做 BGRA→目标格式）
-                    for (NSString *key in formatMap) {
-                        NSArray *parts = [key componentsSeparatedByString:@"_"];
-                        if (parts.count != 3) continue;
-                        size_t w = (size_t)[parts[1] integerValue];
-                        size_t h = (size_t)[parts[2] integerValue];
-
-                        CVPixelBufferRef processed = [strongSelf.gpuProcessor scaleToBGRA:frame width:w height:h];
-                        if (processed) {
-                            [strongSelf.processLock lock];
-                            strongSelf.liveBGRAMap[key] = (__bridge_transfer id)processed;
-                            [strongSelf.processLock unlock];
-                        }
-                    }
-                }
-
+                // 1. 旋转/镜像（如需要, 视频原尺寸）
+                CVPixelBufferRef rotated = [strongSelf.gpuProcessor rotateAndMirrorIfNeeded:frame];
                 CVPixelBufferRelease(frame);
+                if (!rotated) continue;
+
+                // 2. YUV 版本（同尺寸 420f, VT 转换）
+                CVPixelBufferRef yuv = [strongSelf.gpuProcessor convertFormat:rotated toFormat:'420f'];
+
+                // 3. 完整产出后才替换缓存（避免半成品被 render 读到）
+                [strongSelf.processLock lock];
+                if (strongSelf->_liveBGRAPixelBuffer) {
+                    CVPixelBufferRelease(strongSelf->_liveBGRAPixelBuffer);
+                }
+                strongSelf->_liveBGRAPixelBuffer = rotated;  // 所有权转移
+                if (yuv) {
+                    if (strongSelf->_liveYUVPixelBuffer) {
+                        CVPixelBufferRelease(strongSelf->_liveYUVPixelBuffer);
+                    }
+                    strongSelf->_liveYUVPixelBuffer = yuv;  // 所有权转移; 失败时保留旧 YUV
+                }
+                [strongSelf.processLock unlock];
 
                 // 按视频帧率等待
                 double fps = strongSelf.videoPlayer.videoFps > 1.0 ? strongSelf.videoPlayer.videoFps : 30.0;

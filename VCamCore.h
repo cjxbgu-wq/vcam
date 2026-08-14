@@ -38,16 +38,15 @@
 @property (nonatomic, strong) GPUImageProcessor *gpuProcessor;
 @property (nonatomic, strong) NSQueue *frameQueue;
 
-// 双格式预渲染缓冲区（逆向特征: 同时维护 BGRA 和 YUV）
+// 双格式预渲染缓冲区（对齐逆向: 视频原尺寸的 BGRA + YUV(420f), render 时 VT transfer crop fill 到相机帧）
 @property (nonatomic, assign) CVPixelBufferRef liveBGRAPixelBuffer;
 @property (nonatomic, assign) CVPixelBufferRef liveYUVPixelBuffer;
 
-// 格式锁定状态(多格式: 每种格式独立锁尺寸, 允许 420f/|xv0/p420 同时处理)
+// 格式状态（诊断用）
 @property (nonatomic, assign) BOOL targetSizeKnown;
 @property (nonatomic, assign) size_t targetWidth;
 @property (nonatomic, assign) size_t targetHeight;
 @property (nonatomic, assign) OSType targetFormat;
-@property (nonatomic, strong) NSMutableDictionary<NSString *, id> *formatLockMap;  // key="format_w_h" value=@YES
 
 // 缓存
 @property (nonatomic, assign) size_t lastRenderedWidth;
