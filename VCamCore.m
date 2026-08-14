@@ -137,8 +137,8 @@ static void vcam_core_log(NSString *msg) {
         _targetSizeKnown = YES;
     }
 
-    // 跳过与锁定格式不同的帧（防止相机多流格式交替导致崩溃，但允许同格式不同尺寸）
-    if (origFormat != _targetFormat) {
+    // 跳过与锁定格式+尺寸不同的帧（防止相机多流交替导致 buffer mismatch 崩溃）
+    if (origWidth != _targetWidth || origHeight != _targetHeight || origFormat != _targetFormat) {
         return;
     }
 
