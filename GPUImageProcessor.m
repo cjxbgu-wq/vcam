@@ -51,11 +51,8 @@ static void vcam_gpu_log(NSString *msg) {
 // CIContext（软件渲染，mediaserverd 没有 GPU 上下文）
 @property (nonatomic, strong) CIContext *preprocessContext;
 
-// 缓冲池（减少运行时分配开销）
-@property (nonatomic, assign) CVPixelBufferPoolRef bgraBufferPool;
-@property (nonatomic, assign) size_t preprocessWidth;
-@property (nonatomic, assign) size_t preprocessHeight;
-@property (nonatomic, assign) OSType preprocessFormat;
+// 缓冲池字典（key="w_h", value=CVPixelBufferPoolRef）—— 每个尺寸独立池，避免频繁重建
+@property (nonatomic, strong) NSMutableDictionary *bgraBufferPoolMap;
 
 // 内部方法（前向声明，让 ARC 正确处理 CF_RETURNS_RETAINED）
 - (CVPixelBufferRef)scaleToBGRA:(CVPixelBufferRef)input width:(size_t)width height:(size_t)height CF_RETURNS_RETAINED;
@@ -71,10 +68,7 @@ static void vcam_gpu_log(NSString *msg) {
         _rotationApiAvailable = NO;
         _pixelTransferSession = NULL;
         _pixelRotationSession = NULL;
-        _bgraBufferPool = NULL;
-        _preprocessWidth = 0;
-        _preprocessHeight = 0;
-        _preprocessFormat = 0;
+        _bgraBufferPoolMap = [[NSMutableDictionary alloc] init];
 
         // 软件渲染 CIContext（mediaserverd 没有 GPU 上下文）
         @try {
@@ -98,9 +92,12 @@ static void vcam_gpu_log(NSString *msg) {
         InvalidateFunc invalidate = (InvalidateFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionInvalidate");
         if (invalidate) invalidate(_pixelTransferSession);
     }
-    if (_bgraBufferPool) {
-        CVPixelBufferPoolRelease(_bgraBufferPool);
+    // 释放所有缓冲池
+    for (id key in _bgraBufferPoolMap) {
+        CVPixelBufferPoolRef pool = (__bridge CVPixelBufferPoolRef)_bgraBufferPoolMap[key];
+        CVPixelBufferPoolRelease(pool);
     }
+    [_bgraBufferPoolMap removeAllObjects];
     vcam_gpu_log(@"[vcam] GPUImageProcessor deallocated");
 }
 
@@ -110,10 +107,10 @@ static void vcam_gpu_log(NSString *msg) {
     if (_pixelTransferSession) return;
     OSStatus status = VTPixelTransferSessionCreate(kCFAllocatorDefault, &_pixelTransferSession);
     if (status == noErr) {
-        // 配置 RealTime + ScalingMode（参考逆向 vcameracrack.dylib）
+        // 只设 RealTime（降低延迟）。不设 ScalingMode —— 预渲染已 crop fill 到目标尺寸，
+        // 同尺寸转换不需要额外缩放，CropSourceToCleanAperture 会导致画面位置偏移
         VTSessionSetProperty(_pixelTransferSession, CFSTR("RealTime"), kCFBooleanTrue);
-        VTSessionSetProperty(_pixelTransferSession, CFSTR("ScalingMode"), CFSTR("CropSourceToCleanAperture"));
-        vcam_gpu_log(@"[vcam] VTPixelTransferSession created (RealTime + CropSourceToCleanAperture)");
+        vcam_gpu_log(@"[vcam] VTPixelTransferSession created (RealTime only, no ScalingMode)");
     } else {
         vcam_gpu_log([NSString stringWithFormat:@"[vcam] Failed to create VTPixelTransferSession: %d", (int)status]);
     }
@@ -143,25 +140,20 @@ static void vcam_gpu_log(NSString *msg) {
     }
 }
 
-#pragma mark - 缓冲池
+#pragma mark - 缓冲池（多池字典，每个尺寸独立池，避免频繁重建）
 
-- (void)setupBufferPoolWithWidth:(size_t)width height:(size_t)height format:(OSType)format {
-    if (width == 0 || height == 0) return;
-    if (_bgraBufferPool && _preprocessWidth == width && _preprocessHeight == height && _preprocessFormat == format) {
-        return;  // 配置未变化
+- (CVPixelBufferPoolRef)getOrCreatePoolForWidth:(size_t)width height:(size_t)height format:(OSType)format {
+    if (width == 0 || height == 0) return NULL;
+
+    NSString *key = [NSString stringWithFormat:@"%zu_%zu_%u", width, height, (unsigned)format];
+    id existing = _bgraBufferPoolMap[key];
+    if (existing) {
+        return (__bridge CVPixelBufferPoolRef)existing;
     }
 
-    if (_bgraBufferPool) {
-        CVPixelBufferPoolRelease(_bgraBufferPool);
-        _bgraBufferPool = NULL;
-    }
-
-    vcam_gpu_log([NSString stringWithFormat:@"[vcam] Preprocess target changed: %zux%zu", width, height]);
-
-    // 关键约束：绝对不能使用 kCVPixelBufferIOSurfacePropertiesKey（mediaserverd 会立即崩溃）
-    // 使用最简属性：width/height/format
+    // 创建新池（关键约束：不能用 kCVPixelBufferIOSurfacePropertiesKey）
     NSDictionary *poolAttributes = @{
-        (id)kCVPixelBufferPoolMinimumBufferCountKey: @3,
+        (id)kCVPixelBufferPoolMinimumBufferCountKey: @2,
     };
     NSDictionary *pixelBufferAttributes = @{
         (id)kCVPixelBufferWidthKey:  @(width),
@@ -169,11 +161,12 @@ static void vcam_gpu_log(NSString *msg) {
         (id)kCVPixelBufferPixelFormatTypeKey: @(format),
     };
 
+    CVPixelBufferPoolRef pool = NULL;
     OSStatus status = CVPixelBufferPoolCreate(
         kCFAllocatorDefault,
         (__bridge CFDictionaryRef)poolAttributes,
         (__bridge CFDictionaryRef)pixelBufferAttributes,
-        &_bgraBufferPool
+        &pool
     );
 
     if (status != noErr) {
@@ -182,28 +175,26 @@ static void vcam_gpu_log(NSString *msg) {
             kCFAllocatorDefault,
             NULL,
             (__bridge CFDictionaryRef)pixelBufferAttributes,
-            &_bgraBufferPool
+            &pool
         );
     }
 
-    if (status == noErr) {
-        _preprocessWidth = width;
-        _preprocessHeight = height;
-        _preprocessFormat = format;
-        vcam_gpu_log([NSString stringWithFormat:@"[vcam] Created preprocess buffer pool: %zux%zu", width, height]);
-    } else {
-        vcam_gpu_log([NSString stringWithFormat:@"[vcam] Failed to create preprocess buffer pool: %d", (int)status]);
-        _bgraBufferPool = NULL;
+    if (status == noErr && pool) {
+        _bgraBufferPoolMap[key] = (__bridge id)pool;
+        vcam_gpu_log([NSString stringWithFormat:@"[vcam] Created buffer pool: %zux%zu fmt=%u (key=%@)", width, height, (unsigned)format, key]);
+        return pool;
     }
+
+    vcam_gpu_log([NSString stringWithFormat:@"[vcam] Failed to create buffer pool: %d, %zux%zu", (int)status, width, height]);
+    return NULL;
 }
 
 - (CVPixelBufferRef)getOrCreateBGRABufferWithWidth:(size_t)width height:(size_t)height CF_RETURNS_RETAINED {
-    // 确保缓冲池已配置
-    [self setupBufferPoolWithWidth:width height:height format:kCVPixelFormatType_32BGRA];
+    CVPixelBufferPoolRef pool = [self getOrCreatePoolForWidth:width height:height format:kCVPixelFormatType_32BGRA];
 
     CVPixelBufferRef buffer = NULL;
-    if (_bgraBufferPool) {
-        OSStatus status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, _bgraBufferPool, &buffer);
+    if (pool) {
+        OSStatus status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &buffer);
         if (status == noErr && buffer) {
             return buffer;
         }
@@ -211,18 +202,16 @@ static void vcam_gpu_log(NSString *msg) {
     }
 
     // 回退：直接创建（不带 IOSurface 属性）
-    // 关键约束：mediaserverd 中 IOSurface 分配会立即崩溃，用 NULL 属性
     OSStatus status = CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, NULL, &buffer);
     if (status != noErr) {
-        vcam_gpu_log([NSString stringWithFormat:@"[vcam] Failed to create pixel buffer: %d, size: %zux%zu, format: BGRA",
-                      (int)status, width, height]);
+        vcam_gpu_log([NSString stringWithFormat:@"[vcam] Failed to create pixel buffer: %d, %zux%zu BGRA", (int)status, width, height]);
         return NULL;
     }
     return buffer;
 }
 
 - (void)configureWithWidth:(size_t)width height:(size_t)height format:(OSType)format {
-    [self setupBufferPoolWithWidth:width height:height format:format];
+    [self getOrCreatePoolForWidth:width height:height format:format];
     NSString *fmtStr = [self stringForFormat:format];
     vcam_gpu_log([NSString stringWithFormat:@"[vcam] GPUImageProcessor configured: %zux%zu format: %@", width, height, fmtStr]);
 }
@@ -306,6 +295,7 @@ static void vcam_gpu_log(NSString *msg) {
 
     size_t inW = CVPixelBufferGetWidth(input);
     size_t inH = CVPixelBufferGetHeight(input);
+    if (inW == 0 || inH == 0 || width == 0 || height == 0) return NULL;
 
     CIImage *image = [CIImage imageWithCVPixelBuffer:input];
     if (!image) return NULL;
@@ -313,20 +303,25 @@ static void vcam_gpu_log(NSString *msg) {
     CVPixelBufferRef output = [self getOrCreateBGRABufferWithWidth:width height:height];
     if (!output) return NULL;
 
-    // crop fill: 取较大缩放比填充整个目标, 超出部分裁剪
+    // crop fill: 取较大缩放比填充整个目标, 超出部分裁剪（无黑边）
     CGFloat scale = MAX((CGFloat)width / (CGFloat)inW, (CGFloat)height / (CGFloat)inH);
     CGFloat scaledW = (CGFloat)inW * scale;
     CGFloat scaledH = (CGFloat)inH * scale;
-    CGFloat offsetX = ((CGFloat)width - scaledW) / 2.0;   // 负值(超出裁剪)
+    // 居中偏移（负值 = 图像超出目标边界, 被 bounds 裁剪）
+    CGFloat offsetX = ((CGFloat)width - scaledW) / 2.0;
     CGFloat offsetY = ((CGFloat)height - scaledH) / 2.0;
 
-    // 变换: 先缩放, 再平移居中
+    // 变换: 缩放后平移到居中位置
     CGAffineTransform t = CGAffineTransformMakeScale(scale, scale);
     t = CGAffineTransformTranslate(t, offsetX / scale, offsetY / scale);
     CIImage *scaled = [image imageByApplyingTransform:t];
 
-    // 用 bounds 渲染: 只渲染 (0,0,width,height) 区域, 超出部分自动裁剪
-    [_preprocessContext render:scaled toCVPixelBuffer:output bounds:CGRectMake(0, 0, (CGFloat)width, (CGFloat)height) colorSpace:nil];
+    // 用 sRGB colorSpace 渲染（nil 会导致颜色不正确）
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    [_preprocessContext render:scaled toCVPixelBuffer:output
+                        bounds:CGRectMake(0, 0, (CGFloat)width, (CGFloat)height)
+                    colorSpace:colorSpace];
+    CGColorSpaceRelease(colorSpace);
     return output;
 }
 
