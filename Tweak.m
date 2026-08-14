@@ -11,7 +11,7 @@
 //
 //  注意：
 //    - 不 hook BWVideoCompressorNode（原版没有，更简单更稳定）
-//    - MSHookMessageEx 用 extern 动态查找（不链接 CydiaSubstrate）
+//    - MSHookMessageEx 自包含实现（method_setImplementation，不依赖 Substrate/ElleKit）
 //    - mediaserverd 中初始化 VCamCore + 安装 hook
 //    - SpringBoard 中初始化 VCamFloatingBall
 //
@@ -31,9 +31,19 @@
 #import "VCamFloatingBall.h"
 #import "VCamNotify.h"
 
-// MSHookMessageEx extern 声明（运行时由 ElleKit libinjector.dylib 解析）
-// -undefined dynamic_lookup 已在 Makefile 中配置
-extern void MSHookMessageEx(Class cls, SEL sel, IMP newImp, IMP *origPtr);
+// MSHookMessageEx 自包含实现（不依赖 CydiaSubstrate/ElleKit）
+// 原因：Dopamine 无 ElleKit/Substrate/libinjector，systemhook 未注入 mediaserverd
+// (proxy 跳过)，opainject 单独注入 VCamPlus 时 _MSHookMessageEx 符号缺失导致
+// dlopen 失败。MSHookMessageEx 本质是 method_setImplementation 的封装。
+static void MSHookMessageEx(Class cls, SEL sel, IMP newImp, IMP *origPtr) {
+    Method method = class_getInstanceMethod(cls, sel);
+    if (!method) {
+        if (origPtr) *origPtr = NULL;
+        return;
+    }
+    if (origPtr) *origPtr = method_getImplementation(method);
+    method_setImplementation(method, newImp);
+}
 
 // 文件日志（mediaserverd 中 NSLog 不可见）
 static volatile int32_t vcamTweakLogCount = 0;
