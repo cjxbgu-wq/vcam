@@ -519,6 +519,39 @@ static void vcam_gpu_log(NSString *msg) {
 
 - (BOOL)transferPixelBuffer:(CVPixelBufferRef)src toPixelBuffer:(CVPixelBufferRef)dst {
     if (!src || !dst || !_pixelTransferSession) return NO;
+
+    // 等比裁剪填充: VT 'CropSourceToCleanAperture' 语义是"源 CA 区域拉伸到目标全帧"(非等比!)
+    // 通过把源的 clean aperture 设为"等比居中裁剪出的子区域"(与目标等比),
+    // VT 只取该子区域缩放 → 等比 crop fill, 无拉伸、无黑边
+    size_t srcW = CVPixelBufferGetWidth(src);
+    size_t srcH = CVPixelBufferGetHeight(src);
+    size_t dstW = CVPixelBufferGetWidth(dst);
+    size_t dstH = CVPixelBufferGetHeight(dst);
+    if (srcW > 1 && srcH > 1 && dstW > 1 && dstH > 1 &&
+        (srcW != dstW || srcH != dstH)) {
+        CGFloat caW = (CGFloat)srcW, caH = (CGFloat)srcH;
+        CGFloat srcAR = (CGFloat)srcW / (CGFloat)srcH;
+        CGFloat dstAR = (CGFloat)dstW / (CGFloat)dstH;
+        if (srcAR > dstAR) {
+            caW = floor((CGFloat)srcH * dstAR);       // 源更宽: 左右裁剪
+        } else if (srcAR < dstAR) {
+            caH = floor((CGFloat)srcW / dstAR);       // 源更高: 上下裁剪
+        }
+        caW = floor(caW / 2.0) * 2.0;                  // 偶数对齐(YUV 采样)
+        caH = floor(caH / 2.0) * 2.0;
+        if (caW >= 2 && caH >= 2 && (caW != (CGFloat)srcW || caH != (CGFloat)srcH)) {
+            NSDictionary *ca = @{
+                (id)kCVImageBufferCleanApertureWidthKey: @(caW),
+                (id)kCVImageBufferCleanApertureHeightKey: @(caH),
+                (id)kCVImageBufferCleanApertureHorizontalOffsetKey: @0,
+                (id)kCVImageBufferCleanApertureVerticalOffsetKey: @0,
+            };
+            CVBufferSetAttachment(src, kCVImageBufferCleanApertureKey,
+                                  (__bridge CFDictionaryRef)ca,
+                                  kCVAttachmentMode_ShouldPropagate);
+        }
+    }
+
     OSStatus status = VTPixelTransferSessionTransferImage(_pixelTransferSession, src, dst);
     if (status != noErr) {
         vcam_gpu_log([NSString stringWithFormat:@"[vcam] VTPixelTransferSession failed: %d, format: %@",
