@@ -69,6 +69,7 @@ static void vcam_core_log(NSString *msg) {
         _frameCount = 0;
         _pollingActive = NO;
         _lastEnabledState = NO;
+        _formatLockMap = [[NSMutableDictionary alloc] init];
 
         // 初始化组件
         _gpuProcessor = [[GPUImageProcessor alloc] init];
@@ -129,26 +130,37 @@ static void vcam_core_log(NSString *msg) {
         return;
     }
 
-    // 2. 格式锁定：只处理第一个遇到的格式
-    if (!_targetSizeKnown) {
+    // 2. 多格式锁定: 每种格式独立锁尺寸(允许 420f/|xv0/p420 等多格式同时处理)
+    NSNumber *fmtKey = @(origFormat);
+    NSValue *lockedSize = _formatLockMap[fmtKey];
+    if (!lockedSize) {
+        // 该格式首次遇到, 锁定其尺寸
         char fstr[5] = {0};
         fstr[0] = (char)(origFormat >> 24);
         fstr[1] = (char)(origFormat >> 16);
         fstr[2] = (char)(origFormat >> 8);
         fstr[3] = (char)origFormat;
-        vcam_core_log([NSString stringWithFormat:@"[vcam] Initial Live state: %@",
-                       [NSString stringWithFormat:@"target locked %zux%zu fmt=0x%x (%s)",
-                        origWidth, origHeight, origFormat, fstr]]);
+        vcam_core_log([NSString stringWithFormat:@"[vcam] Format locked: %zux%zu fmt=0x%x (%s)",
+                       origWidth, origHeight, (unsigned)origFormat, fstr]);
+        // 用 NSString 存 "w,h" 简单可靠(NSValue 包装 size_t 在 ARC 下不安全)
+        _formatLockMap[fmtKey] = [NSString stringWithFormat:@"%zu,%zu", origWidth, origHeight];
+        // 兼容旧字段
         _targetWidth = origWidth;
         _targetHeight = origHeight;
         _targetFormat = origFormat;
         _targetSizeKnown = YES;
-    }
-
-    // 跳过与锁定格式+尺寸不同的帧（防止相机多流交替导致 buffer mismatch 崩溃）
-    if (origWidth != _targetWidth || origHeight != _targetHeight || origFormat != _targetFormat) {
-        if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d SKIP lock mismatch %zux%zu fmt=0x%x (target %zux%zu fmt=0x%x)", vcamRenderCount, origWidth, origHeight, (unsigned)origFormat, _targetWidth, _targetHeight, (unsigned)_targetFormat]);
-        return;
+    } else {
+        // 该格式已锁定, 检查尺寸是否匹配(同格式不同尺寸仍跳过, 防 mismatch 崩溃)
+        NSString *sizeStr = (NSString *)lockedSize;
+        NSArray *parts = [sizeStr componentsSeparatedByString:@","];
+        if (parts.count == 2) {
+            size_t lw = (size_t)[parts[0] integerValue];
+            size_t lh = (size_t)[parts[1] integerValue];
+            if (origWidth != lw || origHeight != lh) {
+                if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d SKIP size mismatch %zux%zu fmt=0x%x (locked %zux%zu)", vcamRenderCount, origWidth, origHeight, (unsigned)origFormat, lw, lh]);
+                return;
+            }
+        }
     }
 
     // 3. 获取替换帧
@@ -212,6 +224,7 @@ static void vcam_core_log(NSString *msg) {
     _targetWidth = 0;
     _targetHeight = 0;
     _targetFormat = 0;
+    [_formatLockMap removeAllObjects];
     [_processLock unlock];
     vcam_core_log(@"[vcam] Replacement frame cleared, real camera restored");
 }

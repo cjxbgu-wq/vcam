@@ -42,11 +42,12 @@
 @property (nonatomic, assign) CVPixelBufferRef liveBGRAPixelBuffer;
 @property (nonatomic, assign) CVPixelBufferRef liveYUVPixelBuffer;
 
-// 格式锁定状态
+// 格式锁定状态(多格式: 每种格式独立锁尺寸, 允许 420f/|xv0/p420 同时处理)
 @property (nonatomic, assign) BOOL targetSizeKnown;
 @property (nonatomic, assign) size_t targetWidth;
 @property (nonatomic, assign) size_t targetHeight;
 @property (nonatomic, assign) OSType targetFormat;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSString *> *formatLockMap;  // key=FourCC(NSNumber) value="w,h"
 
 // 缓存
 @property (nonatomic, assign) size_t lastRenderedWidth;
