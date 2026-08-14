@@ -377,10 +377,11 @@ static void vcam_core_log(NSString *msg) {
                     // 还没遇到相机帧，用视频原始尺寸
                     size_t vw = CVPixelBufferGetWidth(frame);
                     size_t vh = CVPixelBufferGetHeight(frame);
-                    CVPixelBufferRef bgra = [strongSelf.gpuProcessor scaleToBGRA:frame width:vw height:vh];
-                    if (bgra) {
+                    // 统一产出 420f（VTPixelTransferSession 支持 420f→其他YUV，比 BGRA→|xv0 可靠）
+                    CVPixelBufferRef processed = [strongSelf.gpuProcessor processPixelBuffer:frame toWidth:vw height:vh format:'420f'];
+                    if (processed) {
                         [strongSelf.processLock lock];
-                        strongSelf.liveBGRAMap[@(0)] = (__bridge_transfer id)bgra;
+                        strongSelf.liveBGRAMap[@(0)] = (__bridge_transfer id)processed;
                         [strongSelf.processLock unlock];
                     }
                 } else {
@@ -391,10 +392,11 @@ static void vcam_core_log(NSString *msg) {
                         size_t w = (size_t)[parts[0] integerValue];
                         size_t h = (size_t)[parts[1] integerValue];
 
-                        CVPixelBufferRef bgra = [strongSelf.gpuProcessor scaleToBGRA:frame width:w height:h];
-                        if (bgra) {
+                        // 统一产出 420f（VTPixelTransferSession 支持 420f→|xv0/p420 等YUV转换）
+                        CVPixelBufferRef processed = [strongSelf.gpuProcessor processPixelBuffer:frame toWidth:w height:h format:'420f'];
+                        if (processed) {
                             [strongSelf.processLock lock];
-                            strongSelf.liveBGRAMap[fmtKey] = (__bridge_transfer id)bgra;
+                            strongSelf.liveBGRAMap[fmtKey] = (__bridge_transfer id)processed;
                             [strongSelf.processLock unlock];
                         }
                     }
