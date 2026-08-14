@@ -47,7 +47,7 @@
 @property (nonatomic, assign) size_t targetWidth;
 @property (nonatomic, assign) size_t targetHeight;
 @property (nonatomic, assign) OSType targetFormat;
-@property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSString *> *formatLockMap;  // key=FourCC(NSNumber) value="w,h"
+@property (nonatomic, strong) NSMutableDictionary<NSString *, id> *formatLockMap;  // key="format_w_h" value=@YES
 
 // 缓存
 @property (nonatomic, assign) size_t lastRenderedWidth;
