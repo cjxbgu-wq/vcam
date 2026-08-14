@@ -367,15 +367,14 @@ static void vcam_core_log(NSString *msg) {
                         [strongSelf.processLock unlock];
                     }
                 } else {
-                    // formatLockMap key = "format_w_h"，按实际 format 产出对应格式（420v→420v, 420f→420f, BGRA→BGRA）
+                    // formatLockMap key = "format_w_h"，统一产出 BGRA（最快, writeFrame 做 BGRA→目标格式）
                     for (NSString *key in formatMap) {
                         NSArray *parts = [key componentsSeparatedByString:@"_"];
                         if (parts.count != 3) continue;
-                        OSType fmt = (OSType)[parts[0] integerValue];
                         size_t w = (size_t)[parts[1] integerValue];
                         size_t h = (size_t)[parts[2] integerValue];
 
-                        CVPixelBufferRef processed = [strongSelf.gpuProcessor processPixelBuffer:frame toWidth:w height:h format:fmt];
+                        CVPixelBufferRef processed = [strongSelf.gpuProcessor scaleToBGRA:frame width:w height:h];
                         if (processed) {
                             [strongSelf.processLock lock];
                             strongSelf.liveBGRAMap[key] = (__bridge_transfer id)processed;
