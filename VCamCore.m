@@ -247,13 +247,17 @@ static void vcam_core_log(NSString *msg) {
     if (!buffer) return NO;
     OSType format = CVPixelBufferGetPixelFormatType(buffer);
     // 千面白名单: BGRA, 420v, 420f
-    // 另加回 |xv0(0x7c787630)/p420: 视频模式预览流是私有格式, 千面在管道层让系统自行编码,
-    // 我们的 hook 点直接遇到 |xv0 帧, VT 支持 BGRA->|xv0(已验证 status=0), 须用 BGRA 缓存做源
+    // 另外加私有 YUV 变体(|xv0/|8v0/-8f0/-8v0 等): 视频模式下多个流并存,
+    // 只替换 420f 流会与未替换的私有格式流交替显示 → 闪烁; 全部尝试替换(BGRA 源 VT 转换)
     return format == kCVPixelFormatType_32BGRA  // BGRA
-        || format == '420v'                      // 420v (VideoRange)
-        || format == '420f'                      // 420f (FullRange)
-        || format == 0x7c787630                  // |xv0 (私有, 视频模式预览)
-        || format == 0x70343230;                 // p420 (私有 3-plane YUV)
+        || format == '420v'                      // 420v
+        || format == '420f'                      // 420f
+        || format == 0x7c787630                  // |xv0
+        || format == 0x7c387630                  // |8v0
+        || format == 0x7c386630                  // |8f0
+        || format == 0x2d387630                  // -8v0
+        || format == 0x2d386630                  // -8f0
+        || format == 0x70343230;                 // p420
 }
 
 #pragma mark - 帧写入
@@ -341,11 +345,29 @@ static void vcam_core_log(NSString *msg) {
     dispatch_async(_prerenderQueue, ^{
         VCamCore *strongSelf = weakSelf;
         if (!strongSelf) return;
+
+        // 绝对时间节拍器: 累计节拍(nextTick += interval), 消除 sleep 精度导致的累计漂移(卡顿/跳帧)
+        CFAbsoluteTime nextTick = CFAbsoluteTimeGetCurrent();
+        uint64_t renderedFrames = 0;
+        static uint64_t prerenderLogSeq = 0;
+
         while (strongSelf.prerenderActive && strongSelf.enabled) {
             @autoreleasepool {
-                CVPixelBufferRef frame = [strongSelf.videoPlayer copyCurrentFrame];
+                double fps = strongSelf.videoPlayer.videoFps > 1.0 ? strongSelf.videoPlayer.videoFps : 30.0;
+                nextTick += 1.0 / fps;
+                double wait = nextTick - CFAbsoluteTimeGetCurrent();
+                if (wait > 0.0005) {
+                    [NSThread sleepForTimeInterval:wait];
+                } else {
+                    nextTick = CFAbsoluteTimeGetCurrent();  // 已落后(转换耗时超帧间隔), 重置基线
+                }
+
+                // 消费式取帧: 跟随解码节拍, 无积压; 队列空(解码间隙/图片模式)回退当前帧
+                CVPixelBufferRef frame = [strongSelf.videoPlayer.frameQueue dequeuePixelBuffer];
                 if (!frame) {
-                    [NSThread sleepForTimeInterval:0.005];
+                    frame = [strongSelf.videoPlayer copyCurrentFrame];
+                }
+                if (!frame) {
                     continue;
                 }
 
@@ -371,9 +393,11 @@ static void vcam_core_log(NSString *msg) {
                 }
                 [strongSelf.processLock unlock];
 
-                // 按视频帧率等待
-                double fps = strongSelf.videoPlayer.videoFps > 1.0 ? strongSelf.videoPlayer.videoFps : 30.0;
-                [NSThread sleepForTimeInterval:1.0 / fps];
+                renderedFrames++;
+                if (renderedFrames % 600 == 1) {
+                    prerenderLogSeq++;
+                    vcam_core_log([NSString stringWithFormat:@"[vcam] prerender #%llu frames ok fps=%.1f", (unsigned long long)renderedFrames, fps]);
+                }
             }
         }
         vcam_core_log(@"[vcam] Prerender thread exited");
