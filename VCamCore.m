@@ -274,14 +274,10 @@ static void vcam_core_log(NSString *msg) {
 - (BOOL)isSupportedVideoFormat:(CVPixelBufferRef)buffer {
     if (!buffer) return NO;
     OSType format = CVPixelBufferGetPixelFormatType(buffer);
-    // 格式白名单: BGRA, 420v, 420f, |xv0(视频录制预览), p420(视频录制预览)
-    // Theos SDK 缺少 kCVPixelFormatType_420YpCbCr8VideoRange/FullRange 声明，用 FourCC 码代替
-    // |xv0 = 0x7c787630 planar YUV 双平面(视频模式预览流), p420 = 0x70343230 3-plane YUV
+    // 逆向白名单: 只有 BGRA, 420v, 420f（不处理 |xv0/p420 等私有格式，让系统自行编码）
     return format == kCVPixelFormatType_32BGRA  // BGRA
         || format == '420v'                      // 420v (VideoRange)
-        || format == '420f'                      // 420f (FullRange)
-        || format == '|xv0'                      // |xv0 (视频录制预览流, planar YUV)
-        || format == 'p420';                     // p420 (视频录制预览流, 3-plane YUV)
+        || format == '420f';                      // 420f (FullRange)
 }
 
 #pragma mark - 帧写入
@@ -311,38 +307,6 @@ static void vcam_core_log(NSString *msg) {
             memcpy(dstBase, srcBase, copySize);
         }
 
-        CVPixelBufferUnlockBaseAddress(dst, 0);
-        CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
-        return;
-    }
-
-    // 路径1.5: 420f→|xv0/p420 直接 memcpy（planar YUV 双平面内存布局兼容, VTPixelTransferSession 不支持这些格式作为目标）
-    if (srcFormat == '420f' && (dstFormat == '|xv0' || dstFormat == 'p420') && srcW == dstW && srcH == dstH) {
-        static int xv0DiagCount = 0;
-        if (xv0DiagCount < 3) {
-            xv0DiagCount++;
-            size_t srcPlanes = CVPixelBufferGetPlaneCount(src);
-            size_t dstPlanes = CVPixelBufferGetPlaneCount(dst);
-            size_t srcDataSize = CVPixelBufferGetDataSize(src);
-            size_t dstDataSize = CVPixelBufferGetDataSize(dst);
-            size_t srcBpr0 = srcPlanes > 0 ? CVPixelBufferGetBytesPerRowOfPlane(src, 0) : 0;
-            size_t dstBpr0 = dstPlanes > 0 ? CVPixelBufferGetBytesPerRowOfPlane(dst, 0) : 0;
-            size_t srcBpr1 = srcPlanes > 1 ? CVPixelBufferGetBytesPerRowOfPlane(src, 1) : 0;
-            size_t dstBpr1 = dstPlanes > 1 ? CVPixelBufferGetBytesPerRowOfPlane(dst, 1) : 0;
-            size_t srcH0 = srcPlanes > 0 ? CVPixelBufferGetHeightOfPlane(src, 0) : 0;
-            size_t dstH0 = dstPlanes > 0 ? CVPixelBufferGetHeightOfPlane(dst, 0) : 0;
-            vcam_core_log([NSString stringWithFormat:@"[vcam] YUV diag: src(420f) planes=%zu dataSize=%zu bpr0=%zu bpr1=%zu h0=%zu | dst(0x%x) planes=%zu dataSize=%zu bpr0=%zu bpr1=%zu h0=%zu",
-                           srcPlanes, srcDataSize, srcBpr0, srcBpr1, srcH0, (unsigned)dstFormat, dstPlanes, dstDataSize, dstBpr0, dstBpr1, dstH0]);
-        }
-        CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
-        CVPixelBufferLockBaseAddress(dst, 0);
-        void *srcBase = CVPixelBufferGetBaseAddress(src);
-        void *dstBase = CVPixelBufferGetBaseAddress(dst);
-        size_t srcSize = CVPixelBufferGetDataSize(src);
-        size_t dstSize = CVPixelBufferGetDataSize(dst);
-        if (srcBase && dstBase) {
-            memcpy(dstBase, srcBase, MIN(srcSize, dstSize));
-        }
         CVPixelBufferUnlockBaseAddress(dst, 0);
         CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
         return;
