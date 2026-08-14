@@ -540,21 +540,39 @@ static void vcam_gpu_log(NSString *msg) {
 - (BOOL)transferPixelBuffer:(CVPixelBufferRef)src toPixelBuffer:(CVPixelBufferRef)dst {
     if (!src || !dst) return NO;
 
-    // 按目标格式选 session: 私有格式转换用独立 session,
-    // 防止其 pipeline 状态污染标准格式流(照片 420f 几何反复抖动)
     OSType dstFmt = CVPixelBufferGetPixelFormatType(dst);
     BOOL privateTarget = !(dstFmt == kCVPixelFormatType_32BGRA || dstFmt == '420v' || dstFmt == '420f');
-    VTPixelTransferSessionRef session = privateTarget ? _renderPrivateSession : _pixelTransferSession;
-    if (!session) {
-        if (privateTarget) {
-            [self setupRenderPrivateSession];
-            session = _renderPrivateSession;
-        } else {
-            [self setupPixelTransferSession];
-            session = _pixelTransferSession;
+
+    // 私有格式目标走两步转换: VT 对私有格式目标可能忽略 CA → 全帧拉伸(上下反复拉伸的根源)
+    // (1) src --VT+CA crop fill--> mid BGRA(目标尺寸): 几何在标准格式阶段固化, 等比无拉伸
+    // (2) mid --同尺寸格式转换--> dst: 纯格式转换无缩放, CA 无关
+    if (privateTarget) {
+        size_t dstW = CVPixelBufferGetWidth(dst);
+        size_t dstH = CVPixelBufferGetHeight(dst);
+        CVPixelBufferRef mid = [self getOrCreateBGRABufferWithWidth:dstW height:dstH];
+        if (!mid) return NO;
+        BOOL ok = NO;
+        if ([self transferPixelBuffer:src toPixelBuffer:mid]) {
+            if (!_renderPrivateSession) [self setupRenderPrivateSession];
+            if (_renderPrivateSession) {
+                OSStatus st = VTPixelTransferSessionTransferImage(_renderPrivateSession, mid, dst);
+                if (st == noErr) {
+                    ok = YES;
+                } else {
+                    vcam_gpu_log([NSString stringWithFormat:@"[vcam] private-format step2 failed: %d, format: %@",
+                                  (int)st, [self stringForFormat:dstFmt]]);
+                }
+            }
         }
+        CVPixelBufferRelease(mid);
+        return ok;
     }
-    if (!session) return NO;
+
+    if (!_pixelTransferSession) {
+        [self setupPixelTransferSession];
+    }
+    if (!_pixelTransferSession) return NO;
+    VTPixelTransferSessionRef session = _pixelTransferSession;
 
     // 等比裁剪填充: VT 'CropSourceToCleanAperture' 语义是"源 CA 区域拉伸到目标全帧"(非等比!)
     // 通过把源的 clean aperture 设为"等比居中裁剪出的子区域"(与目标等比),
