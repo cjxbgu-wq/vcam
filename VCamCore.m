@@ -132,7 +132,7 @@ static void vcam_core_log(NSString *msg) {
 
     // 2. 多格式锁定: 每种格式独立锁尺寸(允许 420f/|xv0/p420 等多格式同时处理)
     NSNumber *fmtKey = @(origFormat);
-    NSValue *lockedSize = _formatLockMap[fmtKey];
+    NSString *lockedSize = _formatLockMap[fmtKey];
     if (!lockedSize) {
         // 该格式首次遇到, 锁定其尺寸
         char fstr[5] = {0};
@@ -151,8 +151,7 @@ static void vcam_core_log(NSString *msg) {
         _targetSizeKnown = YES;
     } else {
         // 该格式已锁定, 检查尺寸是否匹配(同格式不同尺寸仍跳过, 防 mismatch 崩溃)
-        NSString *sizeStr = (NSString *)lockedSize;
-        NSArray *parts = [sizeStr componentsSeparatedByString:@","];
+        NSArray *parts = [lockedSize componentsSeparatedByString:@","];
         if (parts.count == 2) {
             size_t lw = (size_t)[parts[0] integerValue];
             size_t lh = (size_t)[parts[1] integerValue];
