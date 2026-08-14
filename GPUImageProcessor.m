@@ -56,6 +56,9 @@ static void vcam_gpu_log(NSString *msg) {
 @property (nonatomic, assign) size_t preprocessWidth;
 @property (nonatomic, assign) size_t preprocessHeight;
 @property (nonatomic, assign) OSType preprocessFormat;
+
+// 内部方法（前向声明，让 ARC 正确处理 CF_RETURNS_RETAINED）
+- (CVPixelBufferRef)scaleToBGRA:(CVPixelBufferRef)input width:(size_t)width height:(size_t)height CF_RETURNS_RETAINED;
 @end
 
 @implementation GPUImageProcessor
@@ -240,32 +243,44 @@ static void vcam_gpu_log(NSString *msg) {
             rotH = inW;
         }
 
-        // 1. 旋转/镜像（如果需要）
+        // 1. 旋转/镜像（如果需要）→ BGRA
         CVPixelBufferRef processedBuffer = NULL;
         if ((_rotationAngle != 0 || _mirrored) && _rotationApiAvailable && _pixelRotationSession) {
             processedBuffer = [self rotateAndMirror:input width:rotW height:rotH];
         }
-
         // 如果旋转失败或不需要旋转，直接用输入
         if (!processedBuffer) {
             processedBuffer = input;
             CVPixelBufferRetain(processedBuffer);
         }
 
-        // 2. 格式转换（如果目标格式不是 BGRA）
+        // 2. 缩放到目标尺寸的 BGRA（CoreImage 擅长 BGRA→BGRA 缩放）
+        //    VTPixelTransferSession 不支持缩放，必须先缩放到目标尺寸再做格式转换
+        size_t curW = CVPixelBufferGetWidth(processedBuffer);
+        size_t curH = CVPixelBufferGetHeight(processedBuffer);
+        if (curW != width || curH != height) {
+            CVPixelBufferRef scaledBGRA = [self scaleToBGRA:processedBuffer width:width height:height];
+            CVPixelBufferRelease(processedBuffer);
+            processedBuffer = scaledBGRA;  // scaledBGRA 已 retain (CF_RETURNS_RETAINED)
+            if (!processedBuffer) {
+                return NULL;
+            }
+        }
+
+        // 3. 格式转换（BGRA → 目标格式，同尺寸）
         CVPixelBufferRef outputBuffer = NULL;
         if (format == kCVPixelFormatType_32BGRA) {
-            // 目标格式是 BGRA，直接返回处理后的缓冲区
+            // 目标格式是 BGRA，直接返回缩放后的缓冲区
             outputBuffer = processedBuffer;
         } else {
-            // 用 VTPixelTransferSession 转换格式
+            // 用 VTPixelTransferSession 转换格式（同尺寸 BGRA→YUV）
             outputBuffer = [self createBufferWithWidth:width height:height format:format];
             if (outputBuffer) {
                 OSStatus status = VTPixelTransferSessionTransferImage(_pixelTransferSession, processedBuffer, outputBuffer);
                 if (status != noErr) {
                     NSString *fmtStr = [self stringForFormat:format];
                     vcam_gpu_log([NSString stringWithFormat:@"[vcam] VTPixelTransferSession failed: %d, format: %@", (int)status, fmtStr]);
-                    // 回退到 CoreImage
+                    // 回退到 CoreImage（同尺寸 BGRA→YUV）
                     CVPixelBufferRelease(outputBuffer);
                     outputBuffer = [self convertWithCoreImage:processedBuffer toFormat:format width:width height:height];
                 }
@@ -278,6 +293,24 @@ static void vcam_gpu_log(NSString *msg) {
         vcam_gpu_log([NSString stringWithFormat:@"[vcam] Exception in processPixelBuffer: %@", e]);
         return NULL;
     }
+}
+
+// 用 CoreImage 缩放到目标尺寸的 BGRA（BGRA→BGRA，CoreImage 自动缩放）
+- (CVPixelBufferRef)scaleToBGRA:(CVPixelBufferRef)input
+                          width:(size_t)width
+                         height:(size_t)height CF_RETURNS_RETAINED {
+    if (!input || !_preprocessContext) return NULL;
+
+    CIImage *image = [CIImage imageWithCVPixelBuffer:input];
+    if (!image) return NULL;
+
+    // 创建目标尺寸的 BGRA buffer（用缓冲池复用，减少分配开销）
+    CVPixelBufferRef output = [self getOrCreateBGRABufferWithWidth:width height:height];
+    if (!output) return NULL;
+
+    // CoreImage 渲染（自动缩放，BGRA→BGRA）
+    [_preprocessContext render:image toCVPixelBuffer:output];
+    return output;
 }
 
 - (CVPixelBufferRef)rotateAndMirror:(CVPixelBufferRef)input width:(size_t)width height:(size_t)height CF_RETURNS_RETAINED {
