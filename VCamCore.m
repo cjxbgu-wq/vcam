@@ -43,6 +43,8 @@ static void vcam_core_log(NSString *msg) {
 @property (nonatomic, assign) size_t lastProcessedHeight;
 @property (nonatomic, assign) OSType lastProcessedFormat;
 @property (nonatomic, assign) BOOL prerenderActive;
+// writeFrame 专用锁: VT session/CIContext 非线程安全, 多 hook 线程(预览/照片/视频节点)并发调用会输出黑帧/崩溃
+@property (nonatomic, strong) NSLock *renderLock;
 @end
 
 @implementation VCamCore
