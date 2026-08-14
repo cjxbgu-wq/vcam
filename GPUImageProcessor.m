@@ -38,8 +38,9 @@ static void vcam_gpu_log(NSString *msg) {
 }
 
 @interface GPUImageProcessor ()
-// 会话
-@property (nonatomic, assign) VTPixelTransferSessionRef pixelTransferSession;
+// 会话（两个独立的 VTPixelTransferSession: render 线程和预渲染线程各自专用, VT session 非线程安全, 并发调用会崩溃）
+@property (nonatomic, assign) VTPixelTransferSessionRef pixelTransferSession;      // render(hook 线程)专用
+@property (nonatomic, assign) VTPixelTransferSessionRef prerenderTransferSession;  // 预渲染线程专用
 @property (nonatomic, assign) VTPixelRotationSessionRef pixelRotationSession;
 
 // 私有 API 函数指针
@@ -49,7 +50,9 @@ static void vcam_gpu_log(NSString *msg) {
 @property (nonatomic, assign) CFStringRef flipHorizontalKey;
 
 // CIContext（软件渲染，mediaserverd 没有 GPU 上下文）
+// 两个独立 CIContext: 预渲染线程用 preprocessContext, render 线程回退用 renderContext（CIContext 非线程安全）
 @property (nonatomic, strong) CIContext *preprocessContext;
+@property (nonatomic, strong) CIContext *renderContext;
 
 // 缓冲池字典（key="w_h", value=CVPixelBufferPoolRef）—— 每个尺寸独立池，避免频繁重建
 @property (nonatomic, strong) NSMutableDictionary *bgraBufferPoolMap;
@@ -67,6 +70,7 @@ static void vcam_gpu_log(NSString *msg) {
         _mirrored = NO;
         _rotationApiAvailable = NO;
         _pixelTransferSession = NULL;
+        _prerenderTransferSession = NULL;
         _pixelRotationSession = NULL;
         _bgraBufferPoolMap = [[NSMutableDictionary alloc] init];
 
@@ -75,11 +79,16 @@ static void vcam_gpu_log(NSString *msg) {
             _preprocessContext = [CIContext contextWithOptions:@{
                 kCIContextUseSoftwareRenderer: @YES
             }];
+            _renderContext = [CIContext contextWithOptions:@{
+                kCIContextUseSoftwareRenderer: @YES
+            }];
         } @catch (NSException *e) {
             _preprocessContext = nil;
+            _renderContext = nil;
         }
 
         [self setupPixelTransferSession];
+        [self setupPrerenderTransferSession];
         [self setupPixelRotationSession];
         vcam_gpu_log(@"[vcam] GPUImageProcessor initialized");
     }
@@ -87,10 +96,14 @@ static void vcam_gpu_log(NSString *msg) {
 }
 
 - (void)dealloc {
+    typedef void (*InvalidateFunc)(VTPixelTransferSessionRef);
     if (_pixelTransferSession) {
-        typedef void (*InvalidateFunc)(VTPixelTransferSessionRef);
         InvalidateFunc invalidate = (InvalidateFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionInvalidate");
         if (invalidate) invalidate(_pixelTransferSession);
+    }
+    if (_prerenderTransferSession) {
+        InvalidateFunc invalidate = (InvalidateFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionInvalidate");
+        if (invalidate) invalidate(_prerenderTransferSession);
     }
     // 释放所有缓冲池
     for (id key in _bgraBufferPoolMap) {
@@ -115,6 +128,19 @@ static void vcam_gpu_log(NSString *msg) {
         vcam_gpu_log(@"[vcam] VTPixelTransferSession created (RealTime + CropSourceToCleanAperture)");
     } else {
         vcam_gpu_log([NSString stringWithFormat:@"[vcam] Failed to create VTPixelTransferSession: %d", (int)status]);
+    }
+}
+
+- (void)setupPrerenderTransferSession {
+    if (_prerenderTransferSession) return;
+    // 预渲染线程专用 session（与 render 的 session 分离, 避免并发调用崩溃）
+    OSStatus status = VTPixelTransferSessionCreate(kCFAllocatorDefault, &_prerenderTransferSession);
+    if (status == noErr) {
+        VTSessionSetProperty(_prerenderTransferSession, CFSTR("RealTime"), kCFBooleanTrue);
+        VTSessionSetProperty(_prerenderTransferSession, CFSTR("ScalingMode"), CFSTR("CropSourceToCleanAperture"));
+        vcam_gpu_log(@"[vcam] Prerender VTPixelTransferSession created");
+    } else {
+        vcam_gpu_log([NSString stringWithFormat:@"[vcam] Failed to create prerender session: %d", (int)status]);
     }
 }
 
@@ -378,6 +404,7 @@ static void vcam_gpu_log(NSString *msg) {
 }
 
 // 预渲染用: 同尺寸格式转换(如 BGRA -> 420f), VT 主路径 + CoreImage 回退
+// 注意: 用预渲染专用 session（避免与 render 线程的 session 并发调用崩溃）
 - (CVPixelBufferRef)convertFormat:(CVPixelBufferRef)input toFormat:(OSType)format CF_RETURNS_RETAINED {
     if (!input) return NULL;
     if (CVPixelBufferGetPixelFormatType(input) == format) {
@@ -386,11 +413,14 @@ static void vcam_gpu_log(NSString *msg) {
     size_t w = CVPixelBufferGetWidth(input);
     size_t h = CVPixelBufferGetHeight(input);
 
-    // VT transfer 同尺寸格式转换
+    // VT transfer 同尺寸格式转换（预渲染专用 session）
     CVPixelBufferRef out = [self createBufferWithWidth:w height:h format:format];
     if (out) {
-        if (_pixelTransferSession &&
-            VTPixelTransferSessionTransferImage(_pixelTransferSession, input, out) == noErr) {
+        if (!_prerenderTransferSession) {
+            [self setupPrerenderTransferSession];
+        }
+        if (_prerenderTransferSession &&
+            VTPixelTransferSessionTransferImage(_prerenderTransferSession, input, out) == noErr) {
             return out;
         }
         CVPixelBufferRelease(out);
@@ -401,8 +431,9 @@ static void vcam_gpu_log(NSString *msg) {
 }
 
 // writeFrame 回退路径: crop fill 渲染到任意格式目标 buffer（保持宽高比填满, 居中裁剪）
+// 注意: 用 render 线程专用 CIContext（避免与预渲染线程的 context 并发崩溃）
 - (BOOL)renderCropFill:(CVPixelBufferRef)input toPixelBuffer:(CVPixelBufferRef)dst {
-    if (!input || !dst || !_preprocessContext) return NO;
+    if (!input || !dst || !_renderContext) return NO;
 
     size_t inW = CVPixelBufferGetWidth(input);
     size_t inH = CVPixelBufferGetHeight(input);
@@ -421,9 +452,9 @@ static void vcam_gpu_log(NSString *msg) {
     CIImage *scaled = [image imageByApplyingTransform:t];
 
     CGColorSpaceRef colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-    [_preprocessContext render:scaled toCVPixelBuffer:dst
-                        bounds:CGRectMake(0, 0, (CGFloat)w, (CGFloat)h)
-                    colorSpace:colorSpace];
+    [_renderContext render:scaled toCVPixelBuffer:dst
+                    bounds:CGRectMake(0, 0, (CGFloat)w, (CGFloat)h)
+                colorSpace:colorSpace];
     CGColorSpaceRelease(colorSpace);
     return YES;
 }
