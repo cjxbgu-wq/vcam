@@ -182,6 +182,13 @@ static void vcam_darwin_callback(CFNotificationCenterRef center, void *observer,
     dispatch_source_set_timer(_pollingTimer, dispatch_time(DISPATCH_TIME_NOW, 0), intervalNs, intervalNs / 2);
     dispatch_source_set_event_handler(_pollingTimer, ^{
         BOOL enabled = [VCamNotify isPlistEnabled];
+        static int vcamPollCount = 0;
+        vcamPollCount++;
+        if (vcamPollCount % 5 == 1) {  // 每 5 次记一次, 避免刷屏
+            NSFileManager *fm = [NSFileManager defaultManager];
+            BOOL exists = [fm fileExistsAtPath:VCamPlistPath];
+            vcam_notify_log([NSString stringWithFormat:@"[vcam] poll#%d enabled=%d pathExists=%d path=%@", vcamPollCount, enabled, exists, VCamPlistPath]);
+        }
         if (self->_pollingCallback) {
             self->_pollingCallback(enabled);
         }

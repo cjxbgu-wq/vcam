@@ -347,7 +347,13 @@ static void vcam_core_log(NSString *msg) {
     [[VCamNotify sharedInstance] startPollingWithInterval:1.0 callback:^(BOOL enabled) {
         VCamCore *strongSelf = weakSelf;
         if (!strongSelf) return;
+        static int vcamCorePollCount = 0;
+        vcamCorePollCount++;
+        if (vcamCorePollCount % 5 == 1) {
+            vcam_core_log([NSString stringWithFormat:@"[vcam] core poll#%d enabled=%d lastEnabled=%d", vcamCorePollCount, enabled, strongSelf.lastEnabledState]);
+        }
         if (enabled != strongSelf.lastEnabledState) {
+            vcam_core_log([NSString stringWithFormat:@"[vcam] state change: %d -> %d, calling setEnabled", strongSelf.lastEnabledState, enabled]);
             strongSelf.lastEnabledState = enabled;
             [strongSelf setEnabled:enabled];
         }
