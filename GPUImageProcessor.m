@@ -131,8 +131,10 @@ static void vcam_gpu_log(NSString *msg) {
     // 释放旋转 session 与自适应旋转缓存
     {
         InvalidateFunc invalidate = (InvalidateFunc)dlsym(RTLD_DEFAULT, "VTPixelRotationSessionInvalidate");
-        if (_pixelRotationSession && invalidate) invalidate(_pixelRotationSession);
-        if (_renderRotationSession && invalidate) invalidate(_renderRotationSession);
+        if (invalidate) {
+            if (_pixelRotationSession) invalidate((VTPixelTransferSessionRef)_pixelRotationSession);
+            if (_renderRotationSession) invalidate((VTPixelTransferSessionRef)_renderRotationSession);
+        }
     }
     if (_adaptiveRotateCache) {
         CVPixelBufferRelease(_adaptiveRotateCache);
