@@ -45,6 +45,13 @@ static void vcam_core_log(NSString *msg) {
 @property (nonatomic, assign) BOOL prerenderActive;
 // writeFrame 专用锁: VT session/CIContext 非线程安全, 多 hook 线程(预览/照片/视频节点)并发调用会输出黑帧/崩溃
 @property (nonatomic, strong) NSLock *renderLock;
+// 无帧回退缓存(对齐千面 _0x150/_0x158/_0x160): 视频解码间隙用上一帧填充, 避免闪回相机画面
+@property (nonatomic, assign) CVPixelBufferRef fallbackFrame;
+@property (nonatomic, assign) size_t fallbackWidth;
+@property (nonatomic, assign) size_t fallbackHeight;
+// 同帧去重(对齐千面 _0x78/_0x70): 管线同一物理 buffer 连续经过多个消费者,
+// 第一次已就地改写, 后续直接跳过(不 retain, 仅指针比较)
+@property (nonatomic, assign) CVPixelBufferRef dedupLastBuffer;
 @end
 
 @implementation VCamCore
@@ -130,20 +137,20 @@ static void vcam_core_log(NSString *msg) {
 - (void)renderReplacementToPixelBuffer:(CVPixelBufferRef)pixelBuffer {
     if (!pixelBuffer || !_enabled) return;
 
+    // 同帧去重(对齐千面 0xaed4-0xaee8): 管线同一物理 buffer 连续经过多个消费者时,
+    // 第一次已就地改写, 后续消费者拿到的已是假帧数据, 直接跳过节省开销
+    if (_dedupLastBuffer == pixelBuffer) return;
+
     OSType origFormat = CVPixelBufferGetPixelFormatType(pixelBuffer);
+    size_t targetW = CVPixelBufferGetWidth(pixelBuffer);
+    size_t targetH = CVPixelBufferGetHeight(pixelBuffer);
 
     // 诊断: 每 60 帧记录 render 入口
     static int vcamRenderCount = 0;
     vcamRenderCount++;
     BOOL diagThisFrame = (vcamRenderCount % 60 == 1);
 
-    // 1. 格式白名单检查（对齐逆向: 只有 BGRA/420v/420f）
-    if (![self isSupportedVideoFormat:pixelBuffer]) {
-        if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d SKIP whitelist fmt=0x%x", vcamRenderCount, (unsigned)origFormat]);
-        return;
-    }
-
-    // 2. 按相机帧格式选预渲染缓存（视频原尺寸双格式, 对齐逆向）
+    // 1. 取预渲染缓存(视频原尺寸双格式, 等价千面 [player copyCurrentFrame])
     [_processLock lock];
     CVPixelBufferRef bgra = _liveBGRAPixelBuffer;
     if (bgra) CVPixelBufferRetain(bgra);
@@ -152,33 +159,52 @@ static void vcam_core_log(NSString *msg) {
     [_processLock unlock];
 
     if (!bgra && !yuv) {
-        if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d NO frame no cache", vcamRenderCount]);
+        // 无帧回退(对齐千面 0xb018-0xb05c): 用上一帧缓存(目标尺寸匹配)填充,
+        // 视频解码间隙不闪回相机画面
+        if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d NO frame, fallback", vcamRenderCount]);
+        [_renderLock lock];
+        if (_fallbackFrame && _fallbackWidth == targetW && _fallbackHeight == targetH) {
+            [_gpuProcessor transferPixelBuffer:_fallbackFrame toPixelBuffer:pixelBuffer];
+        }
+        [_renderLock unlock];
         return;
     }
 
-    // 按目标格式选源缓存（对齐千面双格式缓存）:
+    // 2. 按目标格式选源缓存（对齐千面双格式缓存）:
     //   BGRA 目标 → BGRA 缓存
     //   420v/420f 目标 → YUV(420f) 缓存优先(标准 YUV→YUV 转换最快), 回退 BGRA
-    //   私有格式(|xv0/p420 等)已在白名单处跳过, 不会到这里
+    //   私有格式目标(|8v0/-8f0 等) → BGRA 缓存优先(实测 BGRA→私有格式 VT 成功率高)
     CVPixelBufferRef src = NULL;
     if (origFormat == kCVPixelFormatType_32BGRA) {
         src = bgra;
+    } else if ([self isPrivateFormat:origFormat]) {
+        src = bgra ? bgra : yuv;
     } else {
         src = yuv ? yuv : bgra;
     }
 
-    // 3. 写入相机帧: VT transfer(CropSourceToCleanAperture 自动 crop fill) 主路径
+    // 3. 写入相机帧: VT transfer(Trim 保比例 crop fill)主路径。
+    //    全格式处理无白名单(对齐千面 0xb0f8-0xb154: 私有格式 |8v0/-8f0/p420 也 transfer,
+    //    这正是千面能替换视频模式预览和拍照保存的原因), 失败保留原相机帧
     BOOL ok = [self writeFrame:src toPixelBuffer:pixelBuffer];
     if (ok) {
         _frameCount++;
         if (diagThisFrame) {
-            vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d OK %zux%zu via %@",
-                           vcamRenderCount,
-                           CVPixelBufferGetWidth(pixelBuffer), CVPixelBufferGetHeight(pixelBuffer),
+            vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d OK %zux%zu fmt=0x%x via %@",
+                           vcamRenderCount, targetW, targetH, (unsigned)origFormat,
                            (src == bgra) ? @"BGRA" : @"YUV"]);
         }
+        // 缓存回退帧 + 同帧去重(对齐千面 0xb15c-0xb19c)
+        [_renderLock lock];
+        if (_fallbackFrame) CVPixelBufferRelease(_fallbackFrame);
+        _fallbackFrame = src;
+        CVPixelBufferRetain(_fallbackFrame);
+        _fallbackWidth = targetW;
+        _fallbackHeight = targetH;
+        [_renderLock unlock];
+        _dedupLastBuffer = pixelBuffer;
     } else if (diagThisFrame) {
-        vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d FAILED write, keep camera", vcamRenderCount]);
+        vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d FAILED write fmt=0x%x, keep camera", vcamRenderCount, (unsigned)origFormat]);
     }
 
     if (bgra) CVPixelBufferRelease(bgra);
@@ -215,6 +241,16 @@ static void vcam_core_log(NSString *msg) {
     _targetHeight = 0;
     _targetFormat = 0;
     [_processLock unlock];
+    // 清理回退缓存 + 去重指针
+    [_renderLock lock];
+    if (_fallbackFrame) {
+        CVPixelBufferRelease(_fallbackFrame);
+        _fallbackFrame = NULL;
+    }
+    _fallbackWidth = 0;
+    _fallbackHeight = 0;
+    _dedupLastBuffer = NULL;
+    [_renderLock unlock];
     vcam_core_log(@"[vcam] Replacement frame cleared, real camera restored");
 }
 
@@ -241,21 +277,16 @@ static void vcam_core_log(NSString *msg) {
     [_processLock unlock];
 }
 
-- (BOOL)isSupportedVideoFormat:(CVPixelBufferRef)buffer {
-    if (!buffer) return NO;
-    OSType format = CVPixelBufferGetPixelFormatType(buffer);
-    // 完全对齐千面 vcameracrack.dylib 的白名单: 只有 BGRA, 420v, 420f
-    // 私有格式(|xv0/p420/-8f0 等)一律跳过 —— 千面不处理它们, 由系统管道自行派生;
-    // 处理它们会导致: 共享预渲染缓存被 CA 污染(照片反复拉伸) + 每帧两步转换开销(视频掉帧)
-    return format == kCVPixelFormatType_32BGRA  // BGRA
-        || format == '420v'                      // 420v
-        || format == '420f';                     // 420f
+// 私有格式判断(选转换源用): 私有目标优先用 BGRA 源(实测 BGRA->私有格式 VT 成功率高)
+// 注意: 千面 render 无白名单, 所有格式都 transfer —— 此方法仅用于选源, 不过滤
+- (BOOL)isPrivateFormat:(OSType)format {
+    return !(format == kCVPixelFormatType_32BGRA || format == '420v' || format == '420f');
 }
 
 #pragma mark - 帧写入
 
-// 对齐逆向: VT transfer(CropSourceToCleanAperture 自动 crop fill 缩放+格式转换) 主路径
-// 失败回退 CoreImage crop fill, 再失败保留原相机帧(绝不输出未初始化 buffer 防绿屏)
+// 对齐逆向: VT transfer(Trim 保比例 crop fill 缩放+格式转换) 主路径
+// 失败回退 CoreImage crop fill(仅标准格式), 再失败保留原相机帧(绝不输出未初始化 buffer 防绿屏)
 - (BOOL)writeFrame:(CVPixelBufferRef)src toPixelBuffer:(CVPixelBufferRef)dst {
     if (!src || !dst) return NO;
 
@@ -284,8 +315,9 @@ static void vcam_core_log(NSString *msg) {
         vcam_core_log([NSString stringWithFormat:@"[vcam] write#%d VT exception: %@", vcamWriteCount, e]);
     }
 
-    // 路径2: CoreImage crop fill 渲染（回退）
-    if (!done) {
+    // 路径2: CoreImage crop fill 渲染（回退, 仅标准格式 —— CI 软件渲染器对私有 planar
+    // 格式不可靠, 可能留下未初始化数据导致绿屏）
+    if (!done && ![self isPrivateFormat:CVPixelBufferGetPixelFormatType(dst)]) {
         @try {
             if ([_gpuProcessor renderCropFill:src toPixelBuffer:dst]) {
                 if (diag) vcam_core_log([NSString stringWithFormat:@"[vcam] write#%d CI ok (fallback)", vcamWriteCount]);

@@ -13,16 +13,19 @@
 //    - "State polling timer started"
 //    - dispatch_queue: com.vcam.processing
 //    - 方法: renderReplacementToPixelBuffer:, hasReplacementFrame, clearReplacementFrame
-//    - 方法: cacheLastRenderedFrame:width:height:, isSupportedVideoFormat:
+//    - 方法: cacheLastRenderedFrame:width:height:
 //    - 属性: liveBGRAPixelBuffer, liveYUVPixelBuffer, gpuProcessor
 //
 //  关键约束（记忆）：
-//    1. 格式锁定：只处理第一个遇到的相机帧格式，跳过后续不同格式
-//    2. 格式白名单：BGRA, 420v, 420f（不处理 -8f0, |xv0, |8f0 私有格式）
-//    3. 双格式预渲染：同时维护 BGRA 和 YUV 缓冲区
-//    4. mediaserverd 不能重启，避免重复 stopDecoding+cleanup+reload
-//    5. 状态转换：disable→enable(load), enable→enable(no reload), enable→disable(stop), disable→disable(no action)
-//    6. 转换失败时保持原始相机帧，不显示黑屏
+//    1. 无格式白名单(千面 render 逆向 0xb0f8-0xb154): 所有格式都 VT transfer,
+//       按目标格式分三套隔离 session(BGRA/YUV/私有) —— 私有格式 |8v0/-8f0 也处理,
+//       这是千面能替换视频模式预览和拍照保存的原因
+//    2. 同帧去重: 同一物理 buffer 连续经过多消费者, 首次已改写, 后续跳过
+//    3. 无帧回退: 用上一帧缓存(目标尺寸匹配)填充, 不闪回相机画面
+//    4. 双格式预渲染：同时维护 BGRA 和 YUV 缓冲区
+//    5. mediaserverd 不能重启，避免重复 stopDecoding+cleanup+reload
+//    6. 状态转换：disable→enable(load), enable→enable(no reload), enable→disable(stop), disable→disable(no action)
+//    7. 转换失败时保持原始相机帧，不显示黑屏
 //
 
 #import <Foundation/Foundation.h>
@@ -71,7 +74,7 @@
 - (BOOL)hasReplacementFrame;
 - (void)clearReplacementFrame;
 - (void)cacheLastRenderedFrame:(CVPixelBufferRef)buffer width:(size_t)width height:(size_t)height;
-- (BOOL)isSupportedVideoFormat:(CVPixelBufferRef)buffer;
+- (BOOL)isPrivateFormat:(OSType)format;
 
 #pragma mark - 状态控制
 - (void)setEnabled:(BOOL)enabled;

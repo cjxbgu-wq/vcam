@@ -39,7 +39,12 @@ static void vcam_gpu_log(NSString *msg) {
 
 @interface GPUImageProcessor ()
 // 会话（VT session 非线程安全且内部缓存 pipeline 状态, 必须按用途隔离）
-@property (nonatomic, assign) VTPixelTransferSessionRef pixelTransferSession;      // render 线程: writeFrame VT transfer
+// 对齐千面 render 逆向(0xb0f8-0xb154): 按目标格式三套 session
+//   BGRA 目标 -> 专用 session(千面 _0xe8) / 420v/420f 目标 -> 专用 session(千面 _0xf0)
+//   其他私有格式(|8v0/-8f0/p420 等) -> base session(千面 _0x30), 千面对所有格式无白名单全 transfer
+@property (nonatomic, assign) VTPixelTransferSessionRef bgraTransferSession;       // render 线程: BGRA 目标专用
+@property (nonatomic, assign) VTPixelTransferSessionRef yuvTransferSession;        // render 线程: 420v/420f 目标专用
+@property (nonatomic, assign) VTPixelTransferSessionRef privateTransferSession;    // render 线程: 私有格式目标专用(base, 隔离状态)
 @property (nonatomic, assign) VTPixelTransferSessionRef prerenderTransferSession;  // 预渲染线程专用
 @property (nonatomic, assign) VTPixelRotationSessionRef pixelRotationSession;
 
@@ -69,7 +74,9 @@ static void vcam_gpu_log(NSString *msg) {
         _rotationAngle = 0;
         _mirrored = NO;
         _rotationApiAvailable = NO;
-        _pixelTransferSession = NULL;
+        _bgraTransferSession = NULL;
+        _yuvTransferSession = NULL;
+        _privateTransferSession = NULL;
         _prerenderTransferSession = NULL;
         _pixelRotationSession = NULL;
         _bgraBufferPoolMap = [[NSMutableDictionary alloc] init];
@@ -87,7 +94,8 @@ static void vcam_gpu_log(NSString *msg) {
             _renderContext = nil;
         }
 
-        [self setupPixelTransferSession];
+        [self setupBGRATransferSession];
+        [self setupYUVTransferSession];
         [self setupPrerenderTransferSession];
         [self setupPixelRotationSession];
         vcam_gpu_log(@"[vcam] GPUImageProcessor initialized");
@@ -97,13 +105,21 @@ static void vcam_gpu_log(NSString *msg) {
 
 - (void)dealloc {
     typedef void (*InvalidateFunc)(VTPixelTransferSessionRef);
-    if (_pixelTransferSession) {
+    if (_bgraTransferSession) {
         InvalidateFunc invalidate = (InvalidateFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionInvalidate");
-        if (invalidate) invalidate(_pixelTransferSession);
+        if (invalidate) invalidate(_bgraTransferSession);
+    }
+    if (_yuvTransferSession) {
+        InvalidateFunc invalidate = (InvalidateFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionInvalidate");
+        if (invalidate) invalidate(_yuvTransferSession);
     }
     if (_prerenderTransferSession) {
         InvalidateFunc invalidate = (InvalidateFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionInvalidate");
         if (invalidate) invalidate(_prerenderTransferSession);
+    }
+    if (_privateTransferSession) {
+        InvalidateFunc invalidate = (InvalidateFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionInvalidate");
+        if (invalidate) invalidate(_privateTransferSession);
     }
     // 释放所有缓冲池
     for (id key in _bgraBufferPoolMap) {
@@ -116,18 +132,29 @@ static void vcam_gpu_log(NSString *msg) {
 
 #pragma mark - Session 初始化
 
-- (void)setupPixelTransferSession {
-    if (_pixelTransferSession) return;
-    OSStatus status = VTPixelTransferSessionCreate(kCFAllocatorDefault, &_pixelTransferSession);
+- (void)setupBGRATransferSession {
+    if (_bgraTransferSession) return;
+    OSStatus status = VTPixelTransferSessionCreate(kCFAllocatorDefault, &_bgraTransferSession);
     if (status == noErr) {
         // 对齐逆向 vcameracrack.dylib: RealTime + Trim
         // 千面导入 kVTScalingMode_Trim: 保宽高比填充目标 + 裁剪超出部分(crop fill)
-        // CropSourceToCleanAperture 是把源 CA 直接拉伸到目标尺寸(比例不同时画面变形) —— 拉伸根源
-        VTSessionSetProperty(_pixelTransferSession, CFSTR("RealTime"), kCFBooleanTrue);
-        VTSessionSetProperty(_pixelTransferSession, CFSTR("ScalingMode"), CFSTR("Trim"));
-        vcam_gpu_log(@"[vcam] VTPixelTransferSession created (RealTime + Trim)");
+        VTSessionSetProperty(_bgraTransferSession, CFSTR("RealTime"), kCFBooleanTrue);
+        VTSessionSetProperty(_bgraTransferSession, CFSTR("ScalingMode"), CFSTR("Trim"));
+        vcam_gpu_log(@"[vcam] BGRA VTPixelTransferSession created (RealTime + Trim)");
     } else {
-        vcam_gpu_log([NSString stringWithFormat:@"[vcam] Failed to create VTPixelTransferSession: %d", (int)status]);
+        vcam_gpu_log([NSString stringWithFormat:@"[vcam] Failed to create BGRA session: %d", (int)status]);
+    }
+}
+
+- (void)setupYUVTransferSession {
+    if (_yuvTransferSession) return;
+    OSStatus status = VTPixelTransferSessionCreate(kCFAllocatorDefault, &_yuvTransferSession);
+    if (status == noErr) {
+        VTSessionSetProperty(_yuvTransferSession, CFSTR("RealTime"), kCFBooleanTrue);
+        VTSessionSetProperty(_yuvTransferSession, CFSTR("ScalingMode"), CFSTR("Trim"));
+        vcam_gpu_log(@"[vcam] YUV VTPixelTransferSession created (RealTime + Trim)");
+    } else {
+        vcam_gpu_log([NSString stringWithFormat:@"[vcam] Failed to create YUV session: %d", (int)status]);
     }
 }
 
@@ -141,6 +168,21 @@ static void vcam_gpu_log(NSString *msg) {
         vcam_gpu_log(@"[vcam] Prerender VTPixelTransferSession created (Trim)");
     } else {
         vcam_gpu_log([NSString stringWithFormat:@"[vcam] Failed to create prerender session: %d", (int)status]);
+    }
+}
+
+- (void)setupPrivateTransferSession {
+    if (_privateTransferSession) return;
+    // 私有格式目标(|xv0/|8v0/-8f0/p420 等)专用 session:
+    // 与标准格式 session 隔离 —— 私有格式的 pipeline 会改写 session 内部状态,
+    // 混用会污染标准流(之前照片模式上下反复拉伸的教训)
+    OSStatus status = VTPixelTransferSessionCreate(kCFAllocatorDefault, &_privateTransferSession);
+    if (status == noErr) {
+        VTSessionSetProperty(_privateTransferSession, CFSTR("RealTime"), kCFBooleanTrue);
+        VTSessionSetProperty(_privateTransferSession, CFSTR("ScalingMode"), CFSTR("Trim"));
+        vcam_gpu_log(@"[vcam] Private-format VTPixelTransferSession created (Trim)");
+    } else {
+        vcam_gpu_log([NSString stringWithFormat:@"[vcam] Failed to create private session: %d", (int)status]);
     }
 }
 
@@ -301,7 +343,7 @@ static void vcam_gpu_log(NSString *msg) {
             // 用 VTPixelTransferSession 转换格式（同尺寸 BGRA→YUV）
             outputBuffer = [self createBufferWithWidth:width height:height format:format];
             if (outputBuffer) {
-                OSStatus status = VTPixelTransferSessionTransferImage(_pixelTransferSession, processedBuffer, outputBuffer);
+                OSStatus status = VTPixelTransferSessionTransferImage(_yuvTransferSession, processedBuffer, outputBuffer);
                 if (status != noErr) {
                     NSString *fmtStr = [self stringForFormat:format];
                     vcam_gpu_log([NSString stringWithFormat:@"[vcam] VTPixelTransferSession failed: %d, format: %@", (int)status, fmtStr]);
@@ -525,20 +567,33 @@ static void vcam_gpu_log(NSString *msg) {
 - (BOOL)transferPixelBuffer:(CVPixelBufferRef)src toPixelBuffer:(CVPixelBufferRef)dst {
     if (!src || !dst) return NO;
 
-    // 完全对齐千面 vcameracrack.dylib: 一步 VT transfer, 不做任何手动处理
-    //  - ScalingMode=CropSourceToCleanAperture(初始化时已配置) 自动完成 crop fill 缩放+格式转换
+    // 一步 VT transfer, 不做任何手动处理:
+    //  - ScalingMode=Trim(初始化时已配置) 自动完成保比例 crop fill 缩放+格式转换
     //  - 不在共享 src 上设置 clean aperture attachment: 多流(预览/照片)交替 render 会把
     //    同一 src 的 CA 来回改写 → 输出几何来回变化(照片模式上下反复拉伸的根源)
-    //  - 私有格式目标已由白名单挡住, 不会到达这里
-    if (!_pixelTransferSession) {
-        [self setupPixelTransferSession];
-    }
-    if (!_pixelTransferSession) return NO;
+    //  - 对齐千面(逆向 0xb0f8-0xb154): 所有格式无白名单全 transfer, 按目标格式分三套隔离 session:
+    //    BGRA→bgra / 420v|420f→yuv / 私有格式→private(base), 防止 pipeline 状态互相污染
+    OSType dstFormat = CVPixelBufferGetPixelFormatType(dst);
 
-    OSStatus status = VTPixelTransferSessionTransferImage(_pixelTransferSession, src, dst);
+    VTPixelTransferSessionRef session = NULL;
+    if (dstFormat == kCVPixelFormatType_32BGRA) {
+        if (!_bgraTransferSession) [self setupBGRATransferSession];
+        session = _bgraTransferSession;
+    } else if ((dstFormat & 0xffffffef) == '420f') {  // 420v/420f 抹掉 video/full-range 位
+        if (!_yuvTransferSession) [self setupYUVTransferSession];
+        session = _yuvTransferSession;
+    } else {
+        if (!_privateTransferSession) [self setupPrivateTransferSession];
+        session = _privateTransferSession;
+    }
+    if (!session) return NO;
+
+    OSStatus status = VTPixelTransferSessionTransferImage(session, src, dst);
     if (status != noErr) {
-        vcam_gpu_log([NSString stringWithFormat:@"[vcam] VTPixelTransferSession failed: %d, format: %@",
-                      (int)status, [self stringForFormat:CVPixelBufferGetPixelFormatType(dst)]]);
+        vcam_gpu_log([NSString stringWithFormat:@"[vcam] VT transfer failed: %d, %@ -> %@",
+                      (int)status,
+                      [self stringForFormat:CVPixelBufferGetPixelFormatType(src)],
+                      [self stringForFormat:dstFormat]]);
         return NO;
     }
     return YES;
