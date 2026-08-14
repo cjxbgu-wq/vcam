@@ -170,16 +170,10 @@ static void vcam_core_log(NSString *msg) {
         return;
     }
 
-    // 2. 按目标格式选源缓存（对齐千面双格式缓存）:
-    //   BGRA 目标 → BGRA 缓存
-    //   420v/420f/私有格式目标 → YUV(420f) 缓存优先 —— 私有格式(-8f0/|8v0/p420)是 YUV 变体,
-    //   BGRA→YUV 的 range/矩阵假设不匹配会过曝发白(高光根因), YUV→YUV 转换保持 range
-    CVPixelBufferRef base = NULL;
-    if (origFormat == kCVPixelFormatType_32BGRA) {
-        base = bgra ? bgra : yuv;
-    } else {
-        base = yuv ? yuv : bgra;
-    }
+    // 2. 选源(对齐千面 render: transfer 源固定为单一 BGRA 帧 copyCurrentFrame,
+    //    不按目标格式选源 —— BGRA->任意格式(含私有 |xv0/-8f0/p420) VT 都支持,
+    //    而 420f->私有格式 VT 不支持(-12905, 实测日志确认, 导致全绿/替换失效), YUV 仅兜底)
+    CVPixelBufferRef base = bgra ? bgra : yuv;
 
     // 3. 自适应旋转(对齐千面 render_disas 0xaf7c-0xafe4): 源/目标宽高比正交(一横一竖)时
     //    CCW90 旋转(宽高互换), 预览流(竖向 buffer)与拍照/录像流(横向 buffer)各自正确方向,
@@ -196,9 +190,8 @@ static void vcam_core_log(NSString *msg) {
     if (ok) {
         _frameCount++;
         if (diagThisFrame) {
-            vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d OK %zux%zu fmt=0x%x via %@%@",
+            vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d OK %zux%zu fmt=0x%x via BGRA%@",
                            vcamRenderCount, targetW, targetH, (unsigned)origFormat,
-                           [self isPrivateFormat:origFormat] ? @"YUV" : @"SRC",
                            (src != base) ? @" +CCW90" : @""]);
         }
         // 缓存回退帧(千面缓存旋转后的实际 transfer 源 x24, 0xb15c-0xb19c) + 同帧去重

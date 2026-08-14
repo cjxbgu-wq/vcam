@@ -208,19 +208,29 @@ static void vcam_gpu_log(NSString *msg) {
 - (void)setupPixelRotationSession {
     if (_pixelRotationSession) return;
 
-    // 通过 dlsym 加载私有 API
-    _createRotationSession = (VTPixelRotationSessionCreateFunc)dlsym(RTLD_DEFAULT, "VTPixelRotationSessionCreate");
-    _transferRotationImage = (VTPixelRotationSessionTransferImageFunc)dlsym(RTLD_DEFAULT, "VTPixelRotationSessionTransferImage");
+    // dlsym(RTLD_DEFAULT) 在 mediaserverd 中找不到 VideoToolbox 私有符号
+    // (rotation session 因此从未创建, 自适应旋转从未执行)。
+    // 改为显式 dlopen VideoToolbox 后在其镜像内查找。
+    void *vt = dlopen("/System/Library/Frameworks/VideoToolbox.framework/VideoToolbox", RTLD_LAZY | RTLD_GLOBAL);
+    void *base = vt ? vt : RTLD_DEFAULT;
+
+    _createRotationSession = (VTPixelRotationSessionCreateFunc)dlsym(base, "VTPixelRotationSessionCreate");
+    _transferRotationImage = (VTPixelRotationSessionTransferImageFunc)dlsym(base, "VTPixelRotationSessionRotateImage");
 
     // 注意: kVTPixelRotationPropertyKey_* 是 CFStringRef 全局变量, dlsym 返回的是变量地址,
     // 需解引用拿到 CFString 对象; 解引用失败回退已知字符串值(RotationInDegrees / FlipHorizontalOrientation)
-    void *rotSym = dlsym(RTLD_DEFAULT, "kVTPixelRotationPropertyKey_RotationInDegrees");
+    void *rotSym = dlsym(base, "kVTPixelRotationPropertyKey_RotationInDegrees");
     _rotationKeyInDegrees = rotSym ? *(CFStringRef *)rotSym : CFSTR("RotationInDegrees");
-    void *flipSym = dlsym(RTLD_DEFAULT, "kVTPixelRotationPropertyKey_FlipHorizontalOrientation");
+    void *flipSym = dlsym(base, "kVTPixelRotationPropertyKey_FlipHorizontalOrientation");
     _flipHorizontalKey = flipSym ? *(CFStringRef *)flipSym : CFSTR("FlipHorizontalOrientation");
 
-    if (!_createRotationSession || !_transferRotationImage || !_rotationKeyInDegrees || !_flipHorizontalKey) {
+    vcam_gpu_log([NSString stringWithFormat:@"[vcam] rotation api probe: handle=%d create=%d rotate=%d rotKey=%d flipKey=%d",
+                  vt != NULL, _createRotationSession != NULL, _transferRotationImage != NULL,
+                  rotSym != NULL, flipSym != NULL]);
+
+    if (!_createRotationSession || !_transferRotationImage) {
         _rotationApiAvailable = NO;
+        vcam_gpu_log(@"[vcam] VTPixelRotationSession API unavailable (adaptive rotation disabled)");
         return;
     }
 
@@ -228,8 +238,8 @@ static void vcam_gpu_log(NSString *msg) {
     if (status == noErr) {
         _rotationApiAvailable = YES;
         // render 路径专用第二个 session（预渲染与 render 并发旋转同一 session 会崩溃）
-        _createRotationSession(kCFAllocatorDefault, &_renderRotationSession);
-        vcam_gpu_log(@"[vcam] VTPixelRotationSession created successfully");
+        OSStatus st2 = _createRotationSession(kCFAllocatorDefault, &_renderRotationSession);
+        vcam_gpu_log([NSString stringWithFormat:@"[vcam] VTPixelRotationSession created (render session: %d)", (int)st2]);
     } else {
         _rotationApiAvailable = NO;
         vcam_gpu_log([NSString stringWithFormat:@"[vcam] Failed to create VTPixelRotationSession: %d", (int)status]);
