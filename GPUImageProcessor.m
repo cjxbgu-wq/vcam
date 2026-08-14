@@ -120,12 +120,12 @@ static void vcam_gpu_log(NSString *msg) {
     if (_pixelTransferSession) return;
     OSStatus status = VTPixelTransferSessionCreate(kCFAllocatorDefault, &_pixelTransferSession);
     if (status == noErr) {
-        // 对齐逆向 vcameracrack.dylib: RealTime + CropSourceToCleanAperture
-        // VT transfer 支持任意尺寸+格式组合, CropSourceToCleanAperture 自动做 crop fill 缩放
-        // (源缩放到完全填充目标, 超出部分裁剪, 无黑边, 硬件优化质量好)
+        // 对齐逆向 vcameracrack.dylib: RealTime + Trim
+        // 千面导入 kVTScalingMode_Trim: 保宽高比填充目标 + 裁剪超出部分(crop fill)
+        // CropSourceToCleanAperture 是把源 CA 直接拉伸到目标尺寸(比例不同时画面变形) —— 拉伸根源
         VTSessionSetProperty(_pixelTransferSession, CFSTR("RealTime"), kCFBooleanTrue);
-        VTSessionSetProperty(_pixelTransferSession, CFSTR("ScalingMode"), CFSTR("CropSourceToCleanAperture"));
-        vcam_gpu_log(@"[vcam] VTPixelTransferSession created (RealTime + CropSourceToCleanAperture)");
+        VTSessionSetProperty(_pixelTransferSession, CFSTR("ScalingMode"), CFSTR("Trim"));
+        vcam_gpu_log(@"[vcam] VTPixelTransferSession created (RealTime + Trim)");
     } else {
         vcam_gpu_log([NSString stringWithFormat:@"[vcam] Failed to create VTPixelTransferSession: %d", (int)status]);
     }
