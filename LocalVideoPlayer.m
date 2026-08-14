@@ -391,6 +391,9 @@ static void vcam_player_log(NSString *msg) {
                     [_frameQueue enqueuePixelBuffer:buffer];
                     CVPixelBufferRelease(buffer);  // 队列已 retain
                     _frameCount++;
+                    // 按视频帧率控制解码速度, 避免加速播放(参考逆向: 按时间戳输出帧)
+                    double frameInterval = (_videoFps > 1.0) ? (1.0 / _videoFps) : (1.0 / 30.0);
+                    [NSThread sleepForTimeInterval:frameInterval];
                 } else {
                     // 没有读到帧，短暂休眠避免忙等
                     [NSThread sleepForTimeInterval:0.005];

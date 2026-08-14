@@ -49,7 +49,7 @@ static void MSHookMessageEx(Class cls, SEL sel, IMP newImp, IMP *origPtr) {
 static volatile int32_t vcamTweakLogCount = 0;
 static void vcam_tweak_log(NSString *msg) {
     int32_t n = __sync_add_and_fetch(&vcamTweakLogCount, 1);
-    if (n > 100) return;  // 限制日志量
+    if (n > 500) return;  // 限制日志量
     @try {
         NSString *logPath = @"/tmp/vcam_tweak_log.txt";
         NSString *ts = [NSDate date].description;
@@ -81,6 +81,14 @@ static void (*orig_BWPhotoEncoderNode_renderSampleBuffer)(id self, SEL _cmd, CMS
 // Hook 1: BWNodeOutput emitSampleBuffer:
 // 主预览流 —— 所有 app 的相机预览都经过这里
 static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sampleBuffer) {
+    // 诊断: 记录预览流触发 + 格式(每 60 帧一次)
+    static int vcamEmitCount = 0;
+    vcamEmitCount++;
+    if (vcamEmitCount % 60 == 1) {
+        CVPixelBufferRef pb = sampleBuffer ? CMSampleBufferGetImageBuffer(sampleBuffer) : NULL;
+        OSType fmt = pb ? CVPixelBufferGetPixelFormatType(pb) : 0;
+        vcam_tweak_log([NSString stringWithFormat:@"[vcam] emit#%d fmt=0x%x cls=%@", vcamEmitCount, (unsigned)fmt, NSStringFromClass([self class])]);
+    }
     // 在调用原始方法之前替换帧
     if (sampleBuffer) {
         CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
