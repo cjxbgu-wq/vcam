@@ -156,17 +156,15 @@ static void vcam_core_log(NSString *msg) {
         return;
     }
 
-    // 按目标格式选源缓存:
+    // 按目标格式选源缓存（对齐千面双格式缓存）:
     //   BGRA 目标 → BGRA 缓存
     //   420v/420f 目标 → YUV(420f) 缓存优先(标准 YUV→YUV 转换最快), 回退 BGRA
-    //   |xv0/p420 等私有格式目标 → BGRA 缓存优先(VT 支持 BGRA->|xv0, 不支持 420f->|xv0 -12905)
+    //   私有格式(|xv0/p420 等)已在白名单处跳过, 不会到这里
     CVPixelBufferRef src = NULL;
     if (origFormat == kCVPixelFormatType_32BGRA) {
         src = bgra;
-    } else if (origFormat == '420v' || origFormat == '420f') {
-        src = yuv ? yuv : bgra;
     } else {
-        src = bgra ? bgra : yuv;
+        src = yuv ? yuv : bgra;
     }
 
     // 3. 写入相机帧: VT transfer(CropSourceToCleanAperture 自动 crop fill) 主路径
@@ -246,18 +244,12 @@ static void vcam_core_log(NSString *msg) {
 - (BOOL)isSupportedVideoFormat:(CVPixelBufferRef)buffer {
     if (!buffer) return NO;
     OSType format = CVPixelBufferGetPixelFormatType(buffer);
-    // 千面白名单: BGRA, 420v, 420f
-    // 另外加私有 YUV 变体(|xv0/|8v0/-8f0/-8v0 等): 视频模式下多个流并存,
-    // 只替换 420f 流会与未替换的私有格式流交替显示 → 闪烁; 全部尝试替换(BGRA 源 VT 转换)
+    // 完全对齐千面 vcameracrack.dylib 的白名单: 只有 BGRA, 420v, 420f
+    // 私有格式(|xv0/p420/-8f0 等)一律跳过 —— 千面不处理它们, 由系统管道自行派生;
+    // 处理它们会导致: 共享预渲染缓存被 CA 污染(照片反复拉伸) + 每帧两步转换开销(视频掉帧)
     return format == kCVPixelFormatType_32BGRA  // BGRA
         || format == '420v'                      // 420v
-        || format == '420f'                      // 420f
-        || format == 0x7c787630                  // |xv0
-        || format == 0x7c387630                  // |8v0
-        || format == 0x7c386630                  // |8f0
-        || format == 0x2d387630                  // -8v0
-        || format == 0x2d386630                  // -8f0
-        || format == 0x70343230;                 // p420
+        || format == '420f';                     // 420f
 }
 
 #pragma mark - 帧写入
