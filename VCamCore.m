@@ -36,6 +36,12 @@ static void vcam_core_log(NSString *msg) {
 @property (nonatomic, strong) dispatch_source_t pollingTimer;
 @property (nonatomic, assign) BOOL pollingActive;
 @property (nonatomic, assign) BOOL lastEnabledState;
+// 帧缓存: 避免每次 render 都调用 processPixelBuffer（24fps 视频 vs 60fps 相机）
+@property (nonatomic, assign) CVPixelBufferRef cachedProcessedFrame;
+@property (nonatomic, assign) uint64_t lastProcessedFrameCount;
+@property (nonatomic, assign) size_t lastProcessedWidth;
+@property (nonatomic, assign) size_t lastProcessedHeight;
+@property (nonatomic, assign) OSType lastProcessedFormat;
 @end
 
 @implementation VCamCore
@@ -70,6 +76,11 @@ static void vcam_core_log(NSString *msg) {
         _pollingActive = NO;
         _lastEnabledState = NO;
         _formatLockMap = [[NSMutableDictionary alloc] init];
+        _cachedProcessedFrame = NULL;
+        _lastProcessedFrameCount = 0;
+        _lastProcessedWidth = 0;
+        _lastProcessedHeight = 0;
+        _lastProcessedFormat = 0;
 
         // 初始化组件
         _gpuProcessor = [[GPUImageProcessor alloc] init];
@@ -162,45 +173,61 @@ static void vcam_core_log(NSString *msg) {
         }
     }
 
-    // 3. 获取替换帧
-    CVPixelBufferRef replacementFrame = [_videoPlayer copyCurrentFrame];
-    if (!replacementFrame) {
-        // 没有可用帧，使用缓存的帧
-        if (origFormat == kCVPixelFormatType_32BGRA && _liveBGRAPixelBuffer) {
-            [self writeFrame:_liveBGRAPixelBuffer toPixelBuffer:pixelBuffer];
-            if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d cache BGRA", vcamRenderCount]);
-            return;
+    // 3. 帧缓存: 只在视频帧变化或目标格式/尺寸变化时重新处理 processPixelBuffer
+    //    (视频 24fps vs 相机 60fps, 缓存避免 60% 的重复处理, 大幅减少卡顿)
+    uint64_t currentFrameCount = _videoPlayer.frameCount;
+    BOOL needReprocess = (currentFrameCount != _lastProcessedFrameCount ||
+                          origWidth != _lastProcessedWidth ||
+                          origHeight != _lastProcessedHeight ||
+                          origFormat != _lastProcessedFormat ||
+                          _cachedProcessedFrame == NULL);
+
+    if (needReprocess) {
+        CVPixelBufferRef replacementFrame = [_videoPlayer copyCurrentFrame];
+        if (replacementFrame) {
+            CVPixelBufferRef processedFrame = [_gpuProcessor processPixelBuffer:replacementFrame
+                                                                        toWidth:origWidth
+                                                                        height:origHeight
+                                                                        format:origFormat];
+            CVPixelBufferRelease(replacementFrame);
+
+            if (processedFrame) {
+                if (_cachedProcessedFrame) {
+                    CVPixelBufferRelease(_cachedProcessedFrame);
+                }
+                _cachedProcessedFrame = processedFrame;  // CF_RETURNS_RETAINED, 已 retain
+                _lastProcessedFrameCount = currentFrameCount;
+                _lastProcessedWidth = origWidth;
+                _lastProcessedHeight = origHeight;
+                _lastProcessedFormat = origFormat;
+                if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d REPROCESS fc=%llu %zux%zu fmt=0x%x", vcamRenderCount, (unsigned long long)currentFrameCount, origWidth, origHeight, (unsigned)origFormat]);
+            } else {
+                if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d processPixelBuffer FAILED", vcamRenderCount]);
+            }
         }
-        if (_liveYUVPixelBuffer) {
-            [self writeFrame:_liveYUVPixelBuffer toPixelBuffer:pixelBuffer];
-            if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d cache YUV", vcamRenderCount]);
-            return;
-        }
-        if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d NO frame no cache", vcamRenderCount]);
-        return;  // 没有缓存帧，保持原始相机
     }
 
-    // 4. 处理帧（旋转/镜像/缩放/格式转换）
-    CVPixelBufferRef processedFrame = [_gpuProcessor processPixelBuffer:replacementFrame
-                                                                toWidth:origWidth
-                                                                height:origHeight
-                                                                format:origFormat];
-    CVPixelBufferRelease(replacementFrame);
-
-    if (!processedFrame) {
-        if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d processPixelBuffer FAILED", vcamRenderCount]);
+    // 4. 用缓存的 processedFrame 写入相机帧（快路径: writeFrame 只 memcpy）
+    if (_cachedProcessedFrame) {
+        [self writeFrame:_cachedProcessedFrame toPixelBuffer:pixelBuffer];
+        [self cacheLastRenderedFrame:_cachedProcessedFrame width:origWidth height:origHeight];
+        if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d OK wrote frame %zux%zu (cached)", vcamRenderCount, origWidth, origHeight]);
+        _frameCount++;
         return;
     }
 
-    // 5. 写入目标 pixelBuffer
-    [self writeFrame:processedFrame toPixelBuffer:pixelBuffer];
-
-    // 6. 缓存最后渲染的帧
-    [self cacheLastRenderedFrame:processedFrame width:origWidth height:origHeight];
-    CVPixelBufferRelease(processedFrame);
-
-    if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d OK wrote frame %zux%zu", vcamRenderCount, origWidth, origHeight]);
-    _frameCount++;
+    // 5. 没有缓存帧，用 liveBGRAPixelBuffer/liveYUVPixelBuffer 回退
+    if (origFormat == kCVPixelFormatType_32BGRA && _liveBGRAPixelBuffer) {
+        [self writeFrame:_liveBGRAPixelBuffer toPixelBuffer:pixelBuffer];
+        if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d cache BGRA", vcamRenderCount]);
+        return;
+    }
+    if (_liveYUVPixelBuffer) {
+        [self writeFrame:_liveYUVPixelBuffer toPixelBuffer:pixelBuffer];
+        if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d cache YUV", vcamRenderCount]);
+        return;
+    }
+    if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d NO frame no cache", vcamRenderCount]);
 }
 
 - (BOOL)hasReplacementFrame {
@@ -219,6 +246,14 @@ static void vcam_core_log(NSString *msg) {
         CVPixelBufferRelease(_liveYUVPixelBuffer);
         _liveYUVPixelBuffer = NULL;
     }
+    if (_cachedProcessedFrame) {
+        CVPixelBufferRelease(_cachedProcessedFrame);
+        _cachedProcessedFrame = NULL;
+    }
+    _lastProcessedFrameCount = 0;
+    _lastProcessedWidth = 0;
+    _lastProcessedHeight = 0;
+    _lastProcessedFormat = 0;
     _targetSizeKnown = NO;
     _targetWidth = 0;
     _targetHeight = 0;
