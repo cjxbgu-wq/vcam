@@ -146,11 +146,9 @@ static void vcam_core_log(NSString *msg) {
         return;
     }
 
-    // 2. 多格式锁定: 每种格式独立锁尺寸(允许 420f/|xv0/p420 等多格式同时处理)
-    NSNumber *fmtKey = @(origFormat);
-    NSString *lockedSize = _formatLockMap[fmtKey];
-    if (!lockedSize) {
-        // 该格式首次遇到, 锁定其尺寸
+    // 2. 多格式锁定: key="format_w_h"（允许同格式不同尺寸，如 420f 1080x2340 和 420f 1440x1080）
+    NSString *fmtKey = [NSString stringWithFormat:@"%u_%zu_%zu", (unsigned)origFormat, origWidth, origHeight];
+    if (!_formatLockMap[fmtKey]) {
         char fstr[5] = {0};
         fstr[0] = (char)(origFormat >> 24);
         fstr[1] = (char)(origFormat >> 16);
@@ -158,29 +156,17 @@ static void vcam_core_log(NSString *msg) {
         fstr[3] = (char)origFormat;
         vcam_core_log([NSString stringWithFormat:@"[vcam] Format locked: %zux%zu fmt=0x%x (%s)",
                        origWidth, origHeight, (unsigned)origFormat, fstr]);
-        // 用 NSString 存 "w,h" 简单可靠(NSValue 包装 size_t 在 ARC 下不安全)
-        _formatLockMap[fmtKey] = [NSString stringWithFormat:@"%zu,%zu", origWidth, origHeight];
-        // 兼容旧字段
+        _formatLockMap[fmtKey] = @YES;
         _targetWidth = origWidth;
         _targetHeight = origHeight;
         _targetFormat = origFormat;
         _targetSizeKnown = YES;
-    } else {
-        // 该格式已锁定, 检查尺寸是否匹配(同格式不同尺寸仍跳过, 防 mismatch 崩溃)
-        NSArray *parts = [lockedSize componentsSeparatedByString:@","];
-        if (parts.count == 2) {
-            size_t lw = (size_t)[parts[0] integerValue];
-            size_t lh = (size_t)[parts[1] integerValue];
-            if (origWidth != lw || origHeight != lh) {
-                if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d SKIP size mismatch %zux%zu fmt=0x%x (locked %zux%zu)", vcamRenderCount, origWidth, origHeight, (unsigned)origFormat, lw, lh]);
-                return;
-            }
-        }
     }
+    // key 已包含尺寸，不需要检查 mismatch
 
-    // 3. 用预渲染的 liveBGRAMap 取对应格式的 BGRA（多格式预渲染，每种格式对应尺寸）
+    // 3. 用预渲染的 liveBGRAMap 取对应 format+w+h 的 420f buffer
     [_processLock lock];
-    id bgraObj = _liveBGRAMap[@(origFormat)];
+    id bgraObj = _liveBGRAMap[fmtKey];
     if (!bgraObj) bgraObj = _liveBGRAMap[@(0)];  // 回退到原始尺寸
     if (bgraObj) CFRetain((__bridge CFTypeRef)bgraObj);
     [_processLock unlock];
@@ -332,6 +318,22 @@ static void vcam_core_log(NSString *msg) {
 
     // 路径1.5: 420f→|xv0/p420 直接 memcpy（planar YUV 双平面内存布局兼容, VTPixelTransferSession 不支持这些格式作为目标）
     if (srcFormat == '420f' && (dstFormat == '|xv0' || dstFormat == 'p420') && srcW == dstW && srcH == dstH) {
+        static int xv0DiagCount = 0;
+        if (xv0DiagCount < 3) {
+            xv0DiagCount++;
+            size_t srcPlanes = CVPixelBufferGetPlaneCount(src);
+            size_t dstPlanes = CVPixelBufferGetPlaneCount(dst);
+            size_t srcDataSize = CVPixelBufferGetDataSize(src);
+            size_t dstDataSize = CVPixelBufferGetDataSize(dst);
+            size_t srcBpr0 = srcPlanes > 0 ? CVPixelBufferGetBytesPerRowOfPlane(src, 0) : 0;
+            size_t dstBpr0 = dstPlanes > 0 ? CVPixelBufferGetBytesPerRowOfPlane(dst, 0) : 0;
+            size_t srcBpr1 = srcPlanes > 1 ? CVPixelBufferGetBytesPerRowOfPlane(src, 1) : 0;
+            size_t dstBpr1 = dstPlanes > 1 ? CVPixelBufferGetBytesPerRowOfPlane(dst, 1) : 0;
+            size_t srcH0 = srcPlanes > 0 ? CVPixelBufferGetHeightOfPlane(src, 0) : 0;
+            size_t dstH0 = dstPlanes > 0 ? CVPixelBufferGetHeightOfPlane(dst, 0) : 0;
+            vcam_core_log([NSString stringWithFormat:@"[vcam] YUV diag: src(420f) planes=%zu dataSize=%zu bpr0=%zu bpr1=%zu h0=%zu | dst(0x%x) planes=%zu dataSize=%zu bpr0=%zu bpr1=%zu h0=%zu",
+                           srcPlanes, srcDataSize, srcBpr0, srcBpr1, srcH0, (unsigned)dstFormat, dstPlanes, dstDataSize, dstBpr0, dstBpr1, dstH0]);
+        }
         CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
         CVPixelBufferLockBaseAddress(dst, 0);
         void *srcBase = CVPixelBufferGetBaseAddress(src);
@@ -393,7 +395,6 @@ static void vcam_core_log(NSString *msg) {
                     // 还没遇到相机帧，用视频原始尺寸
                     size_t vw = CVPixelBufferGetWidth(frame);
                     size_t vh = CVPixelBufferGetHeight(frame);
-                    // 统一产出 420f（VTPixelTransferSession 支持 420f→其他YUV，比 BGRA→|xv0 可靠）
                     CVPixelBufferRef processed = [strongSelf.gpuProcessor processPixelBuffer:frame toWidth:vw height:vh format:'420f'];
                     if (processed) {
                         [strongSelf.processLock lock];
@@ -401,18 +402,18 @@ static void vcam_core_log(NSString *msg) {
                         [strongSelf.processLock unlock];
                     }
                 } else {
-                    for (NSNumber *fmtKey in formatMap) {
-                        NSString *sizeStr = formatMap[fmtKey];
-                        NSArray *parts = [sizeStr componentsSeparatedByString:@","];
-                        if (parts.count != 2) continue;
-                        size_t w = (size_t)[parts[0] integerValue];
-                        size_t h = (size_t)[parts[1] integerValue];
+                    // formatLockMap key = "format_w_h"，解析获取 format/w/h
+                    for (NSString *key in formatMap) {
+                        NSArray *parts = [key componentsSeparatedByString:@"_"];
+                        if (parts.count != 3) continue;
+                        size_t w = (size_t)[parts[1] integerValue];
+                        size_t h = (size_t)[parts[2] integerValue];
 
-                        // 统一产出 420f（VTPixelTransferSession 支持 420f→|xv0/p420 等YUV转换）
+                        // 统一产出 420f（VTPixelTransferSession 支持 420f→其他YUV）
                         CVPixelBufferRef processed = [strongSelf.gpuProcessor processPixelBuffer:frame toWidth:w height:h format:'420f'];
                         if (processed) {
                             [strongSelf.processLock lock];
-                            strongSelf.liveBGRAMap[fmtKey] = (__bridge_transfer id)processed;
+                            strongSelf.liveBGRAMap[key] = (__bridge_transfer id)processed;
                             [strongSelf.processLock unlock];
                         }
                     }
