@@ -357,25 +357,25 @@ static void vcam_core_log(NSString *msg) {
                 [strongSelf.processLock unlock];
 
                 if (formatMap.count == 0) {
-                    // 还没遇到相机帧，用视频原始尺寸
+                    // 还没遇到相机帧，用视频原始尺寸，产出 BGRA
                     size_t vw = CVPixelBufferGetWidth(frame);
                     size_t vh = CVPixelBufferGetHeight(frame);
-                    CVPixelBufferRef processed = [strongSelf.gpuProcessor processPixelBuffer:frame toWidth:vw height:vh format:'420f'];
+                    CVPixelBufferRef processed = [strongSelf.gpuProcessor scaleToBGRA:frame width:vw height:vh];
                     if (processed) {
                         [strongSelf.processLock lock];
                         strongSelf.liveBGRAMap[@(0)] = (__bridge_transfer id)processed;
                         [strongSelf.processLock unlock];
                     }
                 } else {
-                    // formatLockMap key = "format_w_h"，解析获取 format/w/h
+                    // formatLockMap key = "format_w_h"，按实际 format 产出对应格式（420v→420v, 420f→420f, BGRA→BGRA）
                     for (NSString *key in formatMap) {
                         NSArray *parts = [key componentsSeparatedByString:@"_"];
                         if (parts.count != 3) continue;
+                        OSType fmt = (OSType)[parts[0] integerValue];
                         size_t w = (size_t)[parts[1] integerValue];
                         size_t h = (size_t)[parts[2] integerValue];
 
-                        // 统一产出 420f（VTPixelTransferSession 支持 420f→其他YUV）
-                        CVPixelBufferRef processed = [strongSelf.gpuProcessor processPixelBuffer:frame toWidth:w height:h format:'420f'];
+                        CVPixelBufferRef processed = [strongSelf.gpuProcessor processPixelBuffer:frame toWidth:w height:h format:fmt];
                         if (processed) {
                             [strongSelf.processLock lock];
                             strongSelf.liveBGRAMap[key] = (__bridge_transfer id)processed;
