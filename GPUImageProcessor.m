@@ -295,7 +295,7 @@ static void vcam_gpu_log(NSString *msg) {
     }
 }
 
-// 用 CGBitmapContext 缩放到目标尺寸的 BGRA（crop fill: 保持宽高比, 填充整个目标, 无黑边）
+// 用 CIContext render:toCVPixelBuffer:bounds: 实现 crop fill（保持宽高比, 无黑边, 方向正确）
 - (CVPixelBufferRef)scaleToBGRA:(CVPixelBufferRef)input
                           width:(size_t)width
                          height:(size_t)height CF_RETURNS_RETAINED {
@@ -307,49 +307,23 @@ static void vcam_gpu_log(NSString *msg) {
     CIImage *image = [CIImage imageWithCVPixelBuffer:input];
     if (!image) return NULL;
 
-    // 用 CIContext 创建 CGImage（从原始 extent）
-    CGImageRef cgImage = [_preprocessContext createCGImage:image fromRect:[image extent]];
-    if (!cgImage) {
-        // 回退: 直接 render（拉伸，不保持宽高比）
-        CVPixelBufferRef output = [self getOrCreateBGRABufferWithWidth:width height:height];
-        if (output) [_preprocessContext render:image toCVPixelBuffer:output];
-        return output;
-    }
-
     CVPixelBufferRef output = [self getOrCreateBGRABufferWithWidth:width height:height];
-    if (!output) {
-        CGImageRelease(cgImage);
-        return NULL;
-    }
+    if (!output) return NULL;
 
-    // crop fill: 保持宽高比, 取较大缩放比填充整个目标, 超出部分裁剪（无黑边）
-    CGFloat imgW = (CGFloat)CGImageGetWidth(cgImage);
-    CGFloat imgH = (CGFloat)CGImageGetHeight(cgImage);
-    CGFloat scale = MAX((CGFloat)width / imgW, (CGFloat)height / imgH);
-    CGFloat drawW = imgW * scale;
-    CGFloat drawH = imgH * scale;
-    CGFloat drawX = ((CGFloat)width - drawW) / 2.0;
-    CGFloat drawY = ((CGFloat)height - drawH) / 2.0;
+    // crop fill: 取较大缩放比填充整个目标, 超出部分裁剪（无黑边）
+    CGFloat scale = MAX((CGFloat)width / (CGFloat)inW, (CGFloat)height / (CGFloat)inH);
+    CGFloat scaledW = (CGFloat)inW * scale;
+    CGFloat scaledH = (CGFloat)inH * scale;
+    CGFloat offsetX = ((CGFloat)width - scaledW) / 2.0;   // 负值（超出部分裁剪）
+    CGFloat offsetY = ((CGFloat)height - scaledH) / 2.0;
 
-    CVPixelBufferLockBaseAddress(output, 0);
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    CGContextRef ctx = CGBitmapContextCreate(
-        CVPixelBufferGetBaseAddress(output),
-        width, height, 8, CVPixelBufferGetBytesPerRow(output),
-        cs, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
-    CGColorSpaceRelease(cs);
+    // 变换: 缩放 + 平移居中
+    CGAffineTransform t = CGAffineTransformMakeScale(scale, scale);
+    t = CGAffineTransformTranslate(t, offsetX / scale, offsetY / scale);
+    CIImage *scaled = [image imageByApplyingTransform:t];
 
-    if (ctx) {
-        // CG 坐标系 Y 轴向上, CVPixelBuffer Y 轴向下, 需翻转
-        CGContextSaveGState(ctx);
-        CGContextTranslateCTM(ctx, 0, (CGFloat)height);
-        CGContextScaleCTM(ctx, 1.0, -1.0);
-        CGContextDrawImage(ctx, CGRectMake(drawX, drawY, drawW, drawH), cgImage);
-        CGContextRestoreGState(ctx);
-        CGContextRelease(ctx);
-    }
-    CVPixelBufferUnlockBaseAddress(output, 0);
-    CGImageRelease(cgImage);
+    // 用 bounds 渲染: 只渲染 (0,0,width,height) 区域, 超出部分自动裁剪
+    [_preprocessContext render:scaled toCVPixelBuffer:output bounds:CGRectMake(0, 0, (CGFloat)width, (CGFloat)height) colorSpace:nil];
     return output;
 }
 
