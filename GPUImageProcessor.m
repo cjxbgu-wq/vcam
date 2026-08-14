@@ -137,8 +137,8 @@ static void vcam_gpu_log(NSString *msg) {
     OSStatus status = VTPixelTransferSessionCreate(kCFAllocatorDefault, &_prerenderTransferSession);
     if (status == noErr) {
         VTSessionSetProperty(_prerenderTransferSession, CFSTR("RealTime"), kCFBooleanTrue);
-        VTSessionSetProperty(_prerenderTransferSession, CFSTR("ScalingMode"), CFSTR("CropSourceToCleanAperture"));
-        vcam_gpu_log(@"[vcam] Prerender VTPixelTransferSession created");
+        VTSessionSetProperty(_prerenderTransferSession, CFSTR("ScalingMode"), CFSTR("Trim"));
+        vcam_gpu_log(@"[vcam] Prerender VTPixelTransferSession created (Trim)");
     } else {
         vcam_gpu_log([NSString stringWithFormat:@"[vcam] Failed to create prerender session: %d", (int)status]);
     }
