@@ -242,11 +242,14 @@ static void vcam_core_log(NSString *msg) {
 - (BOOL)isSupportedVideoFormat:(CVPixelBufferRef)buffer {
     if (!buffer) return NO;
     OSType format = CVPixelBufferGetPixelFormatType(buffer);
-    // 格式白名单（逆向确认）：BGRA, 420v, 420f
+    // 格式白名单: BGRA, 420v, 420f, |xv0(视频录制预览), p420(视频录制预览)
     // Theos SDK 缺少 kCVPixelFormatType_420YpCbCr8VideoRange/FullRange 声明，用 FourCC 码代替
+    // |xv0 = 0x7c787630 planar YUV 双平面(视频模式预览流), p420 = 0x70343230 3-plane YUV
     return format == kCVPixelFormatType_32BGRA  // BGRA
         || format == '420v'                      // 420v (VideoRange)
-        || format == '420f';                     // 420f (FullRange)
+        || format == '420f'                      // 420f (FullRange)
+        || format == '|xv0'                      // |xv0 (视频录制预览流, planar YUV)
+        || format == 'p420';                     // p420 (视频录制预览流, 3-plane YUV)
 }
 
 #pragma mark - 帧写入
