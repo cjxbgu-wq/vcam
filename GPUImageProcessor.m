@@ -38,8 +38,9 @@ static void vcam_gpu_log(NSString *msg) {
 }
 
 @interface GPUImageProcessor ()
-// 会话（两个独立的 VTPixelTransferSession: render 线程和预渲染线程各自专用, VT session 非线程安全, 并发调用会崩溃）
-@property (nonatomic, assign) VTPixelTransferSessionRef pixelTransferSession;      // render(hook 线程)专用
+// 会话（VT session 非线程安全且内部缓存 pipeline 状态, 必须按用途隔离）
+@property (nonatomic, assign) VTPixelTransferSessionRef pixelTransferSession;      // render: 标准格式目标(BGRA/420v/420f)
+@property (nonatomic, assign) VTPixelTransferSessionRef renderPrivateSession;      // render: 私有格式目标(-8v0/|xv0 等), 与标准 session 隔离防止状态污染导致几何抖动
 @property (nonatomic, assign) VTPixelTransferSessionRef prerenderTransferSession;  // 预渲染线程专用
 @property (nonatomic, assign) VTPixelRotationSessionRef pixelRotationSession;
 
