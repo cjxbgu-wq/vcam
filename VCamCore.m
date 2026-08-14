@@ -42,6 +42,7 @@ static void vcam_core_log(NSString *msg) {
 @property (nonatomic, assign) size_t lastProcessedWidth;
 @property (nonatomic, assign) size_t lastProcessedHeight;
 @property (nonatomic, assign) OSType lastProcessedFormat;
+@property (nonatomic, assign) BOOL prerenderActive;
 @end
 
 @implementation VCamCore
@@ -81,6 +82,7 @@ static void vcam_core_log(NSString *msg) {
         _lastProcessedWidth = 0;
         _lastProcessedHeight = 0;
         _lastProcessedFormat = 0;
+        _prerenderActive = NO;
 
         // 初始化组件
         _gpuProcessor = [[GPUImageProcessor alloc] init];
@@ -173,55 +175,40 @@ static void vcam_core_log(NSString *msg) {
         }
     }
 
-    // 3. 帧缓存: 只在视频帧变化或目标格式/尺寸变化时重新处理 processPixelBuffer
-    //    (视频 24fps vs 相机 60fps, 缓存避免 60% 的重复处理, 大幅减少卡顿)
-    uint64_t currentFrameCount = _videoPlayer.frameCount;
-    BOOL needReprocess = (currentFrameCount != _lastProcessedFrameCount ||
-                          origWidth != _lastProcessedWidth ||
-                          origHeight != _lastProcessedHeight ||
-                          origFormat != _lastProcessedFormat ||
-                          _cachedProcessedFrame == NULL);
+    // 3. 用预渲染的 _liveBGRAPixelBuffer 写入相机帧（快路径：预渲染线程已缩放，render 只 writeFrame）
+    [_processLock lock];
+    CVPixelBufferRef liveBGRA = _liveBGRAPixelBuffer;
+    if (liveBGRA) CVPixelBufferRetain(liveBGRA);
+    [_processLock unlock];
 
-    if (needReprocess) {
-        CVPixelBufferRef replacementFrame = [_videoPlayer copyCurrentFrame];
-        if (replacementFrame) {
-            CVPixelBufferRef processedFrame = [_gpuProcessor processPixelBuffer:replacementFrame
-                                                                        toWidth:origWidth
-                                                                        height:origHeight
-                                                                        format:origFormat];
-            CVPixelBufferRelease(replacementFrame);
-
+    if (liveBGRA) {
+        size_t liveW = CVPixelBufferGetWidth(liveBGRA);
+        size_t liveH = CVPixelBufferGetHeight(liveBGRA);
+        if (liveW == origWidth && liveH == origHeight) {
+            // 尺寸匹配：writeFrame 处理格式转换（memcpy/VTPixelTransferSession/CoreImage）
+            [self writeFrame:liveBGRA toPixelBuffer:pixelBuffer];
+            [self cacheLastRenderedFrame:liveBGRA width:origWidth height:origHeight];
+            if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d OK wrote frame %zux%zu (prerendered)", vcamRenderCount, origWidth, origHeight]);
+            CVPixelBufferRelease(liveBGRA);
+            _frameCount++;
+            return;
+        } else {
+            // 尺寸不匹配（多格式）：实时缩放 + 格式转换
+            CVPixelBufferRef processedFrame = [_gpuProcessor processPixelBuffer:liveBGRA toWidth:origWidth height:origHeight format:origFormat];
             if (processedFrame) {
-                if (_cachedProcessedFrame) {
-                    CVPixelBufferRelease(_cachedProcessedFrame);
-                }
-                _cachedProcessedFrame = processedFrame;  // CF_RETURNS_RETAINED, 已 retain
-                _lastProcessedFrameCount = currentFrameCount;
-                _lastProcessedWidth = origWidth;
-                _lastProcessedHeight = origHeight;
-                _lastProcessedFormat = origFormat;
-                if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d REPROCESS fc=%llu %zux%zu fmt=0x%x", vcamRenderCount, (unsigned long long)currentFrameCount, origWidth, origHeight, (unsigned)origFormat]);
-            } else {
-                if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d processPixelBuffer FAILED", vcamRenderCount]);
+                [self writeFrame:processedFrame toPixelBuffer:pixelBuffer];
+                [self cacheLastRenderedFrame:processedFrame width:origWidth height:origHeight];
+                CVPixelBufferRelease(processedFrame);
+                if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d OK wrote frame %zux%zu (live resize)", vcamRenderCount, origWidth, origHeight]);
+                CVPixelBufferRelease(liveBGRA);
+                _frameCount++;
+                return;
             }
         }
+        CVPixelBufferRelease(liveBGRA);
     }
 
-    // 4. 用缓存的 processedFrame 写入相机帧（快路径: writeFrame 只 memcpy）
-    if (_cachedProcessedFrame) {
-        [self writeFrame:_cachedProcessedFrame toPixelBuffer:pixelBuffer];
-        [self cacheLastRenderedFrame:_cachedProcessedFrame width:origWidth height:origHeight];
-        if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d OK wrote frame %zux%zu (cached)", vcamRenderCount, origWidth, origHeight]);
-        _frameCount++;
-        return;
-    }
-
-    // 5. 没有缓存帧，用 liveBGRAPixelBuffer/liveYUVPixelBuffer 回退
-    if (origFormat == kCVPixelFormatType_32BGRA && _liveBGRAPixelBuffer) {
-        [self writeFrame:_liveBGRAPixelBuffer toPixelBuffer:pixelBuffer];
-        if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d cache BGRA", vcamRenderCount]);
-        return;
-    }
+    // 4. 没有预渲染帧，用 liveYUVPixelBuffer 回退
     if (_liveYUVPixelBuffer) {
         [self writeFrame:_liveYUVPixelBuffer toPixelBuffer:pixelBuffer];
         if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d cache YUV", vcamRenderCount]);
@@ -237,6 +224,7 @@ static void vcam_core_log(NSString *msg) {
 }
 
 - (void)clearReplacementFrame {
+    [self stopPrerenderThread];
     [_processLock lock];
     if (_liveBGRAPixelBuffer) {
         CVPixelBufferRelease(_liveBGRAPixelBuffer);
@@ -351,6 +339,64 @@ static void vcam_core_log(NSString *msg) {
     // 不做任何操作，让原始相机帧通过
 }
 
+#pragma mark - 预渲染线程
+
+- (void)startPrerenderThread {
+    if (_prerenderActive) return;
+    _prerenderActive = YES;
+    vcam_core_log(@"[vcam] Prerender thread started");
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(_prerenderQueue, ^{
+        VCamCore *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        while (strongSelf.prerenderActive && strongSelf.enabled) {
+            @autoreleasepool {
+                CVPixelBufferRef frame = [strongSelf.videoPlayer copyCurrentFrame];
+                if (!frame) {
+                    [NSThread sleepForTimeInterval:0.005];
+                    continue;
+                }
+
+                // 确定目标尺寸：用第一个锁定的格式尺寸，否则用视频原始尺寸
+                size_t targetW, targetH;
+                if (strongSelf.targetSizeKnown && strongSelf.targetWidth > 0 && strongSelf.targetHeight > 0) {
+                    targetW = strongSelf.targetWidth;
+                    targetH = strongSelf.targetHeight;
+                } else {
+                    targetW = CVPixelBufferGetWidth(frame);
+                    targetH = CVPixelBufferGetHeight(frame);
+                }
+
+                // 缩放到目标尺寸 BGRA（预渲染）
+                CVPixelBufferRef bgra = [strongSelf.gpuProcessor scaleToBGRA:frame width:targetW height:targetH];
+                if (bgra) {
+                    [strongSelf.processLock lock];
+                    CVPixelBufferRef old = strongSelf.liveBGRAPixelBuffer;
+                    strongSelf.liveBGRAPixelBuffer = bgra;
+                    CVPixelBufferRetain(strongSelf.liveBGRAPixelBuffer);
+                    strongSelf.lastRenderedWidth = targetW;
+                    strongSelf.lastRenderedHeight = targetH;
+                    [strongSelf.processLock unlock];
+                    if (old) CVPixelBufferRelease(old);
+                    CVPixelBufferRelease(bgra);
+                }
+
+                CVPixelBufferRelease(frame);
+
+                // 按视频帧率等待
+                double fps = strongSelf.videoPlayer.videoFps > 1.0 ? strongSelf.videoPlayer.videoFps : 30.0;
+                [NSThread sleepForTimeInterval:1.0 / fps];
+            }
+        }
+        vcam_core_log(@"[vcam] Prerender thread exited");
+    });
+}
+
+- (void)stopPrerenderThread {
+    _prerenderActive = NO;
+    vcam_core_log(@"[vcam] Prerender thread stopped");
+}
+
 #pragma mark - 状态控制
 
 - (void)setEnabled:(BOOL)enabled {
@@ -380,6 +426,7 @@ static void vcam_core_log(NSString *msg) {
             }
         }];
         [_videoPlayer startWatchingFile:path];
+        [self startPrerenderThread];
 
         [_processLock lock];
         _enabled = YES;
@@ -387,6 +434,7 @@ static void vcam_core_log(NSString *msg) {
         vcam_core_log(@"[vcam] Live state changed to: enabled");
     } else {
         // enable→disable: 停止解码
+        [self stopPrerenderThread];
         [_videoPlayer stopDecodingThread];
         [_videoPlayer stopWatchingFile];
         [self clearReplacementFrame];

@@ -295,14 +295,11 @@ static void vcam_gpu_log(NSString *msg) {
     }
 }
 
-// 用 CIContext render:toCVPixelBuffer:bounds: 实现 crop fill（保持宽高比, 无黑边, 方向正确）
+// 用 CIContext render 缩放到目标尺寸 BGRA（拉伸到目标尺寸，方向/颜色正确）
 - (CVPixelBufferRef)scaleToBGRA:(CVPixelBufferRef)input
                           width:(size_t)width
                          height:(size_t)height CF_RETURNS_RETAINED {
     if (!input || !_preprocessContext) return NULL;
-
-    size_t inW = CVPixelBufferGetWidth(input);
-    size_t inH = CVPixelBufferGetHeight(input);
 
     CIImage *image = [CIImage imageWithCVPixelBuffer:input];
     if (!image) return NULL;
@@ -310,20 +307,7 @@ static void vcam_gpu_log(NSString *msg) {
     CVPixelBufferRef output = [self getOrCreateBGRABufferWithWidth:width height:height];
     if (!output) return NULL;
 
-    // crop fill: 取较大缩放比填充整个目标, 超出部分裁剪（无黑边）
-    CGFloat scale = MAX((CGFloat)width / (CGFloat)inW, (CGFloat)height / (CGFloat)inH);
-    CGFloat scaledW = (CGFloat)inW * scale;
-    CGFloat scaledH = (CGFloat)inH * scale;
-    CGFloat offsetX = ((CGFloat)width - scaledW) / 2.0;   // 负值（超出部分裁剪）
-    CGFloat offsetY = ((CGFloat)height - scaledH) / 2.0;
-
-    // 变换: 缩放 + 平移居中
-    CGAffineTransform t = CGAffineTransformMakeScale(scale, scale);
-    t = CGAffineTransformTranslate(t, offsetX / scale, offsetY / scale);
-    CIImage *scaled = [image imageByApplyingTransform:t];
-
-    // 用 bounds 渲染: 只渲染 (0,0,width,height) 区域, 超出部分自动裁剪
-    [_preprocessContext render:scaled toCVPixelBuffer:output bounds:CGRectMake(0, 0, (CGFloat)width, (CGFloat)height) colorSpace:nil];
+    [_preprocessContext render:image toCVPixelBuffer:output];
     return output;
 }
 
