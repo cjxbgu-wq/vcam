@@ -330,6 +330,22 @@ static void vcam_core_log(NSString *msg) {
         return;
     }
 
+    // 路径1.5: 420f→|xv0/p420 直接 memcpy（planar YUV 双平面内存布局兼容, VTPixelTransferSession 不支持这些格式作为目标）
+    if (srcFormat == '420f' && (dstFormat == '|xv0' || dstFormat == 'p420') && srcW == dstW && srcH == dstH) {
+        CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+        CVPixelBufferLockBaseAddress(dst, 0);
+        void *srcBase = CVPixelBufferGetBaseAddress(src);
+        void *dstBase = CVPixelBufferGetBaseAddress(dst);
+        size_t srcSize = CVPixelBufferGetDataSize(src);
+        size_t dstSize = CVPixelBufferGetDataSize(dst);
+        if (srcBase && dstBase) {
+            memcpy(dstBase, srcBase, MIN(srcSize, dstSize));
+        }
+        CVPixelBufferUnlockBaseAddress(dst, 0);
+        CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+        return;
+    }
+
     // 路径2：VTPixelTransferSession 转换
     if ([_gpuProcessor transferPixelBuffer:src toPixelBuffer:dst]) {
         return;
