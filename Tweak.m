@@ -79,7 +79,8 @@ static void (*orig_BWPhotoEncoderNode_renderSampleBuffer)(id self, SEL _cmd, CMS
 #pragma mark - Hook 函数实现
 
 // Hook 1: BWNodeOutput emitSampleBuffer:
-// 主预览流 —— 所有 app 的相机预览都经过这里
+// 主预览流 —— 所有 app 的相机预览/录像都经过这里(逆向: 就地改写原 buffer 后调原 IMP,
+// 假帧顺原生管线流向所有下游消费者: 预览/录像编码器/拍照编码器)
 static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sampleBuffer) {
     // 诊断: 记录预览流触发 + 格式(每 60 帧一次)
     static int vcamEmitCount = 0;
@@ -89,8 +90,27 @@ static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBuffer
         OSType fmt = pb ? CVPixelBufferGetPixelFormatType(pb) : 0;
         vcam_tweak_log([NSString stringWithFormat:@"[vcam] emit#%d fmt=0x%x cls=%@", vcamEmitCount, (unsigned)fmt, NSStringFromClass([self class])]);
     }
-    // 在调用原始方法之前替换帧
+    // 逆向逻辑: 只替换 mediaType=='vide' 的帧, 过滤音频/元数据(避免无效处理 + 录像流被漏掉)
     if (sampleBuffer) {
+        // CMSampleBuffer 本身无 mediaType, 但 [self mediaType] 在 BWNodeOutput 上返回当前流类型
+        // 用 CFString 'vide' (kCMMediaType_Video = 'vide') 比较未导出符号, 用 FourCC 直接比较
+        // 逆向: w8 = 0x76696465 = 'vide'; 若 [self mediaType] != 'vide' 直通原 IMP
+        @try {
+            // [self mediaType] 返回 CMMediaType (FourCC uint32)
+            // 用 objc_msgSend 调用避免 Theos SDK 声明问题
+            SEL mediaTypeSel = sel_registerName("mediaType");
+            if ([self respondsToSelector:mediaTypeSel]) {
+                uint32_t mt = ((uint32_t(*)(id, SEL))objc_msgSend)(self, mediaTypeSel);
+                if (mt != 'vide') {
+                    // 非视频帧(音频/元数据), 直通原 IMP
+                    if (orig_BWNodeOutput_emitSampleBuffer) {
+                        orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
+                    }
+                    return;
+                }
+            }
+        } @catch (NSException *e) {}
+        // 就地改写原 sample buffer 的 CVPixelBuffer, 然后调原 IMP 发射(假帧流向所有下游)
         CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
         if (pixelBuffer) {
             @try {
@@ -100,7 +120,7 @@ static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBuffer
             }
         }
     }
-    // 调用原始方法
+    // 调用原始方法(发射已掉包的 sample buffer)
     if (orig_BWNodeOutput_emitSampleBuffer) {
         orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
     }

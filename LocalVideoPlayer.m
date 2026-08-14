@@ -349,64 +349,58 @@ static void vcam_player_log(NSString *msg) {
 
 #pragma mark - 解码线程
 
+// 逆向逻辑: GCD dispatch_source_t 定时器, 按 nominalFrameRate 节拍读帧(leeway=0 高精度)
+// 替代原 NSThread + sleepForTimeInterval(精度差导致卡顿)
 - (void)startDecodingThread {
     if (_isDecoding) return;
     _shouldDecode = YES;
     _isDecoding = YES;
 
-    _decodeThread = [[NSThread alloc] initWithTarget:self selector:@selector(decodeLoop) object:nil];
-    _decodeThread.name = @"vcam.decoder";
-    [_decodeThread start];
-    vcam_player_log(@"[vcam] Decoding thread started");
+    // 图片模式: 不需要定时器, 仅保持缓存帧
+    if (_mediaType == VCamMediaTypeImage) {
+        vcam_player_log(@"[vcam] Decoding thread started (image mode, no timer)");
+        return;
+    }
+
+    // 视频模式: 用 GCD 定时器按帧率读帧
+    double fps = (_videoFps > 1.0) ? (double)_videoFps : 30.0;
+    double intervalSec = 1.0 / fps;
+    uint64_t intervalNs = (uint64_t)(intervalSec * 1000000000.0);
+
+    _frameTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _decodeQueue);
+    // leeway=0 高精度触发(对齐逆向 dispatch_source_set_timer(timer, NOW, interval, 0))
+    dispatch_source_set_timer(_frameTimer, dispatch_time(DISPATCH_TIME_NOW, 0), intervalNs, 0);
+    __weak typeof(self) weakSelf = self;
+    dispatch_source_set_event_handler(_frameTimer, ^{
+        LocalVideoPlayer *strongSelf = weakSelf;
+        if (!strongSelf || !strongSelf.shouldDecode) return;
+        // 队列满则跳过本帧(避免内存堆积), 消费者取帧后再读
+        if (strongSelf.frameQueue.count >= strongSelf.frameQueue.capacity) return;
+        CVPixelBufferRef buffer = [strongSelf readNextFrame];
+        if (buffer) {
+            [strongSelf.frameQueue enqueuePixelBuffer:buffer];
+            CVPixelBufferRelease(buffer);  // 队列已 retain
+            strongSelf.frameCount++;
+        }
+    });
+    dispatch_resume(_frameTimer);
+    vcam_player_log([NSString stringWithFormat:@"[vcam] Decoding timer started (fps=%.1f, interval=%lluns)", fps, (unsigned long long)intervalNs]);
 }
 
 - (void)stopDecodingThread {
     _shouldDecode = NO;
-    if (_decodeThread) {
-        [_decodeThread cancel];
-        // 等待线程退出（最多 1 秒）
-        NSDate *timeout = [NSDate dateWithTimeIntervalSinceNow:1.0];
-        while (_decodeThread.isExecuting && [timeout timeIntervalSinceNow] > 0) {
-            [NSThread sleepForTimeInterval:0.01];
-        }
-        _decodeThread = nil;
+    if (_frameTimer) {
+        dispatch_source_cancel(_frameTimer);
+        _frameTimer = nil;
     }
     _isDecoding = NO;
     vcam_player_log(@"[vcam] Decoding thread stopped");
 }
 
+// 兼容旧调用(已用 GCD 定时器替代, decodeLoop 保留给图片模式兜底, 实际不再使用)
 - (void)decodeLoop {
-    @autoreleasepool {
-        while (_shouldDecode && !_decodeThread.cancelled) {
-            @autoreleasepool {
-                if (_mediaType == VCamMediaTypeImage) {
-                    // 图片模式：不需要持续解码，只保持缓存帧
-                    [NSThread sleepForTimeInterval:0.1];
-                    continue;
-                }
-
-                // 视频模式：持续解码
-                CVPixelBufferRef buffer = [self readNextFrame];
-                if (buffer) {
-                    [_frameQueue enqueuePixelBuffer:buffer];
-                    CVPixelBufferRelease(buffer);  // 队列已 retain
-                    _frameCount++;
-                    // 按视频帧率控制解码速度, 避免加速播放(参考逆向: 按时间戳输出帧)
-                    double frameInterval = (_videoFps > 1.0) ? (1.0 / _videoFps) : (1.0 / 30.0);
-                    [NSThread sleepForTimeInterval:frameInterval];
-                } else {
-                    // 没有读到帧，短暂休眠避免忙等
-                    [NSThread sleepForTimeInterval:0.005];
-                }
-
-                // 控制队列大小，避免内存占用过高
-                if (_frameQueue.count > _frameQueue.capacity) {
-                    [NSThread sleepForTimeInterval:0.01];
-                }
-            }
-        }
-    }
-    vcam_player_log(@"[vcam] Decoding loop exited");
+    // 已由 startDecodingThread 的 GCD 定时器接管, 此处保留空实现避免外部调用崩溃
+    vcam_player_log(@"[vcam] decodeLoop called (deprecated, GCD timer in use)");
 }
 
 #pragma mark - 帧获取
