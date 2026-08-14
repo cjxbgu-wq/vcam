@@ -288,14 +288,19 @@ static void vcam_ball_log(NSString *msg) {
     int oldAngle = [VCamCore sharedInstance].gpuProcessor.rotationAngle;
     int newAngle = (oldAngle + 90) % 360;
     [VCamCore sharedInstance].gpuProcessor.rotationAngle = newAngle;
-    vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] rotation: %d -> %d (deg=%d)", oldAngle, newAngle, newAngle]);
+    // 持久化到 vc.plist: mediaserverd(真正渲染替换画面的进程)轮询读取,
+    // 只改本进程(SpringBoard)的 rotationAngle 对相机替换无效
+    [VCamNotify setPlistRotation:newAngle];
+    vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] rotation: %d -> %d (deg=%d, synced)", oldAngle, newAngle, newAngle]);
     vcam_ball_log(@"[vcam][btn] rotateRightTapped fired");
 }
 
 - (void)toggleMirrorTapped {
     BOOL oldMirrored = [VCamCore sharedInstance].gpuProcessor.mirrored;
     [VCamCore sharedInstance].gpuProcessor.mirrored = !oldMirrored;
-    vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] mirror toggled: %d -> %d", oldMirrored, !oldMirrored]);
+    // 持久化到 vc.plist 供 mediaserverd 轮询(同 rotateRightTapped)
+    [VCamNotify setPlistMirrored:!oldMirrored];
+    vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] mirror toggled: %d -> %d (synced)", oldMirrored, !oldMirrored]);
 }
 
 - (void)toggleReplacementTapped {

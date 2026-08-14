@@ -48,5 +48,11 @@ typedef void(^VCamNotifyCallback)(NSString *name);
 + (void)setPlistEnabled:(BOOL)enabled;
 + (NSString *)activePlaybackPath;
 + (void)setActivePlaybackPath:(NSString *)path;
+// 旋转/镜像状态（跨进程同步: 悬浮球在 SpringBoard 写, mediaserverd 轮询读;
+// 字段名对齐千面逆向 vc.plist 的 manualRotation）
++ (NSInteger)plistRotation;
++ (void)setPlistRotation:(NSInteger)degrees;
++ (BOOL)plistMirrored;
++ (void)setPlistMirrored:(BOOL)mirrored;
 
 @end

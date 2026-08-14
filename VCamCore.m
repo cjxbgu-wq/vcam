@@ -172,29 +172,36 @@ static void vcam_core_log(NSString *msg) {
 
     // 2. 按目标格式选源缓存（对齐千面双格式缓存）:
     //   BGRA 目标 → BGRA 缓存
-    //   420v/420f 目标 → YUV(420f) 缓存优先(标准 YUV→YUV 转换最快), 回退 BGRA
-    //   私有格式目标(|8v0/-8f0 等) → BGRA 缓存优先(实测 BGRA→私有格式 VT 成功率高)
-    CVPixelBufferRef src = NULL;
+    //   420v/420f/私有格式目标 → YUV(420f) 缓存优先 —— 私有格式(-8f0/|8v0/p420)是 YUV 变体,
+    //   BGRA→YUV 的 range/矩阵假设不匹配会过曝发白(高光根因), YUV→YUV 转换保持 range
+    CVPixelBufferRef base = NULL;
     if (origFormat == kCVPixelFormatType_32BGRA) {
-        src = bgra;
-    } else if ([self isPrivateFormat:origFormat]) {
-        src = bgra ? bgra : yuv;
+        base = bgra ? bgra : yuv;
     } else {
-        src = yuv ? yuv : bgra;
+        base = yuv ? yuv : bgra;
     }
 
-    // 3. 写入相机帧: VT transfer(Trim 保比例 crop fill)主路径。
+    // 3. 自适应旋转(对齐千面 render_disas 0xaf7c-0xafe4): 源/目标宽高比正交(一横一竖)时
+    //    CCW90 旋转(宽高互换), 预览流(竖向 buffer)与拍照/录像流(横向 buffer)各自正确方向,
+    //    否则拍照保存画面横躺(翻转根因)。rotation session 非线程安全, 在 renderLock 内用
+    //    render 专用 session 调用
+    [_renderLock lock];
+    CVPixelBufferRef src = [_gpuProcessor adaptiveRotateIfNeeded:base targetWidth:targetW targetHeight:targetH];
+    [_renderLock unlock];
+
+    // 4. 写入相机帧: VT transfer(Trim 保比例 crop fill)主路径。
     //    全格式处理无白名单(对齐千面 0xb0f8-0xb154: 私有格式 |8v0/-8f0/p420 也 transfer,
     //    这正是千面能替换视频模式预览和拍照保存的原因), 失败保留原相机帧
     BOOL ok = [self writeFrame:src toPixelBuffer:pixelBuffer];
     if (ok) {
         _frameCount++;
         if (diagThisFrame) {
-            vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d OK %zux%zu fmt=0x%x via %@",
+            vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d OK %zux%zu fmt=0x%x via %@%@",
                            vcamRenderCount, targetW, targetH, (unsigned)origFormat,
-                           (src == bgra) ? @"BGRA" : @"YUV"]);
+                           [self isPrivateFormat:origFormat] ? @"YUV" : @"SRC",
+                           (src != base) ? @" +CCW90" : @""]);
         }
-        // 缓存回退帧 + 同帧去重(对齐千面 0xb15c-0xb19c)
+        // 缓存回退帧(千面缓存旋转后的实际 transfer 源 x24, 0xb15c-0xb19c) + 同帧去重
         [_renderLock lock];
         if (_fallbackFrame) CVPixelBufferRelease(_fallbackFrame);
         _fallbackFrame = src;
@@ -207,6 +214,7 @@ static void vcam_core_log(NSString *msg) {
         vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d FAILED write fmt=0x%x, keep camera", vcamRenderCount, (unsigned)origFormat]);
     }
 
+    if (src) CVPixelBufferRelease(src);
     if (bgra) CVPixelBufferRelease(bgra);
     if (yuv) CVPixelBufferRelease(yuv);
 }
@@ -505,6 +513,23 @@ static void vcam_core_log(NSString *msg) {
             vcam_core_log([NSString stringWithFormat:@"[vcam] state change: %d -> %d, calling setEnabled", strongSelf.lastEnabledState, enabled]);
             strongSelf.lastEnabledState = enabled;
             [strongSelf setEnabled:enabled];
+        }
+
+        // 旋转/镜像跨进程同步: 悬浮球(SpringBoard)写 vc.plist, mediaserverd 轮询应用
+        // (对齐千面 vc.plist manualRotation 字段; rotationAngle!=0 时 render 不做自适应旋转)
+        static NSInteger lastSyncedRotation = -1;
+        static BOOL lastSyncedMirrored = NO;
+        NSInteger plistRotation = [VCamNotify plistRotation];
+        BOOL plistMirrored = [VCamNotify plistMirrored];
+        if (plistRotation != lastSyncedRotation) {
+            strongSelf.gpuProcessor.rotationAngle = (int)plistRotation;
+            lastSyncedRotation = plistRotation;
+            vcam_core_log([NSString stringWithFormat:@"[vcam] rotation synced: %ld", (long)plistRotation]);
+        }
+        if (plistMirrored != lastSyncedMirrored) {
+            strongSelf.gpuProcessor.mirrored = plistMirrored;
+            lastSyncedMirrored = plistMirrored;
+            vcam_core_log([NSString stringWithFormat:@"[vcam] mirror synced: %d", plistMirrored]);
         }
     }];
 }

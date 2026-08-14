@@ -238,4 +238,30 @@ static void vcam_darwin_callback(CFNotificationCenterRef center, void *observer,
     [dict writeToFile:VCamPlistPath atomically:YES];
 }
 
++ (NSInteger)plistRotation {
+    NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath];
+    NSNumber *rot = dict[@"manualRotation"];
+    return rot ? [rot integerValue] : 0;
+}
+
++ (void)setPlistRotation:(NSInteger)degrees {
+    NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithDictionary:
+        [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath] ?: @{}];
+    dict[@"manualRotation"] = @(degrees);
+    [dict writeToFile:VCamPlistPath atomically:YES];
+}
+
++ (BOOL)plistMirrored {
+    NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath];
+    NSNumber *m = dict[@"mirrored"];
+    return m ? [m boolValue] : NO;
+}
+
++ (void)setPlistMirrored:(BOOL)mirrored {
+    NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithDictionary:
+        [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath] ?: @{}];
+    dict[@"mirrored"] = @(mirrored);
+    [dict writeToFile:VCamPlistPath atomically:YES];
+}
+
 @end

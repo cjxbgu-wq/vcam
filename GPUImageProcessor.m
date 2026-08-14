@@ -47,6 +47,13 @@ static void vcam_gpu_log(NSString *msg) {
 @property (nonatomic, assign) VTPixelTransferSessionRef privateTransferSession;    // render 线程: 私有格式目标专用(base, 隔离状态)
 @property (nonatomic, assign) VTPixelTransferSessionRef prerenderTransferSession;  // 预渲染线程专用
 @property (nonatomic, assign) VTPixelRotationSessionRef pixelRotationSession;
+// render 路径专用旋转 session（非线程安全: 预渲染线程与 render 线程并发用同一 session 会崩溃）
+@property (nonatomic, assign) VTPixelRotationSessionRef renderRotationSession;
+// 自适应旋转 buffer 缓存（按 尺寸+格式 复用, 避免拍照流每帧创建 ~3MB buffer; 仅 renderLock 内访问）
+@property (nonatomic, assign) CVPixelBufferRef adaptiveRotateCache;
+@property (nonatomic, assign) size_t adaptiveRotateCacheW;
+@property (nonatomic, assign) size_t adaptiveRotateCacheH;
+@property (nonatomic, assign) OSType adaptiveRotateCacheFmt;
 
 // 私有 API 函数指针
 @property (nonatomic, assign) VTPixelRotationSessionCreateFunc createRotationSession;
@@ -121,6 +128,16 @@ static void vcam_gpu_log(NSString *msg) {
         InvalidateFunc invalidate = (InvalidateFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionInvalidate");
         if (invalidate) invalidate(_privateTransferSession);
     }
+    // 释放旋转 session 与自适应旋转缓存
+    {
+        InvalidateFunc invalidate = (InvalidateFunc)dlsym(RTLD_DEFAULT, "VTPixelRotationSessionInvalidate");
+        if (_pixelRotationSession && invalidate) invalidate(_pixelRotationSession);
+        if (_renderRotationSession && invalidate) invalidate(_renderRotationSession);
+    }
+    if (_adaptiveRotateCache) {
+        CVPixelBufferRelease(_adaptiveRotateCache);
+        _adaptiveRotateCache = NULL;
+    }
     // 释放所有缓冲池
     for (id key in _bgraBufferPoolMap) {
         CVPixelBufferPoolRef pool = (__bridge CVPixelBufferPoolRef)_bgraBufferPoolMap[key];
@@ -192,8 +209,13 @@ static void vcam_gpu_log(NSString *msg) {
     // 通过 dlsym 加载私有 API
     _createRotationSession = (VTPixelRotationSessionCreateFunc)dlsym(RTLD_DEFAULT, "VTPixelRotationSessionCreate");
     _transferRotationImage = (VTPixelRotationSessionTransferImageFunc)dlsym(RTLD_DEFAULT, "VTPixelRotationSessionTransferImage");
-    _rotationKeyInDegrees = (CFStringRef)dlsym(RTLD_DEFAULT, "kVTPixelRotationPropertyKey_RotationInDegrees");
-    _flipHorizontalKey = (CFStringRef)dlsym(RTLD_DEFAULT, "kVTPixelRotationPropertyKey_FlipHorizontalOrientation");
+
+    // 注意: kVTPixelRotationPropertyKey_* 是 CFStringRef 全局变量, dlsym 返回的是变量地址,
+    // 需解引用拿到 CFString 对象; 解引用失败回退已知字符串值(RotationInDegrees / FlipHorizontalOrientation)
+    void *rotSym = dlsym(RTLD_DEFAULT, "kVTPixelRotationPropertyKey_RotationInDegrees");
+    _rotationKeyInDegrees = rotSym ? *(CFStringRef *)rotSym : CFSTR("RotationInDegrees");
+    void *flipSym = dlsym(RTLD_DEFAULT, "kVTPixelRotationPropertyKey_FlipHorizontalOrientation");
+    _flipHorizontalKey = flipSym ? *(CFStringRef *)flipSym : CFSTR("FlipHorizontalOrientation");
 
     if (!_createRotationSession || !_transferRotationImage || !_rotationKeyInDegrees || !_flipHorizontalKey) {
         _rotationApiAvailable = NO;
@@ -203,6 +225,8 @@ static void vcam_gpu_log(NSString *msg) {
     OSStatus status = _createRotationSession(kCFAllocatorDefault, &_pixelRotationSession);
     if (status == noErr) {
         _rotationApiAvailable = YES;
+        // render 路径专用第二个 session（预渲染与 render 并发旋转同一 session 会崩溃）
+        _createRotationSession(kCFAllocatorDefault, &_renderRotationSession);
         vcam_gpu_log(@"[vcam] VTPixelRotationSession created successfully");
     } else {
         _rotationApiAvailable = NO;
@@ -504,6 +528,61 @@ static void vcam_gpu_log(NSString *msg) {
                 colorSpace:colorSpace];
     CGColorSpaceRelease(colorSpace);
     return YES;
+}
+
+// render 路径用: 千面自适应旋转(render_disas 0xaf7c-0xafe4)
+// rotationAngle==0 且源与目标宽高比正交(一横一竖)时 CCW90 旋转(千面 _kVTRotation_CCW90,
+// 宽高互换, 保持源格式) —— 预览流(竖向 buffer)与拍照/录像流(横向 buffer)方向不同,
+// 预渲染帧只按预览方向产出, 写横向 buffer 前需旋转, 否则画面横躺(拍照翻转的根因)。
+// 用 renderRotationSession(独立于预渲染 session), 调用方需持有 renderLock。
+// 旋转 buffer 按尺寸+格式缓存复用(千面 getRotateBufferWithWidth:height: 池化思想)。
+- (CVPixelBufferRef)adaptiveRotateIfNeeded:(CVPixelBufferRef)src
+                               targetWidth:(size_t)targetW
+                              targetHeight:(size_t)targetH CF_RETURNS_RETAINED {
+    if (!src) return NULL;
+    if (_rotationAngle != 0 || !_rotationApiAvailable || !_renderRotationSession) {
+        // 用户已手动旋转(预渲染已应用, 千面 rotationAngle 1/2/3 固定旋转不自适应)或 API 不可用
+        return (CVPixelBufferRef)CVPixelBufferRetain(src);
+    }
+
+    size_t srcW = CVPixelBufferGetWidth(src);
+    size_t srcH = CVPixelBufferGetHeight(src);
+    if (!srcW || !srcH || !targetW || !targetH) {
+        return (CVPixelBufferRef)CVPixelBufferRetain(src);
+    }
+
+    // 千面 0xaf90-0xafe4: srcRatio/dstRatio 方向正交(一横一竖) -> CCW90
+    double srcRatio = (double)srcW / (double)srcH;
+    double dstRatio = (double)targetW / (double)targetH;
+    BOOL orthogonal = (srcRatio > 1.0 && dstRatio < 1.0) || (srcRatio < 1.0 && dstRatio > 1.0);
+    if (!orthogonal) {
+        return (CVPixelBufferRef)CVPixelBufferRetain(src);
+    }
+
+    // CCW90: 宽高互换, 保持源格式(YUV 源旋转后仍是 YUV, 后续 YUV->私有格式转换 range 不变)
+    OSType fmt = CVPixelBufferGetPixelFormatType(src);
+    CVPixelBufferRef rotated = NULL;
+    if (_adaptiveRotateCache && _adaptiveRotateCacheW == srcH && _adaptiveRotateCacheH == srcW && _adaptiveRotateCacheFmt == fmt) {
+        rotated = CVPixelBufferRetain(_adaptiveRotateCache);  // 复用缓存(RotateImage 全覆盖写, 无需清空)
+    } else {
+        rotated = [self createBufferWithWidth:srcH height:srcW format:fmt];
+        if (!rotated) return (CVPixelBufferRef)CVPixelBufferRetain(src);
+        if (_adaptiveRotateCache) CVPixelBufferRelease(_adaptiveRotateCache);
+        _adaptiveRotateCache = CVPixelBufferRetain(rotated);
+        _adaptiveRotateCacheW = srcH;
+        _adaptiveRotateCacheH = srcW;
+        _adaptiveRotateCacheFmt = fmt;
+    }
+
+    VTSessionSetProperty(_renderRotationSession, _rotationKeyInDegrees, (__bridge CFTypeRef)@90);
+    OSStatus st = _transferRotationImage(_renderRotationSession, src, rotated);
+    if (st != noErr) {
+        vcam_gpu_log([NSString stringWithFormat:@"[vcam] adaptive CCW90 failed: %d fmt=%@ (keep unrotated)",
+                      (int)st, [self stringForFormat:fmt]]);
+        CVPixelBufferRelease(rotated);
+        return (CVPixelBufferRef)CVPixelBufferRetain(src);
+    }
+    return rotated;  // CF_RETURNS_RETAINED
 }
 
 // CoreImage 回退: CI 只渲染到 BGRA(软件渲染器对 planar YUV 支持不可靠, 渲染失败会留下未初始化 buffer → 黑屏/绿屏)
