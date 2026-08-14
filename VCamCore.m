@@ -118,8 +118,16 @@ static void vcam_core_log(NSString *msg) {
     size_t origHeight = CVPixelBufferGetHeight(pixelBuffer);
     OSType origFormat = CVPixelBufferGetPixelFormatType(pixelBuffer);
 
+    // 诊断: 每 60 帧记录 render 入口
+    static int vcamRenderCount = 0;
+    vcamRenderCount++;
+    BOOL diagThisFrame = (vcamRenderCount % 60 == 1);
+
     // 1. 格式白名单检查
-    if (![self isSupportedVideoFormat:pixelBuffer]) return;
+    if (![self isSupportedVideoFormat:pixelBuffer]) {
+        if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d SKIP whitelist fmt=0x%x", vcamRenderCount, (unsigned)origFormat]);
+        return;
+    }
 
     // 2. 格式锁定：只处理第一个遇到的格式
     if (!_targetSizeKnown) {
@@ -139,6 +147,7 @@ static void vcam_core_log(NSString *msg) {
 
     // 跳过与锁定格式+尺寸不同的帧（防止相机多流交替导致 buffer mismatch 崩溃）
     if (origWidth != _targetWidth || origHeight != _targetHeight || origFormat != _targetFormat) {
+        if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d SKIP lock mismatch %zux%zu fmt=0x%x (target %zux%zu fmt=0x%x)", vcamRenderCount, origWidth, origHeight, (unsigned)origFormat, _targetWidth, _targetHeight, (unsigned)_targetFormat]);
         return;
     }
 
@@ -148,12 +157,15 @@ static void vcam_core_log(NSString *msg) {
         // 没有可用帧，使用缓存的帧
         if (origFormat == kCVPixelFormatType_32BGRA && _liveBGRAPixelBuffer) {
             [self writeFrame:_liveBGRAPixelBuffer toPixelBuffer:pixelBuffer];
+            if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d cache BGRA", vcamRenderCount]);
             return;
         }
         if (_liveYUVPixelBuffer) {
             [self writeFrame:_liveYUVPixelBuffer toPixelBuffer:pixelBuffer];
+            if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d cache YUV", vcamRenderCount]);
             return;
         }
+        if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d NO frame no cache", vcamRenderCount]);
         return;  // 没有缓存帧，保持原始相机
     }
 
@@ -165,7 +177,7 @@ static void vcam_core_log(NSString *msg) {
     CVPixelBufferRelease(replacementFrame);
 
     if (!processedFrame) {
-        // 处理失败，使用缓存帧或保持原始相机
+        if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d processPixelBuffer FAILED", vcamRenderCount]);
         return;
     }
 
@@ -176,6 +188,7 @@ static void vcam_core_log(NSString *msg) {
     [self cacheLastRenderedFrame:processedFrame width:origWidth height:origHeight];
     CVPixelBufferRelease(processedFrame);
 
+    if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d OK wrote frame %zux%zu", vcamRenderCount, origWidth, origHeight]);
     _frameCount++;
 }
 
