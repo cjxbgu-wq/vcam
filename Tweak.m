@@ -92,15 +92,18 @@ static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBuffer
     }
     // 逆向逻辑: 只替换 mediaType=='vide' 的帧, 过滤音频/元数据(避免无效处理 + 录像流被漏掉)
     if (sampleBuffer) {
-        // CMSampleBuffer 本身无 mediaType, 但 [self mediaType] 在 BWNodeOutput 上返回当前流类型
-        // 用 CFString 'vide' (kCMMediaType_Video = 'vide') 比较未导出符号, 用 FourCC 直接比较
-        // 逆向: w8 = 0x76696465 = 'vide'; 若 [self mediaType] != 'vide' 直通原 IMP
+        // [self mediaType] 返回 CMMediaType (FourCC uint32), 'vide' = kCMMediaType_Video
         @try {
-            // [self mediaType] 返回 CMMediaType (FourCC uint32)
-            // 用 objc_msgSend 调用避免 Theos SDK 声明问题
             SEL mediaTypeSel = sel_registerName("mediaType");
             if ([self respondsToSelector:mediaTypeSel]) {
                 uint32_t mt = ((uint32_t(*)(id, SEL))objc_msgSend)(self, mediaTypeSel);
+                // 诊断: 每 60 帧记录 mediaType 实际值
+                if (vcamEmitCount % 60 == 1) {
+                    char mts[5] = {0};
+                    mts[0] = (char)(mt >> 24); mts[1] = (char)(mt >> 16);
+                    mts[2] = (char)(mt >> 8); mts[3] = (char)mt;
+                    vcam_tweak_log([NSString stringWithFormat:@"[vcam] emit#%d mediaType=0x%x (%s) cls=%@", vcamEmitCount, (unsigned)mt, mts, NSStringFromClass([self class])]);
+                }
                 if (mt != 'vide') {
                     // 非视频帧(音频/元数据), 直通原 IMP
                     if (orig_BWNodeOutput_emitSampleBuffer) {
