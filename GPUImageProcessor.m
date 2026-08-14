@@ -58,7 +58,12 @@ static void vcam_gpu_log(NSString *msg) {
 // 私有 API 函数指针
 @property (nonatomic, assign) VTPixelRotationSessionCreateFunc createRotationSession;
 @property (nonatomic, assign) VTPixelRotationSessionTransferImageFunc transferRotationImage;
-@property (nonatomic, assign) CFStringRef rotationKeyInDegrees;
+// 千面逆向确认(0xb094/0xe598): 属性是 kVTPixelRotationPropertyKey_Rotation,
+// 值是 CFString 常量 kVTRotation_CCW90/CW90/180 (不是 RotationInDegrees + 数字!)
+@property (nonatomic, assign) CFStringRef rotationPropertyKey;
+@property (nonatomic, assign) CFStringRef rotationCCW90Value;
+@property (nonatomic, assign) CFStringRef rotationCW90Value;
+@property (nonatomic, assign) CFStringRef rotation180Value;
 @property (nonatomic, assign) CFStringRef flipHorizontalKey;
 
 // CIContext（软件渲染，mediaserverd 没有 GPU 上下文）
@@ -217,16 +222,24 @@ static void vcam_gpu_log(NSString *msg) {
     _createRotationSession = (VTPixelRotationSessionCreateFunc)dlsym(base, "VTPixelRotationSessionCreate");
     _transferRotationImage = (VTPixelRotationSessionTransferImageFunc)dlsym(base, "VTPixelRotationSessionRotateImage");
 
-    // 注意: kVTPixelRotationPropertyKey_* 是 CFStringRef 全局变量, dlsym 返回的是变量地址,
-    // 需解引用拿到 CFString 对象; 解引用失败回退已知字符串值(RotationInDegrees / FlipHorizontalOrientation)
-    void *rotSym = dlsym(base, "kVTPixelRotationPropertyKey_RotationInDegrees");
-    _rotationKeyInDegrees = rotSym ? *(CFStringRef *)rotSym : CFSTR("RotationInDegrees");
+    // 注意: kVTPixelRotationPropertyKey_* / kVTRotation_* 是 CFStringRef 全局变量,
+    // dlsym 返回的是变量地址, 需解引用拿到 CFString 对象; 解引用失败回退已知字符串值。
+    // 千面逆向(0xb094/0xe598)确认: 属性 kVTPixelRotationPropertyKey_Rotation,
+    // 值为 kVTRotation_CCW90 / kVTRotation_CW90 / kVTRotation_180 CFString 常量
+    void *rotSym = dlsym(base, "kVTPixelRotationPropertyKey_Rotation");
+    _rotationPropertyKey = rotSym ? *(CFStringRef *)rotSym : CFSTR("Rotation");
+    void *ccwSym = dlsym(base, "kVTRotation_CCW90");
+    _rotationCCW90Value = ccwSym ? *(CFStringRef *)ccwSym : CFSTR("CCW90");
+    void *cwSym = dlsym(base, "kVTRotation_CW90");
+    _rotationCW90Value = cwSym ? *(CFStringRef *)cwSym : CFSTR("CW90");
+    void *r180Sym = dlsym(base, "kVTRotation_180");
+    _rotation180Value = r180Sym ? *(CFStringRef *)r180Sym : CFSTR("180");
     void *flipSym = dlsym(base, "kVTPixelRotationPropertyKey_FlipHorizontalOrientation");
     _flipHorizontalKey = flipSym ? *(CFStringRef *)flipSym : CFSTR("FlipHorizontalOrientation");
 
-    vcam_gpu_log([NSString stringWithFormat:@"[vcam] rotation api probe: handle=%d create=%d rotate=%d rotKey=%d flipKey=%d",
+    vcam_gpu_log([NSString stringWithFormat:@"[vcam] rotation api probe: handle=%d create=%d rotate=%d rotKey=%d ccw=%d cw=%d r180=%d flipKey=%d",
                   vt != NULL, _createRotationSession != NULL, _transferRotationImage != NULL,
-                  rotSym != NULL, flipSym != NULL]);
+                  rotSym != NULL, ccwSym != NULL, cwSym != NULL, r180Sym != NULL, flipSym != NULL]);
 
     if (!_createRotationSession || !_transferRotationImage) {
         _rotationApiAvailable = NO;
@@ -427,12 +440,13 @@ static void vcam_gpu_log(NSString *msg) {
     t = CGAffineTransformTranslate(t, offsetX / scale, offsetY / scale);
     CIImage *scaled = [image imageByApplyingTransform:t];
 
-    // 用 sRGB colorSpace 渲染（nil 会导致颜色不正确）
-    CGColorSpaceRef colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    // 千面用 DeviceRGB 渲染(逆向: CGColorSpaceCreateDeviceRGB + render:colorSpace:),
+    // sRGB 会导致照片流(-8f0 full-range)高光过爆
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
     [_preprocessContext render:scaled toCVPixelBuffer:output
                         bounds:CGRectMake(0, 0, (CGFloat)width, (CGFloat)height)
                     colorSpace:colorSpace];
-    CGColorSpaceRelease(colorSpace);
+    
     return output;
 }
 
@@ -447,9 +461,13 @@ static void vcam_gpu_log(NSString *msg) {
         return NULL;
     }
 
-    // 设置旋转角度
-    if (_rotationAngle != 0) {
-        VTSessionSetProperty(_pixelRotationSession, _rotationKeyInDegrees, (__bridge CFTypeRef)@(_rotationAngle));
+    // 设置旋转角度（千面 prerender rotateBuffer 用 kVTRotation_* 常量值, 90=CW90 与其一致）
+    if (_rotationAngle == 90) {
+        VTSessionSetProperty(_pixelRotationSession, _rotationPropertyKey, _rotationCW90Value);
+    } else if (_rotationAngle == 180) {
+        VTSessionSetProperty(_pixelRotationSession, _rotationPropertyKey, _rotation180Value);
+    } else if (_rotationAngle == 270) {
+        VTSessionSetProperty(_pixelRotationSession, _rotationPropertyKey, _rotationCCW90Value);
     }
     // 设置镜像
     VTSessionSetProperty(_pixelRotationSession, _flipHorizontalKey, _mirrored ? kCFBooleanTrue : kCFBooleanFalse);
@@ -534,11 +552,11 @@ static void vcam_gpu_log(NSString *msg) {
     t = CGAffineTransformTranslate(t, offsetX / scale, offsetY / scale);
     CIImage *scaled = [image imageByApplyingTransform:t];
 
-    CGColorSpaceRef colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
     [_renderContext render:scaled toCVPixelBuffer:dst
                     bounds:CGRectMake(0, 0, (CGFloat)w, (CGFloat)h)
                 colorSpace:colorSpace];
-    CGColorSpaceRelease(colorSpace);
+    
     return YES;
 }
 
@@ -586,7 +604,7 @@ static void vcam_gpu_log(NSString *msg) {
         _adaptiveRotateCacheFmt = fmt;
     }
 
-    VTSessionSetProperty(_renderRotationSession, _rotationKeyInDegrees, (__bridge CFTypeRef)@90);
+    VTSessionSetProperty(_renderRotationSession, _rotationPropertyKey, _rotationCCW90Value);
     OSStatus st = _transferRotationImage(_renderRotationSession, src, rotated);
     if (st != noErr) {
         vcam_gpu_log([NSString stringWithFormat:@"[vcam] adaptive CCW90 failed: %d fmt=%@ (keep unrotated)",
@@ -612,11 +630,11 @@ static void vcam_gpu_log(NSString *msg) {
     CVPixelBufferRef bgra = [self getOrCreateBGRABufferWithWidth:width height:height];
     if (!bgra) return NULL;
 
-    CGColorSpaceRef colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
     [_preprocessContext render:image toCVPixelBuffer:bgra
                         bounds:CGRectMake(0, 0, (CGFloat)width, (CGFloat)height)
                     colorSpace:colorSpace];
-    CGColorSpaceRelease(colorSpace);
+    
 
     // 2. 目标就是 BGRA: 直接返回
     if (format == kCVPixelFormatType_32BGRA) {

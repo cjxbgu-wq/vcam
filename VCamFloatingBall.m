@@ -141,8 +141,36 @@ static void vcam_ball_log(NSString *msg) {
 
 - (void)createOverlayWindow {
     CGRect screenBounds = [UIScreen mainScreen].bounds;
-    _overlayWindow = [[UIWindow alloc] initWithFrame:screenBounds];
-    _overlayWindow.windowLevel = UIWindowLevelAlert + 1;
+
+    // iOS 13+: UIWindow 必须关联 UIWindowScene 才会渲染（SpringBoard 也是 scene 体系,
+    // 不关联 scene 的 window 创建成功但永远不可见——悬浮球一直不显示的根因）
+    UIWindowScene *windowScene = nil;
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]] &&
+            scene.activationState == UISceneActivationStateForegroundActive) {
+            windowScene = (UIWindowScene *)scene;
+            break;
+        }
+    }
+    // 回退: 任意 UIWindowScene（启动早期可能还没 active 的）
+    if (!windowScene) {
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if ([scene isKindOfClass:[UIWindowScene class]]) {
+                windowScene = (UIWindowScene *)scene;
+                break;
+            }
+        }
+    }
+
+    if (windowScene) {
+        _overlayWindow = [[UIWindow alloc] initWithWindowScene:windowScene];
+        vcam_ball_log([NSString stringWithFormat:@"[vcam] overlay window attached to scene: %@", windowScene]);
+    } else {
+        _overlayWindow = [[UIWindow alloc] initWithFrame:screenBounds];
+        vcam_ball_log(@"[vcam] overlay window: no scene found, fallback initWithFrame");
+    }
+    _overlayWindow.frame = screenBounds;
+    _overlayWindow.windowLevel = UIWindowLevelAlert + 100;
     _overlayWindow.backgroundColor = [UIColor clearColor];
     _overlayWindow.rootViewController = [[UIViewController alloc] init];
     _overlayWindow.hidden = NO;
@@ -334,6 +362,16 @@ static void vcam_ball_log(NSString *msg) {
     // app 前台显示时，桌面悬浮窗隐藏
     // 但 app 内悬浮窗保持显示
     vcam_ball_log(@"[vcam] App became active");
+
+    // 启动早期 scene 未连接时 window 未关联 scene（不可见），此时补建
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self->_isFloating && self.overlayWindow && self.overlayWindow.windowScene == nil) {
+            vcam_ball_log(@"[vcam] window has no scene, recreating on didBecomeActive");
+            [self.overlayWindow removeFromSuperview];
+            self.overlayWindow = nil;
+            [self createOverlayWindow];
+        }
+    });
 }
 
 - (void)appDidEnterBackground:(NSNotification *)notification {
