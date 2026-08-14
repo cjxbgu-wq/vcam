@@ -62,6 +62,7 @@ static void vcam_core_log(NSString *msg) {
         _prerenderQueue = dispatch_queue_create("com.vcam.processing", DISPATCH_QUEUE_SERIAL);
         _processingQueue = dispatch_queue_create("com.vcam.processing.bg", DISPATCH_QUEUE_SERIAL);
         _processLock = [[NSLock alloc] init];
+        _renderLock = [[NSLock alloc] init];
         _isPixelBufferMode = YES;
         _preprocessEnabled = YES;
         _enabled = NO;
@@ -251,19 +252,45 @@ static void vcam_core_log(NSString *msg) {
 - (BOOL)writeFrame:(CVPixelBufferRef)src toPixelBuffer:(CVPixelBufferRef)dst {
     if (!src || !dst) return NO;
 
+    static int vcamWriteCount = 0;
+    vcamWriteCount++;
+    BOOL diag = (vcamWriteCount % 300 == 1);
+    if (diag) {
+        vcam_core_log([NSString stringWithFormat:@"[vcam] write#%d VT begin %zux%zu(0x%x) -> %zux%zu(0x%x)",
+                       vcamWriteCount,
+                       CVPixelBufferGetWidth(src), CVPixelBufferGetHeight(src), (unsigned)CVPixelBufferGetPixelFormatType(src),
+                       CVPixelBufferGetWidth(dst), CVPixelBufferGetHeight(dst), (unsigned)CVPixelBufferGetPixelFormatType(dst)]);
+    }
+
+    // 路径1+2 加锁: pixelTransferSession/renderContext 非线程安全,
+    // BWNodeOutput/照片/视频多个 hook 节点在不同线程并发调用 writeFrame 会输出黑帧/崩溃
+    [_renderLock lock];
+    BOOL done = NO;
+
     // 路径1: VTPixelTransferSession（任意尺寸+格式组合, CropSourceToCleanAperture 自动 crop fill）
-    if ([_gpuProcessor transferPixelBuffer:src toPixelBuffer:dst]) {
-        return YES;
+    @try {
+        if ([_gpuProcessor transferPixelBuffer:src toPixelBuffer:dst]) {
+            if (diag) vcam_core_log([NSString stringWithFormat:@"[vcam] write#%d VT ok", vcamWriteCount]);
+            done = YES;
+        }
+    } @catch (NSException *e) {
+        vcam_core_log([NSString stringWithFormat:@"[vcam] write#%d VT exception: %@", vcamWriteCount, e]);
     }
 
     // 路径2: CoreImage crop fill 渲染（回退）
-    @try {
-        if ([_gpuProcessor renderCropFill:src toPixelBuffer:dst]) {
-            return YES;
+    if (!done) {
+        @try {
+            if ([_gpuProcessor renderCropFill:src toPixelBuffer:dst]) {
+                if (diag) vcam_core_log([NSString stringWithFormat:@"[vcam] write#%d CI ok (fallback)", vcamWriteCount]);
+                done = YES;
+            }
+        } @catch (NSException *e) {
+            vcam_core_log([NSString stringWithFormat:@"[vcam] write#%d renderCropFill exception: %@", vcamWriteCount, e]);
         }
-    } @catch (NSException *e) {
-        vcam_core_log([NSString stringWithFormat:@"[vcam] renderCropFill exception: %@", e]);
     }
+
+    [_renderLock unlock];
+    if (done) return YES;
 
     // 路径3: 同格式同尺寸非 planar memcpy（最后手段）
     size_t srcW = CVPixelBufferGetWidth(src);
@@ -376,11 +403,13 @@ static void vcam_core_log(NSString *msg) {
             }
         }];
         [_videoPlayer startWatchingFile:path];
-        [self startPrerenderThread];
 
         [_processLock lock];
         _enabled = YES;
         [_processLock unlock];
+
+        // 必须在 _enabled=YES 之后启动（否则预渲染 while(enabled) 读到 NO 立即退出, 之后永远不替换）
+        [self startPrerenderThread];
         vcam_core_log(@"[vcam] Live state changed to: enabled");
     } else {
         // enable→disable: 停止解码

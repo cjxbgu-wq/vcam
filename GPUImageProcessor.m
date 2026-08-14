@@ -459,6 +459,8 @@ static void vcam_gpu_log(NSString *msg) {
     return YES;
 }
 
+// CoreImage 回退: CI 只渲染到 BGRA(软件渲染器对 planar YUV 支持不可靠, 渲染失败会留下未初始化 buffer → 黑屏/绿屏)
+// 目标是 YUV 时再用 VT transfer 转换, VT 失败返回 NULL(绝不返回未初始化的 YUV buffer)
 - (CVPixelBufferRef)convertWithCoreImage:(CVPixelBufferRef)input
                                 toFormat:(OSType)format
                                   width:(size_t)width
@@ -468,17 +470,38 @@ static void vcam_gpu_log(NSString *msg) {
     CIImage *image = [CIImage imageWithCVPixelBuffer:input];
     if (!image) return NULL;
 
-    // 创建目标缓冲区（不带 IOSurface 属性）
-    CVPixelBufferRef output = NULL;
-    OSStatus status = CVPixelBufferCreate(kCFAllocatorDefault, width, height, format, NULL, &output);
-    if (status != noErr) {
-        vcam_gpu_log([NSString stringWithFormat:@"[vcam] Failed to create pixel buffer: %d, size: %zux%zu, format: %@",
-                      (int)status, width, height, [self stringForFormat:format]]);
-        return NULL;
+    // 1. CI 渲染到 BGRA（bounds + sRGB, 软件渲染器对 BGRA 支持可靠）
+    CVPixelBufferRef bgra = [self getOrCreateBGRABufferWithWidth:width height:height];
+    if (!bgra) return NULL;
+
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    [_preprocessContext render:image toCVPixelBuffer:bgra
+                        bounds:CGRectMake(0, 0, (CGFloat)width, (CGFloat)height)
+                    colorSpace:colorSpace];
+    CGColorSpaceRelease(colorSpace);
+
+    // 2. 目标就是 BGRA: 直接返回
+    if (format == kCVPixelFormatType_32BGRA) {
+        return bgra;
     }
 
-    // 渲染到目标缓冲区
-    [_preprocessContext render:image toCVPixelBuffer:output];
+    // 3. BGRA -> YUV 用 VT 转换（预渲染专用 session）; 失败返回 NULL
+    CVPixelBufferRef output = [self createBufferWithWidth:width height:height format:format];
+    if (!output) {
+        CVPixelBufferRelease(bgra);
+        return NULL;
+    }
+    if (!_prerenderTransferSession) {
+        [self setupPrerenderTransferSession];
+    }
+    if (!_prerenderTransferSession ||
+        VTPixelTransferSessionTransferImage(_prerenderTransferSession, bgra, output) != noErr) {
+        CVPixelBufferRelease(output);
+        CVPixelBufferRelease(bgra);
+        vcam_gpu_log(@"[vcam] convertWithCoreImage: VT BGRA->YUV failed, return NULL (no uninitialized buffer)");
+        return NULL;
+    }
+    CVPixelBufferRelease(bgra);
     return output;
 }
 
