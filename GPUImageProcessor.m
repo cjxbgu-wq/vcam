@@ -78,10 +78,10 @@ static void vcam_gpu_log(NSString *msg) {
 // 旋转若每帧 CVPixelBufferCreate ~3MB(1080p 420f) = 30fps 下 90MB/s 分配释放,
 // malloc 压力 + 内存碎片 → 卡顿/不稳。live 缓存 + render fallback + in-flight
 // transfer 最多同时持有 2 帧旧输出, 3 槽轮转保证写入槽不被任何读者持有
-{
-    CVPixelBufferRef _prerenderRotatePool[3];
-    int _prerenderRotateSlot;
-}
+@property (nonatomic, assign) CVPixelBufferRef prerenderRotatePool0;
+@property (nonatomic, assign) CVPixelBufferRef prerenderRotatePool1;
+@property (nonatomic, assign) CVPixelBufferRef prerenderRotatePool2;
+@property (nonatomic, assign) int prerenderRotateSlot;
 
 // CIContext（软件渲染，mediaserverd 没有 GPU 上下文）
 // 两个独立 CIContext: 预渲染线程用 preprocessContext, render 线程回退用 renderContext（CIContext 非线程安全）
@@ -164,10 +164,9 @@ static void vcam_gpu_log(NSString *msg) {
     }
     // 释放预渲染旋转 3 槽池
     for (int i = 0; i < 3; i++) {
-        if (_prerenderRotatePool[i]) {
-            CVPixelBufferRelease(_prerenderRotatePool[i]);
-            _prerenderRotatePool[i] = NULL;
-        }
+        CVPixelBufferRef b = [self prerenderRotateBufferAtSlot:i];
+        if (b) CVPixelBufferRelease(b);
+        [self setPrerenderRotateBuffer:NULL atSlot:i];
     }
     // 释放所有缓冲池
     for (id key in _bgraBufferPoolMap) {
@@ -511,6 +510,19 @@ static void vcam_gpu_log(NSString *msg) {
     return dst;
 }
 
+// 3 槽存取 helper(仅预渲染线程 + dealloc 调用)
+- (CVPixelBufferRef)prerenderRotateBufferAtSlot:(int)slot {
+    if (slot == 0) return _prerenderRotatePool0;
+    if (slot == 1) return _prerenderRotatePool1;
+    return _prerenderRotatePool2;
+}
+
+- (void)setPrerenderRotateBuffer:(CVPixelBufferRef)buf atSlot:(int)slot {
+    if (slot == 0) _prerenderRotatePool0 = buf;
+    else if (slot == 1) _prerenderRotatePool1 = buf;
+    else _prerenderRotatePool2 = buf;
+}
+
 // 预渲染用: 需要旋转/镜像时做变换(保持源格式), 否则原帧 retain 返回
 // 总旋转 = 视频自带(sourceRotation, preferredTransform 补偿) + 用户手动(rotationAngle)
 // 3 槽轮转 buffer 池化(不再每帧 CVPixelBufferCreate ~3MB)
@@ -534,17 +546,17 @@ static void vcam_gpu_log(NSString *msg) {
     // 槽位轮转: 尺寸/格式变化时重建该槽
     int slot = _prerenderRotateSlot;
     _prerenderRotateSlot = (slot + 1) % 3;
-    CVPixelBufferRef dst = _prerenderRotatePool[slot];
+    CVPixelBufferRef dst = [self prerenderRotateBufferAtSlot:slot];
     if (!dst || CVPixelBufferGetWidth(dst) != rotW || CVPixelBufferGetHeight(dst) != rotH ||
         CVPixelBufferGetPixelFormatType(dst) != fmt) {
         if (dst) CVPixelBufferRelease(dst);
         dst = NULL;
         OSStatus cst = CVPixelBufferCreate(kCFAllocatorDefault, rotW, rotH, fmt, NULL, &dst);
         if (cst != noErr || !dst) {
-            _prerenderRotatePool[slot] = NULL;
+            [self setPrerenderRotateBuffer:NULL atSlot:slot];
             return (CVPixelBufferRef)CVPixelBufferRetain(input);  // 失败回退原帧
         }
-        _prerenderRotatePool[slot] = CVPixelBufferRetain(dst);  // 池持有 1 引用
+        [self setPrerenderRotateBuffer:CVPixelBufferRetain(dst) atSlot:slot];  // 池持有 1 引用
     }
 
     // 旋转角度显式覆盖(含 0°): 只镜像场景(total=0)若不设置, session 会残留
