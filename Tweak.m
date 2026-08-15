@@ -151,10 +151,10 @@ static void vcamDumpStillArrival(NSString *tag, int idx, CMSampleBufferRef sb, C
     NSString *sbA = @"{}", *pbA = @"{}";
     if (sb) {
         CFDictionaryRef d1 = CMCopyDictionaryOfAttachments(NULL, sb, kCMAttachmentMode_ShouldPropagate);
-        if (d1) { sbA = vcamTrunc(CFBridgingRelease(d1).description, 700); }
+        if (d1) { sbA = vcamTrunc([(NSDictionary *)CFBridgingRelease(d1) description], 700); }
     }
     CFDictionaryRef d2 = CMCopyDictionaryOfAttachments(NULL, pb, kCMAttachmentMode_ShouldPropagate);
-    if (d2) { pbA = vcamTrunc(CFBridgingRelease(d2).description, 700); }
+    if (d2) { pbA = vcamTrunc([(NSDictionary *)CFBridgingRelease(d2) description], 700); }
     vcam_tweak_log([NSString stringWithFormat:
         @"[vcam][still] %@#%d fmt=0x%x %zux%zu Y/G=%@ metaFix=%d sbAtts=%@ pbAtts=%@",
         tag, idx, (unsigned)fmt, CVPixelBufferGetWidth(pb), CVPixelBufferGetHeight(pb),
