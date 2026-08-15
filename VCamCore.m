@@ -81,6 +81,9 @@ static void vcam_core_log(NSString *msg) {
     self = [super init];
     if (self) {
         _prerenderQueue = dispatch_queue_create("com.vcam.processing", DISPATCH_QUEUE_SERIAL);
+        // 预渲染绑定 Utility 优先级: 让位给 render 线程(相机回调), 预览流畅度优先
+        dispatch_set_target_queue(_prerenderQueue,
+                                  dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
         _processingQueue = dispatch_queue_create("com.vcam.processing.bg", DISPATCH_QUEUE_SERIAL);
         _processLock = [[NSLock alloc] init];
         _renderLock = [[NSLock alloc] init];
@@ -180,11 +183,12 @@ static void vcam_core_log(NSString *msg) {
     // 注2: 预渲染不再预产 BGRA(懒加载, 产能优化), BGRA 回退时现场转换。
 
     if (!yuv) {
-        // 无帧回退(对齐千面 0xb018-0xb05c): 用上一帧缓存(目标尺寸匹配)填充,
-        // 视频解码间隙不闪回相机画面
+        // 无帧回退(对齐千面 0xb018-0xb05c): 用上一帧缓存填充, 视频解码间隙不闪回相机画面。
+        // 不再要求尺寸匹配 —— VT transfer 本身支持任意尺寸 crop fill,
+        // 尺寸不匹配时跳过会导致间隙闪现真实相机画面(不稳定感)
         if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d NO frame, fallback", vcamRenderCount]);
         [_renderLock lock];
-        if (_fallbackFrame && _fallbackWidth == targetW && _fallbackHeight == targetH) {
+        if (_fallbackFrame) {
             [_gpuProcessor transferPixelBuffer:_fallbackFrame toPixelBuffer:pixelBuffer];
         }
         [_renderLock unlock];
@@ -210,7 +214,7 @@ static void vcam_core_log(NSString *msg) {
     //    全格式处理无白名单(对齐千面 0xb0f8-0xb154: 私有格式 |8v0/-8f0/p420 也 transfer,
     //    这正是千面能替换视频模式预览和拍照保存的原因), 失败保留原相机帧
     BOOL usedFallbackSource = NO;
-    BOOL ok = [self writeFrame:src toPixelBuffer:pixelBuffer];
+    BOOL ok = [self writeFrame:src toPixelBuffer:pixelBuffer token:gen];
     if (!ok && base == yuv) {
         // YUV 源失败(该 420f→目标组合 VT 不支持): 懒转 BGRA 回退(预渲染已不预产 BGRA,
         // 罕见路径现场转换一次, 正常帧不付这个代价)
@@ -377,7 +381,10 @@ static void vcam_core_log(NSString *msg) {
 
 // 对齐逆向: VT transfer(Trim 保比例 crop fill 缩放+格式转换) 主路径
 // 失败回退 CoreImage crop fill(仅标准格式), 再失败保留原相机帧(绝不输出未初始化 buffer 防绿屏)
-- (BOOL)writeFrame:(CVPixelBufferRef)src toPixelBuffer:(CVPixelBufferRef)dst {
+// token: 该 src 帧的代数(私有格式两步法 staging 复用判断用)。传 0 = 永不复用(安全)。
+// 在 renderLock 内设置到 GPU —— 多 hook 线程并发 render 时各自携带自己的 token,
+// 避免 lock 外全局赋值被其他线程覆盖导致 staging 误用别帧内容
+- (BOOL)writeFrame:(CVPixelBufferRef)src toPixelBuffer:(CVPixelBufferRef)dst token:(uint64_t)token {
     if (!src || !dst) return NO;
 
     static int vcamWriteCount = 0;
@@ -393,6 +400,7 @@ static void vcam_core_log(NSString *msg) {
     // 路径1+2 加锁: pixelTransferSession/renderContext 非线程安全,
     // BWNodeOutput/照片/视频多个 hook 节点在不同线程并发调用 writeFrame 会输出黑帧/崩溃
     [_renderLock lock];
+    _gpuProcessor.frameToken = token;  // lock 内传递帧代数(并发安全)
     BOOL done = NO;
 
     // 路径1: VTPixelTransferSession（任意尺寸+格式组合, CropSourceToCleanAperture 自动 crop fill）
@@ -491,9 +499,10 @@ static void vcam_core_log(NSString *msg) {
                 }
 
                 // 重复源跳过: 无新帧入队(frameCount 未变, 如解码间隙/暂停回退当前帧)且
-                // 旋转/镜像未变时, 上一拍已产出相同内容 → 跳过旋转+VT 转换(省 ~5-10ms/拍 CPU)
+                // 总旋转(视频自带+用户手动)/镜像未变时, 下一拍已产出相同内容 → 跳过旋转+VT 转换
                 // (用解码器单调递增的 frameCount 判断, 不用指针: 解码器会回收复用 buffer 指针)
-                int curRot = strongSelf.gpuProcessor.rotationAngle;
+                strongSelf.gpuProcessor.sourceRotation = strongSelf.videoPlayer.preferredRotation;
+                int curRot = (strongSelf.gpuProcessor.sourceRotation + strongSelf.gpuProcessor.rotationAngle) % 360;
                 BOOL curMirror = strongSelf.gpuProcessor.mirrored;
                 uint64_t curCount = strongSelf.videoPlayer.frameCount;
                 if (curCount == strongSelf->_lastPrerenderSrcGen &&
@@ -568,16 +577,23 @@ static void vcam_core_log(NSString *msg) {
         }
         vcam_core_log([NSString stringWithFormat:@"[vcam] readActivePlaybackPath -> %@", path]);
 
+        // 异步加载: loadVideoFile 含同步轨道解析 + 预解码 5 帧(50-150ms+),
+        // 在 0.15s 节拍的轮询线程上同步执行会积压队列 → XPC watchdog 超时 →
+        // mediaserverd 被杀(相机黑屏/闪退)。串行 processingQueue 天然合并连点请求
         __weak typeof(self) weakSelf = self;
-        [_videoPlayer loadVideoAtPath:path completion:^(BOOL success, NSError *error) {
-            if (success) {
-                vcam_core_log(@"[vcam] Live state set to: enabled");
-                [[VCamNotify sharedInstance] postNotification:VCamNotifyLiveChanged];
-            } else {
-                vcam_core_log([NSString stringWithFormat:@"[vcam] Failed to load video: %@", error]);
-            }
-        }];
-        [_videoPlayer startWatchingFile:path];
+        dispatch_async(_processingQueue, ^{
+            VCamCore *strongSelf = weakSelf;
+            if (!strongSelf) return;
+            [strongSelf->_videoPlayer loadVideoAtPath:path completion:^(BOOL success, NSError *error) {
+                if (success) {
+                    vcam_core_log(@"[vcam] Video loaded OK (async)");
+                    [[VCamNotify sharedInstance] postNotification:VCamNotifyLiveChanged];
+                } else {
+                    vcam_core_log([NSString stringWithFormat:@"[vcam] Failed to load video: %@", error]);
+                }
+            }];
+            [strongSelf->_videoPlayer startWatchingFile:path];
+        });
 
         [_processLock lock];
         _enabled = YES;
@@ -609,9 +625,9 @@ static void vcam_core_log(NSString *msg) {
     vcam_core_log(@"[vcam] State polling timer started");
 
     __weak typeof(self) weakSelf = self;
-    // 0.3s 轮询: 悬浮球按钮(转/镜/播/切源)生效延迟从最长 1s 降到 0.3s 内,
-    // 读取在后台 notify 队列, 不占主线程
-    [[VCamNotify sharedInstance] startPollingWithInterval:0.3 callback:^(BOOL enabled) {
+    // 0.15s 轮询: 悬浮球按钮(转/镜/播/切源)生效延迟降到最长 0.15s(平均 75ms),
+    // 单次 plist 读取 ~0.1ms 开销可忽略, 读取在后台 notify 队列不占主线程
+    [[VCamNotify sharedInstance] startPollingWithInterval:0.15 callback:^(BOOL enabled) {
         VCamCore *strongSelf = weakSelf;
         if (!strongSelf) return;
         static int vcamCorePollCount = 0;
@@ -645,7 +661,7 @@ static void vcam_core_log(NSString *msg) {
         }
 
         // 视频源切换(悬浮球 1/2/3 键): activePlaybackPath 变化 → 自动重载新视频
-        // (无需 toggle enabled, 轮询 0.3s 内生效; 路径写入由悬浮球完成)
+        // (无需 toggle enabled, 轮询 0.15s 内生效; 路径写入由悬浮球完成)
         static NSString *lastSyncedPath = nil;
         static BOOL pathSyncInit = NO;
         NSString *activePath = pl[@"activePlaybackPath"];
@@ -653,8 +669,23 @@ static void vcam_core_log(NSString *msg) {
             if (pathSyncInit && strongSelf.enabled) {
                 vcam_core_log([NSString stringWithFormat:
                     @"[vcam] activePlaybackPath changed: %@ -> %@, reloading", lastSyncedPath, activePath]);
-                [strongSelf.videoPlayer loadVideoAtPath:activePath completion:nil];
-                [strongSelf.videoPlayer startWatchingFile:activePath];
+                // 切视频重置手动旋转/镜像: 残留的手动角度会与新视频自带的 preferredRotation
+                // 叠加, 产生意外的 180° 等翻转(换视频后画面倒立的根因)。
+                // 新视频按其自身元数据从干净起点显示
+                strongSelf.gpuProcessor.rotationAngle = 0;
+                strongSelf.gpuProcessor.mirrored = NO;
+                [VCamNotify setPlistRotation:0];
+                [VCamNotify setPlistMirrored:NO];
+                lastSyncedRotation = 0;
+                lastSyncedMirrored = NO;
+                // 异步重载(同步加载阻塞轮询线程 → watchdog 崩溃)
+                __weak typeof(strongSelf) wSelf = strongSelf;
+                dispatch_async(strongSelf.processingQueue, ^{
+                    VCamCore *sSelf = wSelf;
+                    if (!sSelf) return;
+                    [sSelf.videoPlayer loadVideoAtPath:activePath completion:nil];
+                    [sSelf.videoPlayer startWatchingFile:activePath];
+                });
             }
             lastSyncedPath = [activePath copy];
             pathSyncInit = YES;
@@ -675,7 +706,14 @@ static void vcam_core_log(NSString *msg) {
         if (restartToken != lastRestartToken) {
             if (lastRestartToken >= 0 && strongSelf.enabled && strongSelf.videoPlayer.currentVideoPath.length > 0) {
                 vcam_core_log(@"[vcam] restart token bumped, replay from beginning");
-                [strongSelf.videoPlayer loadVideoAtPath:strongSelf.videoPlayer.currentVideoPath completion:nil];
+                // 异步重载(同步加载阻塞轮询线程 → watchdog 崩溃)
+                NSString *replayPath = [strongSelf.videoPlayer.currentVideoPath copy];
+                __weak typeof(strongSelf) wSelf = strongSelf;
+                dispatch_async(strongSelf.processingQueue, ^{
+                    VCamCore *sSelf = wSelf;
+                    if (!sSelf) return;
+                    [sSelf.videoPlayer loadVideoAtPath:replayPath completion:nil];
+                });
             }
             lastRestartToken = restartToken;
         }

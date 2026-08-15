@@ -535,6 +535,7 @@ static void vcam_ball_log(NSString *msg) {
     }
     // 路径变化 → mediaserverd 轮询自动重载; 若替换未开则同时开启
     [VCamNotify setActivePlaybackPath:path];
+    [self resetOrientationState];  // 换源重置旋转/镜像(防残留角度与新视频元数据叠加翻转)
     if (![VCamNotify isPlistEnabled]) {
         [VCamNotify setPlistEnabled:YES];
         [[VCamCore sharedInstance] setEnabled:YES];
@@ -544,21 +545,28 @@ static void vcam_ball_log(NSString *msg) {
 }
 
 // 转: 顺时针旋转 90°
+// 从 plist 读当前角度(单一事实源): SB 进程内存的 gpuProcessor 状态与
+// mediaserverd(真正渲染的进程)可能不同步, 基于 SB 内存累加会导致角度跳变
 - (void)rotateRightTapped {
-    int oldAngle = [VCamCore sharedInstance].gpuProcessor.rotationAngle;
+    int oldAngle = (int)[VCamNotify plistRotation];
     int newAngle = (oldAngle + 90) % 360;
-    [VCamCore sharedInstance].gpuProcessor.rotationAngle = newAngle;
-    // 持久化到 vc.plist: mediaserverd(真正渲染替换画面的进程)轮询读取
     [VCamNotify setPlistRotation:newAngle];
     vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] rotation: %d -> %d (synced)", oldAngle, newAngle]);
 }
 
-// 镜: 镜像翻转
+// 镜: 镜像翻转(同样以 plist 为单一事实源)
 - (void)mirrorTapped {
-    BOOL oldMirrored = [VCamCore sharedInstance].gpuProcessor.mirrored;
-    [VCamCore sharedInstance].gpuProcessor.mirrored = !oldMirrored;
-    [VCamNotify setPlistMirrored:!oldMirrored];
-    vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] mirror toggled: %d -> %d (synced)", oldMirrored, !oldMirrored]);
+    BOOL newMirrored = ![VCamNotify plistMirrored];
+    [VCamNotify setPlistMirrored:newMirrored];
+    vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] mirror toggled -> %d (synced)", newMirrored]);
+}
+
+// 切视频时重置手动旋转/镜像: 残留的手动角度会与新视频自带的 preferredRotation
+// 叠加, 产生意外的 180° 等翻转(换视频后画面倒立的根因)。新视频从元数据干净起点显示
+- (void)resetOrientationState {
+    [VCamNotify setPlistRotation:0];
+    [VCamNotify setPlistMirrored:NO];
+    vcam_ball_log(@"[vcam][btn] orientation state reset (rotation=0, mirror=off)");
 }
 
 #pragma mark - 视频选择(PHPicker 相册选择器)
@@ -626,6 +634,7 @@ static void vcam_ball_log(NSString *msg) {
         if (ok && slot == 0) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 [VCamNotify setActivePlaybackPath:dest];
+                [strongSelf resetOrientationState];  // 换源重置旋转/镜像(防残留角度叠加翻转)
                 if (![VCamNotify isPlistEnabled]) {
                     [VCamNotify setPlistEnabled:YES];
                     [[VCamCore sharedInstance] setEnabled:YES];

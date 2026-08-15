@@ -83,6 +83,9 @@ typedef NS_ENUM(NSInteger, VCamMediaType) {
 @property (nonatomic, assign) size_t videoWidth;
 @property (nonatomic, assign) size_t videoHeight;
 @property (nonatomic, assign) VCamMediaType mediaType;
+// 视频自带旋转(0/90/180/270, 来自 preferredTransform): AVAssetReader 解码帧
+// 不应用它, 需在预渲染时补偿, 否则换视频(如竖拍视频)后画面翻转
+@property (nonatomic, assign) int preferredRotation;
 
 // 图片缓存（图片模式时重复使用）
 @property (nonatomic, assign) CVPixelBufferRef cachedImageBuffer;

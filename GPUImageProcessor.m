@@ -74,6 +74,15 @@ static void vcam_gpu_log(NSString *msg) {
 @property (nonatomic, assign) CFStringRef rotation180Value;
 @property (nonatomic, assign) CFStringRef flipHorizontalKey;
 
+// 预渲染旋转输出 3 槽轮转 buffer(仅预渲染线程访问):
+// 旋转若每帧 CVPixelBufferCreate ~3MB(1080p 420f) = 30fps 下 90MB/s 分配释放,
+// malloc 压力 + 内存碎片 → 卡顿/不稳。live 缓存 + render fallback + in-flight
+// transfer 最多同时持有 2 帧旧输出, 3 槽轮转保证写入槽不被任何读者持有
+{
+    CVPixelBufferRef _prerenderRotatePool[3];
+    int _prerenderRotateSlot;
+}
+
 // CIContext（软件渲染，mediaserverd 没有 GPU 上下文）
 // 两个独立 CIContext: 预渲染线程用 preprocessContext, render 线程回退用 renderContext（CIContext 非线程安全）
 @property (nonatomic, strong) CIContext *preprocessContext;
@@ -152,6 +161,13 @@ static void vcam_gpu_log(NSString *msg) {
     if (_adaptiveRotateCache) {
         CVPixelBufferRelease(_adaptiveRotateCache);
         _adaptiveRotateCache = NULL;
+    }
+    // 释放预渲染旋转 3 槽池
+    for (int i = 0; i < 3; i++) {
+        if (_prerenderRotatePool[i]) {
+            CVPixelBufferRelease(_prerenderRotatePool[i]);
+            _prerenderRotatePool[i] = NULL;
+        }
     }
     // 释放所有缓冲池
     for (id key in _bgraBufferPoolMap) {
@@ -356,17 +372,20 @@ static void vcam_gpu_log(NSString *msg) {
         size_t inW = CVPixelBufferGetWidth(input);
         size_t inH = CVPixelBufferGetHeight(input);
 
+        int total = (_sourceRotation + _rotationAngle) % 360;
+        if (total < 0) total += 360;
+
         // 旋转后的尺寸
         size_t rotW = inW, rotH = inH;
-        if (_rotationAngle == 90 || _rotationAngle == 270) {
+        if (total == 90 || total == 270) {
             rotW = inH;
             rotH = inW;
         }
 
         // 1. 旋转/镜像（如果需要）→ BGRA
         CVPixelBufferRef processedBuffer = NULL;
-        if ((_rotationAngle != 0 || _mirrored) && _rotationApiAvailable && _pixelRotationSession) {
-            processedBuffer = [self rotateAndMirror:input width:rotW height:rotH];
+        if ((total != 0 || _mirrored) && _rotationApiAvailable && _pixelRotationSession) {
+            processedBuffer = [self rotateAndMirror:input width:rotW height:rotH angle:total];
         }
         // 如果旋转失败或不需要旋转，直接用输入
         if (!processedBuffer) {
@@ -454,7 +473,7 @@ static void vcam_gpu_log(NSString *msg) {
     return output;
 }
 
-- (CVPixelBufferRef)rotateAndMirror:(CVPixelBufferRef)input width:(size_t)width height:(size_t)height CF_RETURNS_RETAINED {
+- (CVPixelBufferRef)rotateAndMirror:(CVPixelBufferRef)input width:(size_t)width height:(size_t)height angle:(int)angle CF_RETURNS_RETAINED {
     if (!input || !_pixelRotationSession) return NULL;
 
     // 目标缓冲保持源格式（对齐千面 rotateBuffer: 0xe514-0xe578:
@@ -469,12 +488,15 @@ static void vcam_gpu_log(NSString *msg) {
     }
 
     // 设置旋转角度（千面 prerender rotateBuffer 用 kVTRotation_* 常量值, 90=CW90 与其一致）
-    if (_rotationAngle == 90) {
+    // angle==0 也显式设置: 不设置会残留上一次的角度, 只镜像场景会多转 90/270
+    if (angle == 90) {
         VTSessionSetProperty(_pixelRotationSession, _rotationPropertyKey, _rotationCW90Value);
-    } else if (_rotationAngle == 180) {
+    } else if (angle == 180) {
         VTSessionSetProperty(_pixelRotationSession, _rotationPropertyKey, _rotation180Value);
-    } else if (_rotationAngle == 270) {
+    } else if (angle == 270) {
         VTSessionSetProperty(_pixelRotationSession, _rotationPropertyKey, _rotationCCW90Value);
+    } else {
+        VTSessionSetProperty(_pixelRotationSession, _rotationPropertyKey, kCFBooleanFalse);  // 显式归零防残留
     }
     // 设置镜像
     VTSessionSetProperty(_pixelRotationSession, _flipHorizontalKey, _mirrored ? kCFBooleanTrue : kCFBooleanFalse);
@@ -489,26 +511,58 @@ static void vcam_gpu_log(NSString *msg) {
     return dst;
 }
 
-// 预渲染用: 需要旋转/镜像时做变换(输出 BGRA), 否则原帧 retain 返回
+// 预渲染用: 需要旋转/镜像时做变换(保持源格式), 否则原帧 retain 返回
+// 总旋转 = 视频自带(sourceRotation, preferredTransform 补偿) + 用户手动(rotationAngle)
+// 3 槽轮转 buffer 池化(不再每帧 CVPixelBufferCreate ~3MB)
 - (CVPixelBufferRef)rotateAndMirrorIfNeeded:(CVPixelBufferRef)input CF_RETURNS_RETAINED {
     if (!input) return NULL;
-    if (_rotationAngle == 0 && !_mirrored) {
+    int total = (_sourceRotation + _rotationAngle) % 360;
+    if (total < 0) total += 360;
+    if (total == 0 && !_mirrored) {
         return (CVPixelBufferRef)CVPixelBufferRetain(input);
     }
-    if (!_rotationApiAvailable || !_pixelRotationSession) {
+    if (!_rotationApiAvailable || !_pixelRotationSession || !_transferRotationImage) {
         // 旋转 API 不可用, 回退原帧（不旋转）
         return (CVPixelBufferRef)CVPixelBufferRetain(input);
     }
     size_t inW = CVPixelBufferGetWidth(input);
     size_t inH = CVPixelBufferGetHeight(input);
-    size_t rotW = (_rotationAngle == 90 || _rotationAngle == 270) ? inH : inW;
-    size_t rotH = (_rotationAngle == 90 || _rotationAngle == 270) ? inW : inH;
-    CVPixelBufferRef r = [self rotateAndMirror:input width:rotW height:rotH];
-    if (!r) {
-        // 旋转失败, 回退原帧
+    size_t rotW = (total == 90 || total == 270) ? inH : inW;
+    size_t rotH = (total == 90 || total == 270) ? inW : inH;
+    OSType fmt = CVPixelBufferGetPixelFormatType(input);
+
+    // 槽位轮转: 尺寸/格式变化时重建该槽
+    int slot = _prerenderRotateSlot;
+    _prerenderRotateSlot = (slot + 1) % 3;
+    CVPixelBufferRef dst = _prerenderRotatePool[slot];
+    if (!dst || CVPixelBufferGetWidth(dst) != rotW || CVPixelBufferGetHeight(dst) != rotH ||
+        CVPixelBufferGetPixelFormatType(dst) != fmt) {
+        if (dst) CVPixelBufferRelease(dst);
+        dst = NULL;
+        OSStatus cst = CVPixelBufferCreate(kCFAllocatorDefault, rotW, rotH, fmt, NULL, &dst);
+        if (cst != noErr || !dst) {
+            _prerenderRotatePool[slot] = NULL;
+            return (CVPixelBufferRef)CVPixelBufferRetain(input);  // 失败回退原帧
+        }
+        _prerenderRotatePool[slot] = CVPixelBufferRetain(dst);  // 池持有 1 引用
+    }
+
+    // 旋转角度显式覆盖(含 0°): 只镜像场景(total=0)若不设置, session 会残留
+    // 上一次的角度 → 多次点击转/镜后画面多转 90/270(方向错乱根因之一)
+    CFTypeRef rotValue;
+    if (total == 90)       rotValue = _rotationCW90Value;
+    else if (total == 270) rotValue = _rotationCCW90Value;
+    else if (total == 180) rotValue = _rotation180Value;
+    else                   rotValue = kCFBooleanFalse;  // 显式归零防残留
+    VTSessionSetProperty(_pixelRotationSession, _rotationPropertyKey, rotValue);
+    VTSessionSetProperty(_pixelRotationSession, _flipHorizontalKey, _mirrored ? kCFBooleanTrue : kCFBooleanFalse);
+
+    OSStatus st = _transferRotationImage(_pixelRotationSession, input, dst);
+    if (st != noErr) {
+        vcam_gpu_log([NSString stringWithFormat:@"[vcam] prerender rotate failed: %d (keep unrotated)", (int)st]);
         return (CVPixelBufferRef)CVPixelBufferRetain(input);
     }
-    return r;
+    return CVPixelBufferRetain(dst);  // 返回额外引用, 池仍持有自己的
 }
 
 // 预渲染用: 同尺寸格式转换(如 BGRA -> 420f), VT 主路径 + CoreImage 回退

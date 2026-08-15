@@ -170,8 +170,21 @@ static void vcam_player_log(NSString *msg) {
     _videoFps = _videoTrack.nominalFrameRate;
     _videoDuration = CMTimeGetSeconds(_urlAsset.duration);
 
-    vcam_player_log([NSString stringWithFormat:@"[vcam] Video loaded: %@ (%.0fx%.0f @ %.1ffps, %.1fs)",
-                     path, (double)_videoWidth, (double)_videoHeight, _videoFps, _videoDuration]);
+    // 视频自带旋转(preferredTransform): AVAssetReader 解码帧不应用它,
+    // 记录下来由预渲染补偿(否则换视频后画面 180°/90° 翻转)
+    CGAffineTransform pt = _videoTrack.preferredTransform;
+    if (pt.a == 0 && pt.b == 1 && pt.c == -1 && pt.d == 0) {
+        _preferredRotation = 90;
+    } else if (pt.a == -1 && pt.b == 0 && pt.c == 0 && pt.d == -1) {
+        _preferredRotation = 180;
+    } else if (pt.a == 0 && pt.b == -1 && pt.c == 1 && pt.d == 0) {
+        _preferredRotation = 270;
+    } else {
+        _preferredRotation = 0;
+    }
+
+    vcam_player_log([NSString stringWithFormat:@"[vcam] Video loaded: %@ (%.0fx%.0f @ %.1ffps, %.1fs, preferredRot=%d)",
+                     path, (double)_videoWidth, (double)_videoHeight, _videoFps, _videoDuration, _preferredRotation]);
 
     // 创建 AVAssetReader
     NSError *readerErr = nil;
@@ -358,6 +371,9 @@ static void vcam_player_log(NSString *msg) {
 
     _decodeThread = [[NSThread alloc] initWithTarget:self selector:@selector(decodeLoop) object:nil];
     _decodeThread.name = @"vcam.decoder";
+    // Utility 优先级: 解码让位给 render 线程(相机回调), 预览流畅度优先;
+    // 解码跟不上时预渲染消费式取帧自动降帧, 不阻塞 render
+    _decodeThread.qualityOfService = NSQualityOfServiceUtility;
     [_decodeThread start];
     vcam_player_log(@"[vcam] Decoding thread started");
 }

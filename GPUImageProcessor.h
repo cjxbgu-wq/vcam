@@ -27,7 +27,10 @@
 @interface GPUImageProcessor : NSObject
 
 // 旋转/镜像状态
-@property (nonatomic, assign) int rotationAngle;  // 0/90/180/270
+@property (nonatomic, assign) int rotationAngle;  // 0/90/180/270 (用户手动, 悬浮球"转")
+@property (nonatomic, assign) int sourceRotation; // 视频自带旋转(0/90/180/270, preferredTransform;
+                                                  // AVAssetReader 解码帧不应用它, 不补偿会导致
+                                                  // 换视频后画面 180°/90° 翻转)
 @property (nonatomic, assign) BOOL mirrored;
 @property (nonatomic, readonly) BOOL rotationApiAvailable;
 
