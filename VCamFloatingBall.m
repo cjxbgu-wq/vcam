@@ -111,7 +111,6 @@ static void vcam_ball_log(NSString *msg) {
 @property (nonatomic, assign) BOOL panelVisible;
 @property (nonatomic, assign) BOOL isFloating;
 @property (nonatomic, assign) BOOL isPaused;
-@property (nonatomic, assign) BOOL windowHiddenByClose;  // 关 隐藏后, 回桌面/解锁时恢复
 @property (nonatomic, assign) NSInteger pickerSlot;      // 0=选择视频(vcam.mp4) 2/3=预设槽位
 @end
 
@@ -222,10 +221,11 @@ static void vcam_ball_log(NSString *msg) {
     UIPanGestureRecognizer *panGesture = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(ballDragged:)];
     [_ballView addGestureRecognizer:panGesture];
 
-    [_overlayWindow addSubview:_ballView];
-
-    // 创建面板（初始隐藏）
+    // 创建面板（初始隐藏, 先加入 window）
     [self createPanel];
+
+    // 球最后加入 → 永远在面板上层, 位置重叠时球仍可拖动/点击
+    [_overlayWindow addSubview:_ballView];
 }
 
 #pragma mark - 灰色主题辅助
@@ -256,46 +256,47 @@ static void vcam_ball_log(NSString *msg) {
     return btn;
 }
 
-#pragma mark - 面板创建（双页签 + 灰色主题）
+#pragma mark - 面板创建（双页签 + 灰色主题, 紧凑尺寸）
 
 - (void)createPanel {
-    CGFloat panelW = 232;
-    CGFloat pad = 12;
-    CGFloat contentW = panelW - pad * 2;                 // 208
-    CGFloat tabH = 34;
-    CGFloat pageTop = pad + tabH + 8;                    // 页面内容起始 y
+    CGFloat panelW = 198;
+    CGFloat pad = 10;
+    CGFloat contentW = panelW - pad * 2;                 // 178
+    CGFloat tabH = 30;
+    CGFloat pageTop = pad + tabH + 6;                    // 页面内容起始 y
+    CGFloat rowH = 38;                                   // 整宽按钮高度
+    CGFloat gap = 8;
 
-    // 控制页内容高度: 选择视频(42) + 10 + 3 行宫格(46*3 + 8*2)
-    CGFloat controlH = 42 + 10 + 46 * 3 + 8 * 2;         // 206
-    // 设置页内容高度: 3 个整宽按钮(42*3 + 10*2) + 12 + 水印(18)
-    CGFloat settingsH = 42 * 3 + 10 * 2 + 12 + 18;       // 184
+    // 控制页内容高度: 选择视频(38) + 8 + 3 行宫格(40*3 + 7*2)
+    CGFloat controlH = rowH + gap + 40 * 3 + 7 * 2;      // 174
+    // 设置页内容高度: 3 个整宽按钮(38*3 + 8*2) + 10 + 水印(16)
+    CGFloat settingsH = rowH * 3 + gap * 2 + 10 + 16;    // 154
     CGFloat panelH = pageTop + MAX(controlH, settingsH) + pad;
 
-    CGFloat panelX = _ballView.frame.origin.x - panelW - 10;
-    CGFloat panelY = _ballView.center.y - panelH / 2;
-
-    _panelView = [[UIView alloc] initWithFrame:CGRectMake(panelX, panelY, panelW, panelH)];
+    _panelView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, panelW, panelH)];
     _panelView.backgroundColor = [self vcPanelBgColor];
-    _panelView.layer.cornerRadius = 14;
+    _panelView.layer.cornerRadius = 12;
     _panelView.layer.masksToBounds = YES;
     _panelView.alpha = 0;
     _panelView.hidden = YES;
 
     // ===== 页签行: 控制 | 设置 =====
-    CGFloat tabW = 88;
-    CGFloat tabGap = 10;
+    CGFloat tabW = 76;
+    CGFloat tabGap = 8;
     CGFloat tabX0 = (panelW - (tabW * 2 + tabGap)) / 2;
     _tabControlBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     _tabControlBtn.frame = CGRectMake(tabX0, pad, tabW, tabH);
-    _tabControlBtn.titleLabel.font = [UIFont boldSystemFontOfSize:15];
-    _tabControlBtn.layer.cornerRadius = 8;
+    [_tabControlBtn setTitle:@"控制" forState:UIControlStateNormal];  // 之前漏 setTitle 导致文字不显示
+    _tabControlBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    _tabControlBtn.layer.cornerRadius = 7;
     [_tabControlBtn addTarget:self action:@selector(controlTabTapped) forControlEvents:UIControlEventTouchUpInside];
     [_panelView addSubview:_tabControlBtn];
 
     _tabSettingsBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     _tabSettingsBtn.frame = CGRectMake(tabX0 + tabW + tabGap, pad, tabW, tabH);
-    _tabSettingsBtn.titleLabel.font = [UIFont boldSystemFontOfSize:15];
-    _tabSettingsBtn.layer.cornerRadius = 8;
+    [_tabSettingsBtn setTitle:@"设置" forState:UIControlStateNormal];
+    _tabSettingsBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    _tabSettingsBtn.layer.cornerRadius = 7;
     [_tabSettingsBtn addTarget:self action:@selector(settingsTabTapped) forControlEvents:UIControlEventTouchUpInside];
     [_panelView addSubview:_tabSettingsBtn];
 
@@ -306,15 +307,15 @@ static void vcam_ball_log(NSString *msg) {
 
     // 选择视频(整宽)
     VCamPanelButton *selectBtn = [self makeButton:@"选择视频"
-                                            frame:CGRectMake(pad, 0, contentW, 42)
+                                            frame:CGRectMake(pad, 0, contentW, rowH)
                                           selector:@selector(selectVideoTapped)];
-    selectBtn.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+    selectBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
     [_controlPageView addSubview:selectBtn];
 
     // 3x3 宫格
-    CGFloat cellW = (contentW - 8 * 2) / 3;              // 64
-    CGFloat cellH = 46;
-    CGFloat gridY0 = 42 + 10;
+    CGFloat cellW = (contentW - gap * 2) / 3;            // 54
+    CGFloat cellH = 40;
+    CGFloat gridY0 = rowH + gap;
     NSString *gridTitles[3][3] = {
         { @"播", @"替", @"1" },
         { @"▶", @"关", @"2" },
@@ -322,14 +323,14 @@ static void vcam_ball_log(NSString *msg) {
     };
     SEL gridSels[3][3] = {
         { @selector(restartVideoTapped), @selector(toggleReplacementTapped), @selector(slot1Tapped) },
-        { @selector(playPauseTapped),     @selector(closeWindowTapped),      @selector(slot2Tapped) },
+        { @selector(playPauseTapped),     @selector(closePanelTapped),       @selector(slot2Tapped) },
         { @selector(rotateRightTapped),   @selector(mirrorTapped),           @selector(slot3Tapped) },
     };
     for (int r = 0; r < 3; r++) {
         for (int c = 0; c < 3; c++) {
-            CGRect f = CGRectMake(pad + c * (cellW + 8), gridY0 + r * (cellH + 8), cellW, cellH);
+            CGRect f = CGRectMake(pad + c * (cellW + gap), gridY0 + r * (cellH + 7), cellW, cellH);
             VCamPanelButton *btn = [self makeButton:gridTitles[r][c] frame:f selector:gridSels[r][c]];
-            btn.titleLabel.font = [UIFont boldSystemFontOfSize:18];
+            btn.titleLabel.font = [UIFont boldSystemFontOfSize:16];
             [_controlPageView addSubview:btn];
             if (r == 0 && c == 1) _replaceBtn = btn;    // 替 ↔ 原
             if (r == 1 && c == 0) _playPauseBtn = btn;  // ▶ ↔ ⏸
@@ -342,30 +343,30 @@ static void vcam_ball_log(NSString *msg) {
     [_panelView addSubview:_settingsPageView];
 
     VCamPanelButton *preset2 = [self makeButton:@"预设视频2"
-                                          frame:CGRectMake(pad, 0, contentW, 42)
+                                          frame:CGRectMake(pad, 0, contentW, rowH)
                                         selector:@selector(preset2Tapped)];
-    preset2.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+    preset2.titleLabel.font = [UIFont boldSystemFontOfSize:14];
     [_settingsPageView addSubview:preset2];
 
     VCamPanelButton *preset3 = [self makeButton:@"预设视频3"
-                                          frame:CGRectMake(pad, 52, contentW, 42)
+                                          frame:CGRectMake(pad, rowH + gap, contentW, rowH)
                                         selector:@selector(preset3Tapped)];
-    preset3.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+    preset3.titleLabel.font = [UIFont boldSystemFontOfSize:14];
     [_settingsPageView addSubview:preset3];
 
     // 岐盛相机: 隐藏频道链接按钮(跳转 Telegram)
     VCamPanelButton *channel = [self makeButton:@"岐盛相机"
-                                          frame:CGRectMake(pad, 104, contentW, 42)
+                                          frame:CGRectMake(pad, (rowH + gap) * 2, contentW, rowH)
                                         selector:@selector(channelLinkTapped)];
-    channel.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+    channel.titleLabel.font = [UIFont boldSystemFontOfSize:14];
     [_settingsPageView addSubview:channel];
 
     // 水印
-    UILabel *mark = [[UILabel alloc] initWithFrame:CGRectMake(pad, 158, contentW, 18)];
+    UILabel *mark = [[UILabel alloc] initWithFrame:CGRectMake(pad, (rowH + gap) * 2 + rowH + 10, contentW, 16)];
     mark.text = @"@QuGenttx";
     mark.textColor = [UIColor colorWithRed:0.72 green:0.73 blue:0.75 alpha:1.0];
     mark.textAlignment = NSTextAlignmentCenter;
-    mark.font = [UIFont systemFontOfSize:12];
+    mark.font = [UIFont systemFontOfSize:11];
     [_settingsPageView addSubview:mark];
 
     // 初始页签 = 控制, 替/原标题按当前 enabled 状态
@@ -373,6 +374,7 @@ static void vcam_ball_log(NSString *msg) {
     [self refreshTabStyles];
     [self updateReplaceButtonTitle];
 
+    // 面板先加, 悬浮球后加 → 球永远在面板上层, 即使重叠也能拖动/点击
     [_overlayWindow addSubview:_panelView];
 }
 
@@ -442,16 +444,23 @@ static void vcam_ball_log(NSString *msg) {
 }
 
 - (void)updatePanelPosition {
-    CGFloat panelWidth = _panelView.frame.size.width;
-    CGFloat panelHeight = _panelView.frame.size.height;
-    CGFloat panelX = _ballView.frame.origin.x - panelWidth - 10;
-    CGFloat panelY = _ballView.center.y - panelHeight / 2;
+    CGFloat panelW = _panelView.frame.size.width;
+    CGFloat panelH = _panelView.frame.size.height;
+    CGFloat screenW = _overlayWindow.frame.size.width;
+    CGFloat screenH = _overlayWindow.frame.size.height;
+    CGFloat gap = 8;
 
-    // 限制在屏幕内
+    // 面板默认在悬浮球右侧; 右侧空间不足(球靠右缘)时翻到左侧
+    CGFloat rightX = CGRectGetMaxX(_ballView.frame) + gap;
+    CGFloat leftX = _ballView.frame.origin.x - panelW - gap;
+    CGFloat panelX = (rightX + panelW <= screenW - 5) ? rightX : leftX;
     panelX = MAX(5, panelX);
-    panelY = MAX(5, MIN(_overlayWindow.frame.size.height - panelHeight - 5, panelY));
 
-    _panelView.frame = CGRectMake(panelX, panelY, panelWidth, panelHeight);
+    // 垂直以球为中心, 限制在屏幕内
+    CGFloat panelY = _ballView.center.y - panelH / 2;
+    panelY = MAX(5, MIN(screenH - panelH - 5, panelY));
+
+    _panelView.frame = CGRectMake(panelX, panelY, panelW, panelH);
 }
 
 #pragma mark - 控制页回调
@@ -484,14 +493,17 @@ static void vcam_ball_log(NSString *msg) {
     [self.replaceBtn setTitle:en ? @"原" : @"替" forState:UIControlStateNormal];
 }
 
-// 关: 关闭悬浮窗(球+面板); 回到桌面/锁屏解锁时自动恢复显示
-- (void)closeWindowTapped {
-    vcam_ball_log(@"[vcam][btn] close floating window (reopen on next home/unlock)");
-    _panelVisible = NO;
-    _panelView.hidden = YES;
-    _panelView.alpha = 0;
-    _windowHiddenByClose = YES;
-    _ballView.hidden = YES;
+// 关: 只收起面板(悬浮球保持显示), 再点悬浮球即可重新打开
+- (void)closePanelTapped {
+    vcam_ball_log(@"[vcam][btn] close panel (ball stays)");
+    if (_panelVisible) {
+        _panelVisible = NO;
+        [UIView animateWithDuration:0.15 animations:^{
+            self.panelView.alpha = 0;
+        } completion:^(BOOL finished) {
+            self.panelView.hidden = YES;
+        }];
+    }
 }
 
 // 1/2/3: 播放当前选择视频 / 预设视频2 / 预设视频3
@@ -626,14 +638,6 @@ static void vcam_ball_log(NSString *msg) {
     vcam_ball_log(@"[vcam] App became active");
 
     dispatch_async(dispatch_get_main_queue(), ^{
-        // 关 按钮隐藏后的恢复: 回到桌面/锁屏解锁时重新显示悬浮球
-        if (self->_isFloating && self->_windowHiddenByClose) {
-            self->_windowHiddenByClose = NO;
-            self.ballView.hidden = NO;
-            vcam_ball_log(@"[vcam] floating ball restored after close");
-            return;
-        }
-
         // 启动早期 scene 未连接时 window 未关联 scene（不可见），此时补建
         if (self->_isFloating && self.overlayWindow && self.overlayWindow.windowScene == nil) {
             vcam_ball_log(@"[vcam] window has no scene, recreating on didBecomeActive");
