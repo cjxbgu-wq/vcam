@@ -52,6 +52,9 @@ typedef NS_ENUM(NSInteger, VCamMediaType) {
 @property (nonatomic, assign) BOOL isEnabled;
 @property (nonatomic, assign) BOOL preprocessEnabled;
 @property (nonatomic, assign) BOOL isDecoding;
+// 暂停(跨进程: 悬浮球写 vc.plist paused, mediaserverd 轮询设置):
+// YES 时解码线程停止取新帧, 预渲染冻结在最后一帧; NO 恢复
+@property (nonatomic, assign) BOOL paused;
 
 // 输出尺寸/格式
 @property (nonatomic, assign) size_t outputWidth;

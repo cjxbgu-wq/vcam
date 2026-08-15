@@ -264,4 +264,31 @@ static void vcam_darwin_callback(CFNotificationCenterRef center, void *observer,
     [dict writeToFile:VCamPlistPath atomically:YES];
 }
 
+#pragma mark - 播放控制（跨进程: 悬浮球写, mediaserverd 轮询应用）
+
++ (BOOL)plistPaused {
+    NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath];
+    return [dict[@"paused"] boolValue];  // 缺失时 NO(播放中)
+}
+
++ (void)setPlistPaused:(BOOL)paused {
+    NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithDictionary:
+        [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath] ?: @{}];
+    dict[@"paused"] = @(paused);
+    [dict writeToFile:VCamPlistPath atomically:YES];
+}
+
++ (NSInteger)plistRestartToken {
+    NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath];
+    return [dict[@"restartToken"] integerValue];  // 缺失时 0
+}
+
++ (void)bumpRestartToken {
+    NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithDictionary:
+        [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath] ?: @{}];
+    NSInteger token = [dict[@"restartToken"] integerValue] + 1;
+    dict[@"restartToken"] = @(token);
+    [dict writeToFile:VCamPlistPath atomically:YES];
+}
+
 @end

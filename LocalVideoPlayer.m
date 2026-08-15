@@ -387,6 +387,12 @@ static void vcam_player_log(NSString *msg) {
                     continue;
                 }
 
+                // 暂停: 停止取新帧, 帧队列不再进帧, 预渲染回退 copyCurrentFrame 冻结画面
+                if (_paused) {
+                    [NSThread sleepForTimeInterval:0.05];
+                    continue;
+                }
+
                 // 视频模式：持续解码
                 CVPixelBufferRef buffer = [self readNextFrame];
                 if (buffer) {

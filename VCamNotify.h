@@ -55,4 +55,12 @@ typedef void(^VCamNotifyCallback)(NSString *name);
 + (BOOL)plistMirrored;
 + (void)setPlistMirrored:(BOOL)mirrored;
 
+// 播放控制（跨进程: 悬浮球写, mediaserverd 轮询应用）
+// paused: 暂停/继续视频解码(暂停时预渲染冻结在最后一帧)
++ (BOOL)plistPaused;
++ (void)setPlistPaused:(BOOL)paused;
+// restartToken: 自增令牌, mediaserverd 检测到变化后从头重播当前视频
++ (NSInteger)plistRestartToken;
++ (void)bumpRestartToken;
+
 @end

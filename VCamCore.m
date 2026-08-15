@@ -592,6 +592,42 @@ static void vcam_core_log(NSString *msg) {
             lastSyncedMirrored = plistMirrored;
             vcam_core_log([NSString stringWithFormat:@"[vcam] mirror synced: %d", plistMirrored]);
         }
+
+        // 视频源切换(悬浮球 1/2/3 键): activePlaybackPath 变化 → 自动重载新视频
+        // (无需 toggle enabled, 轮询 1s 内生效; 路径写入由悬浮球完成)
+        static NSString *lastSyncedPath = nil;
+        static BOOL pathSyncInit = NO;
+        NSString *activePath = [VCamNotify activePlaybackPath];
+        if (activePath.length > 0 && ![activePath isEqualToString:lastSyncedPath]) {
+            if (pathSyncInit && strongSelf.enabled) {
+                vcam_core_log([NSString stringWithFormat:
+                    @"[vcam] activePlaybackPath changed: %@ -> %@, reloading", lastSyncedPath, activePath]);
+                [strongSelf.videoPlayer loadVideoAtPath:activePath completion:nil];
+                [strongSelf.videoPlayer startWatchingFile:activePath];
+            }
+            lastSyncedPath = [activePath copy];
+            pathSyncInit = YES;
+        }
+
+        // 暂停/继续(悬浮球 ▶ 键): paused → 解码线程停止取帧, 预渲染冻结最后一帧
+        static BOOL lastSyncedPaused = NO;
+        BOOL plistPaused = [VCamNotify plistPaused];
+        if (plistPaused != lastSyncedPaused) {
+            strongSelf.videoPlayer.paused = plistPaused;
+            vcam_core_log([NSString stringWithFormat:@"[vcam] paused synced: %d", plistPaused]);
+            lastSyncedPaused = plistPaused;
+        }
+
+        // 从头重播(悬浮球 播 键): restartToken 自增 → 重载当前视频回到开头
+        static NSInteger lastRestartToken = -1;
+        NSInteger restartToken = [VCamNotify plistRestartToken];
+        if (restartToken != lastRestartToken) {
+            if (lastRestartToken >= 0 && strongSelf.enabled && strongSelf.videoPlayer.currentVideoPath.length > 0) {
+                vcam_core_log(@"[vcam] restart token bumped, replay from beginning");
+                [strongSelf.videoPlayer loadVideoAtPath:strongSelf.videoPlayer.currentVideoPath completion:nil];
+            }
+            lastRestartToken = restartToken;
+        }
     }];
 }
 
