@@ -170,10 +170,12 @@ static void vcam_core_log(NSString *msg) {
         return;
     }
 
-    // 2. 选源(对齐千面 render: transfer 源固定为单一 BGRA 帧 copyCurrentFrame,
-    //    不按目标格式选源 —— BGRA->任意格式(含私有 |xv0/-8f0/p420) VT 都支持,
-    //    而 420f->私有格式 VT 不支持(-12905, 实测日志确认, 导致全绿/替换失效), YUV 仅兜底)
-    CVPixelBufferRef base = bgra ? bgra : yuv;
+    // 2. 选源(对齐千面架构: 解码原生 420f 单一源 —— readNextFrame 0xe0e4 直接把
+    //    AVAssetReader 解码帧给 setReplacementPixelBuffer, 无 BGRA 中转)。
+    //    YUV(420f) 源携带原生 range/矩阵 attachments: YUV→私有格式(-8f0/p420/|xv0)
+    //    range 保持正确; BGRA 源转私有格式 VT 缺 range 信息 → 照片过曝(高光洗白)。
+    //    420f→某私有格式若 VT 不支持(-12905), 下方自动回退 BGRA 源重试
+    CVPixelBufferRef base = yuv ? yuv : bgra;
 
     // 3. 自适应旋转(对齐千面 render_disas 0xaf7c-0xafe4): 源/目标宽高比正交(一横一竖)时
     //    CCW90 旋转(宽高互换), 预览流(竖向 buffer)与拍照/录像流(横向 buffer)各自正确方向,
@@ -186,13 +188,27 @@ static void vcam_core_log(NSString *msg) {
     // 4. 写入相机帧: VT transfer(Trim 保比例 crop fill)主路径。
     //    全格式处理无白名单(对齐千面 0xb0f8-0xb154: 私有格式 |8v0/-8f0/p420 也 transfer,
     //    这正是千面能替换视频模式预览和拍照保存的原因), 失败保留原相机帧
+    BOOL usedFallbackSource = NO;
     BOOL ok = [self writeFrame:src toPixelBuffer:pixelBuffer];
+    if (!ok && base == yuv && bgra != NULL) {
+        // YUV 源失败(该 420f→目标组合 VT 不支持): 回退 BGRA 源重试
+        if (src) CVPixelBufferRelease(src);
+        [_renderLock lock];
+        src = [_gpuProcessor adaptiveRotateIfNeeded:bgra targetWidth:targetW targetHeight:targetH];
+        [_renderLock unlock];
+        ok = [self writeFrame:src toPixelBuffer:pixelBuffer];
+        usedFallbackSource = ok;
+        if (ok && diagThisFrame) {
+            vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d YUV->0x%x failed, retry via BGRA OK", vcamRenderCount, (unsigned)origFormat]);
+        }
+    }
     if (ok) {
         _frameCount++;
         if (diagThisFrame) {
-            vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d OK %zux%zu fmt=0x%x via BGRA%@",
+            vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d OK %zux%zu fmt=0x%x via %@%@",
                            vcamRenderCount, targetW, targetH, (unsigned)origFormat,
-                           (src != base) ? @" +CCW90" : @""]);
+                           usedFallbackSource ? @"BGRA(fb)" : @"YUV",
+                           (src != base && !usedFallbackSource) ? @" +CCW90" : @""]);
         }
         // 缓存回退帧(千面缓存旋转后的实际 transfer 源 x24, 0xb15c-0xb19c) + 同帧去重
         [_renderLock lock];
@@ -396,25 +412,26 @@ static void vcam_core_log(NSString *msg) {
                     continue;
                 }
 
-                // 1. 旋转/镜像（如需要, 视频原尺寸）
+                // 1. 旋转/镜像（如需要, 视频原尺寸; 解码帧为 420f, 旋转保持 420f）
                 CVPixelBufferRef rotated = [strongSelf.gpuProcessor rotateAndMirrorIfNeeded:frame];
                 CVPixelBufferRelease(frame);
                 if (!rotated) continue;
 
-                // 2. YUV 版本（同尺寸 420f, VT 转换）
-                CVPixelBufferRef yuv = [strongSelf.gpuProcessor convertFormat:rotated toFormat:'420f'];
+                // 2. BGRA 版本（同尺寸, VT 转换; render 回退源 + BGRA 目标流用）
+                CVPixelBufferRef bgra = [strongSelf.gpuProcessor convertFormat:rotated toFormat:kCVPixelFormatType_32BGRA];
 
                 // 3. 完整产出后才替换缓存（避免半成品被 render 读到）
+                //    主源=YUV(420f, 对齐千面解码原生单源), BGRA 为回退
                 [strongSelf.processLock lock];
-                if (strongSelf->_liveBGRAPixelBuffer) {
-                    CVPixelBufferRelease(strongSelf->_liveBGRAPixelBuffer);
+                if (strongSelf->_liveYUVPixelBuffer) {
+                    CVPixelBufferRelease(strongSelf->_liveYUVPixelBuffer);
                 }
-                strongSelf->_liveBGRAPixelBuffer = rotated;  // 所有权转移
-                if (yuv) {
-                    if (strongSelf->_liveYUVPixelBuffer) {
-                        CVPixelBufferRelease(strongSelf->_liveYUVPixelBuffer);
+                strongSelf->_liveYUVPixelBuffer = rotated;  // 所有权转移
+                if (bgra) {
+                    if (strongSelf->_liveBGRAPixelBuffer) {
+                        CVPixelBufferRelease(strongSelf->_liveBGRAPixelBuffer);
                     }
-                    strongSelf->_liveYUVPixelBuffer = yuv;  // 所有权转移; 失败时保留旧 YUV
+                    strongSelf->_liveBGRAPixelBuffer = bgra;  // 所有权转移; 失败时保留旧 BGRA
                 }
                 [strongSelf.processLock unlock];
 

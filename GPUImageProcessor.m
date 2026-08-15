@@ -453,9 +453,12 @@ static void vcam_gpu_log(NSString *msg) {
 - (CVPixelBufferRef)rotateAndMirror:(CVPixelBufferRef)input width:(size_t)width height:(size_t)height CF_RETURNS_RETAINED {
     if (!input || !_pixelRotationSession) return NULL;
 
-    // 创建目标缓冲区（BGRA 格式，不带 IOSurface 属性）
+    // 目标缓冲保持源格式（对齐千面 rotateBuffer: 0xe514-0xe578:
+    // GetPixelFormatType(src) → CVPixelBufferCreate(同格式) —— 420f 源旋转后仍是 420f,
+    // range/矩阵 attachments 语义保持, 不做 BGRA 中转）
+    OSType srcFormat = CVPixelBufferGetPixelFormatType(input);
     CVPixelBufferRef dst = NULL;
-    OSStatus status = CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, NULL, &dst);
+    OSStatus status = CVPixelBufferCreate(kCFAllocatorDefault, width, height, srcFormat, NULL, &dst);
     if (status != noErr) {
         vcam_gpu_log([NSString stringWithFormat:@"[vcam] Failed to create rotation buffer: %d", (int)status]);
         return NULL;

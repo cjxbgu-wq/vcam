@@ -182,9 +182,11 @@ static void vcam_player_log(NSString *msg) {
         return;
     }
 
-    // 创建输出（BGRA 格式）
+    // 创建输出（420f 双平面 full-range, 对齐千面 outputSettings:
+    // 解码帧直接携带原生 YUV range/矩阵 attachments, render 源用 YUV 转私有格式
+    // (-8f0/p420/|xv0)时 range 保持; BGRA 源转私有格式 VT 缺 range 信息导致照片过曝）
     NSDictionary *outputSettings = @{
-        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+        (id)kCVPixelBufferPixelFormatTypeKey: @((OSType)'420f'),
         (id)kCVPixelBufferWidthKey:  @(_videoWidth),
         (id)kCVPixelBufferHeightKey: @(_videoHeight),
     };
@@ -335,9 +337,9 @@ static void vcam_player_log(NSString *msg) {
         return;
     }
 
-    // 重新创建输出
+    // 重新创建输出（420f, 同上）
     NSDictionary *outputSettings = @{
-        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+        (id)kCVPixelBufferPixelFormatTypeKey: @((OSType)'420f'),
         (id)kCVPixelBufferWidthKey:  @(_videoWidth),
         (id)kCVPixelBufferHeightKey: @(_videoHeight),
     };
