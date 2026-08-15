@@ -433,10 +433,9 @@ static void vcam_player_log(NSString *msg) {
 
     _decodeThread = [[NSThread alloc] initWithTarget:self selector:@selector(decodeLoop) object:nil];
     _decodeThread.name = @"vcam.decoder";
-    // Default 优先级(2026-08-15 从 Utility 提级): Utility 下高负载时解码跟不上
-    // 24fps → 队列断供 → 预渲染冻结旧帧 → 画面停顿卡顿。Default 保证持续供给,
-    // 仍低于 render(UserInteractive), 争抢时预览优先
-    _decodeThread.qualityOfService = NSQualityOfServiceDefault;
+    // Utility 优先级(2026-08-15): mediaserverd 内我们的负载必须让位系统服务 RPC,
+    // 否则 AURemoteIO RPCTimeout → mediaserverd 被杀 → 全部相机黑屏(死循环重启)
+    _decodeThread.qualityOfService = NSQualityOfServiceUtility;
     [_decodeThread start];
     vcam_player_log(@"[vcam] Decoding thread started");
 }

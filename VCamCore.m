@@ -81,11 +81,11 @@ static void vcam_core_log(NSString *msg) {
     self = [super init];
     if (self) {
         _prerenderQueue = dispatch_queue_create("com.vcam.processing", DISPATCH_QUEUE_SERIAL);
-        // 预渲染 Default 优先级(2026-08-15 从 Utility 提级): Utility 下大帧 VT 旋转
-        // (1244x1660 420f ~3MB)跟不上 24fps 节拍 → 实测 fps 波动 20.7~28 → 卡顿观感。
-        // Default 与 render(UserInteractive) 仍有差距, 争抢时 render 优先, 但不至饿死
+        // 预渲染 Utility 优先级(2026-08-15): App 多流场景我们的解码+预渲染+多流渲染
+        // 吃满 mediaserverd → AURemoteIO/服务 RPC 超时 → 系统杀 mediaserverd(黑屏死循环)。
+        // 系统服务请求永远优先, 我们的线程全面让位( Utility 空载仍够 24fps, 忙时降帧但不死)
         dispatch_set_target_queue(_prerenderQueue,
-                                  dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0));
+                                  dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
         _processingQueue = dispatch_queue_create("com.vcam.processing.bg", DISPATCH_QUEUE_SERIAL);
         _processLock = [[NSLock alloc] init];
         _renderLock = [[NSLock alloc] init];
@@ -175,6 +175,13 @@ static void vcam_core_log(NSString *msg) {
     OSType origFormat = CVPixelBufferGetPixelFormatType(pixelBuffer);
     size_t targetW = CVPixelBufferGetWidth(pixelBuffer);
     size_t targetH = CVPixelBufferGetHeight(pixelBuffer);
+
+    // 微型流跳过(2026-08-15, mediaserverd 存活关键): App 相机带人脸/场景分析小流
+    // (如 328x184 '18f0'), 替换它无视觉意义但每帧 VT 转换挤占 mediaserverd →
+    // AURemoteIO RPC 超时 → mediaserverd 被杀死循环。可见预览流(≥720p)不受影响
+    if (targetW * targetH < 640 * 480) {
+        return;
+    }
 
     // 诊断: 每 60 帧记录 render 入口
     static int vcamRenderCount = 0;
