@@ -300,6 +300,52 @@ static void vcam_core_log(NSString *msg) {
     return !(format == kCVPixelFormatType_32BGRA || format == '420v' || format == '420f');
 }
 
+// 像素级诊断: dump buffer 的颜色 attachments + 亮度采样(量化单次转换的提亮效应)
+// 采样中心十字 5 点: Y 平面(YUV) 或 G 通道(BGRA), 附 attachments 全字典
+- (void)dumpBufferDiagnostics:(CVPixelBufferRef)buf label:(NSString *)label {
+    if (!buf) return;
+    OSType fmt = CVPixelBufferGetPixelFormatType(buf);
+    size_t w = CVPixelBufferGetWidth(buf);
+    size_t h = CVPixelBufferGetHeight(buf);
+
+    CVPixelBufferLockBaseAddress(buf, kCVPixelBufferLock_ReadOnly);
+    NSMutableArray *samples = [NSMutableArray array];
+    if (CVPixelBufferGetPlaneCount(buf) >= 1) {
+        // YUV: 采样 plane0(Y) 中心十字
+        uint8_t *base = CVPixelBufferGetBaseAddressOfPlane(buf, 0);
+        size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(buf, 0);
+        if (base) {
+            size_t cx = w / 2, cy = h / 2;
+            size_t xs[] = {cx, cx / 2, cx + cx / 2, cx, cx};
+            size_t ys[] = {cy, cy, cy, cy / 2, cy + cy / 2};
+            for (int i = 0; i < 5; i++) {
+                if (xs[i] < w && ys[i] < h) {
+                    [samples addObject:@(base[ys[i] * bpr + xs[i]])];
+                }
+            }
+        }
+    } else {
+        // BGRA: 采样 G 通道(Offset+1)
+        uint8_t *base = CVPixelBufferGetBaseAddress(buf);
+        size_t bpr = CVPixelBufferGetBytesPerRow(buf);
+        if (base) {
+            size_t cx = w / 2, cy = h / 2;
+            size_t xs[] = {cx, cx / 2, cx + cx / 2, cx, cx};
+            size_t ys[] = {cy, cy, cy, cy / 2, cy + cy / 2};
+            for (int i = 0; i < 5; i++) {
+                if (xs[i] < w && ys[i] < h) {
+                    [samples addObject:@(base[ys[i] * bpr + xs[i] * 4 + 1])];
+                }
+            }
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(buf, kCVPixelBufferLock_ReadOnly);
+
+    NSDictionary *atts = CFBridgingRelease(CVBufferCopyAttachments(buf, kCVAttachmentMode_ShouldPropagate));
+    vcam_core_log([NSString stringWithFormat:@"[vcam][pix] %@ %zux%zu fmt=0x%x Y/G=%@ atts=%@",
+                   label, w, h, (unsigned)fmt, samples, atts ?: @"(nil)"]);
+}
+
 #pragma mark - 帧写入
 
 // 对齐逆向: VT transfer(Trim 保比例 crop fill 缩放+格式转换) 主路径
@@ -325,7 +371,12 @@ static void vcam_core_log(NSString *msg) {
     // 路径1: VTPixelTransferSession（任意尺寸+格式组合, CropSourceToCleanAperture 自动 crop fill）
     @try {
         if ([_gpuProcessor transferPixelBuffer:src toPixelBuffer:dst]) {
-            if (diag) vcam_core_log([NSString stringWithFormat:@"[vcam] write#%d VT ok", vcamWriteCount]);
+            if (diag) {
+                vcam_core_log([NSString stringWithFormat:@"[vcam] write#%d VT ok", vcamWriteCount]);
+                // 像素级诊断: 转换前后 Y/G 采样对比(检测单次转换提亮) + attachments
+                [self dumpBufferDiagnostics:src label:@"src"];
+                [self dumpBufferDiagnostics:dst label:@"dst"];
+            }
             done = YES;
         }
     } @catch (NSException *e) {
