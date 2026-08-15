@@ -572,12 +572,12 @@ static void vcam_player_log(NSString *msg) {
     // 初始文件信息
     [self updateFileInfo];
 
+    __weak typeof(self) weakSelf = self;
     // 注册 Darwin 通知监听（reload-media, 仅一次: registerForNotification 非幂等,
     // 重复注册会累积回调 → reload 通知触发 N 次 reloadMedia)
     static BOOL reloadListenerRegistered = NO;
     if (!reloadListenerRegistered) {
         reloadListenerRegistered = YES;
-        __weak typeof(self) weakSelf = self;
         [[VCamNotify sharedInstance] registerForNotification:VCamNotifyReloadMedia callback:^(NSString *name) {
             [weakSelf reloadMedia];
         }];

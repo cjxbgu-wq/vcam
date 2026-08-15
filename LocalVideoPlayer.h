@@ -102,7 +102,6 @@ typedef NS_ENUM(NSInteger, VCamMediaType) {
 // 解码控制
 - (void)startDecodingThread;
 - (void)stopDecodingThread;
-- (void)prefillFrameQueue;
 
 // 帧获取
 - (CVPixelBufferRef)getCurrentFrame;
