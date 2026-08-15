@@ -58,6 +58,15 @@ static void vcam_player_log(NSString *msg) {
 @property (nonatomic, assign) BOOL hasLastPTS;
 @property (nonatomic, assign) double lastPTS;
 
+// AVURLAsset/track 按路径复用(2026-08-15, mediaserverd watchdog 根因修复):
+// 每次重载(重启后 enable/重播/切源)新建 AVURLAsset + 同步 tracksWithMediaType
+// 会向 AVFoundation 的 CommonURLAsset* 通知队列派发任务, mediaserverd 中该队列
+// 卡住 60s → WATCHDOG 杀进程 → 所有相机(系统+App)断连黑屏。
+// 同路径复用已解析的 asset/track, 不再重复触发队列
+@property (nonatomic, copy) NSString *assetPath;
+@property (nonatomic, strong) AVURLAsset *reusableAsset;
+@property (nonatomic, strong) AVAssetTrack *reusableTrack;
+
 // 解码线程控制
 @property (nonatomic, assign) BOOL shouldDecode;
 @property (nonatomic, strong) NSThread *decodeThread;
@@ -166,7 +175,6 @@ static void vcam_player_log(NSString *msg) {
     [self clearFrameQueue];
 
     NSURL *url = [NSURL fileURLWithPath:path];
-    _urlAsset = [AVURLAsset assetWithURL:url];
     _currentVideoPath = path;
     _mediaType = VCamMediaTypeVideo;
     // 重置 PTS 实测状态(新视频从第一帧重新采样)
@@ -174,14 +182,28 @@ static void vcam_player_log(NSString *msg) {
     _lastPTS = 0;
     _effectiveFpsInternal = 0;
 
-    // 获取视频轨道
-    NSArray *tracks = [_urlAsset tracksWithMediaType:AVMediaTypeVideo];
-    if (tracks.count == 0) {
-        vcam_player_log(@"No video track found");
-        if (completion) completion(NO, [NSError errorWithDomain:@"VCam" code:4 userInfo:@{NSLocalizedDescriptionKey:@"No video track"}]);
-        return;
+    // asset/track 复用: 同路径重载(重播/重启后 enable/文件 watcher)不重建,
+    // 避免重复触发 CommonURLAsset* 队列(mediaserverd watchdog 根因)
+    if (![_assetPath isEqualToString:path] || !_reusableAsset) {
+        // 新路径: 重建 asset + 解析 track(仅此一次走同步 track 加载)
+        NSDictionary *opts = @{AVURLAssetPreferPreciseDurationAndTimingKey: @NO};
+        _reusableAsset = [AVURLAsset URLAssetWithURL:url options:opts];
+        _reusableTrack = nil;
+        _assetPath = [path copy];
+        vcam_player_log([NSString stringWithFormat:@"[vcam] New AVURLAsset created for %@", path]);
     }
-    _videoTrack = tracks[0];
+    _urlAsset = _reusableAsset;
+
+    if (!_reusableTrack) {
+        NSArray *tracks = [_urlAsset tracksWithMediaType:AVMediaTypeVideo];
+        if (tracks.count == 0) {
+            vcam_player_log(@"No video track found");
+            if (completion) completion(NO, [NSError errorWithDomain:@"VCam" code:4 userInfo:@{NSLocalizedDescriptionKey:@"No video track"}]);
+            return;
+        }
+        _reusableTrack = tracks[0];
+    }
+    _videoTrack = _reusableTrack;
 
     // 获取视频信息
     _videoWidth = (size_t)_videoTrack.naturalSize.width;
@@ -377,8 +399,12 @@ static void vcam_player_log(NSString *msg) {
 - (void)resetReaderForLoop {
     vcam_player_log(@"[vcam] Looping video from beginning");
 
-    // 重新创建 reader
+    // 显式释放旧 reader/output 后再新建(2026-08-15): 避免新旧 reader 并存瞬间
+    // 对同一 asset 双重持有/派发通知, 加重 CommonURLAsset* 队列负担(watchdog 根因)
     [_assetReader cancelReading];
+    _assetReader = nil;
+    _videoOutput = nil;
+
     NSError *err = nil;
     _assetReader = [[AVAssetReader alloc] initWithAsset:_urlAsset error:&err];
     if (err || !_assetReader) {
@@ -603,6 +629,11 @@ static void vcam_player_log(NSString *msg) {
     int64_t gen = __sync_add_and_fetch(&_reloadGeneration, 1);
     __weak typeof(self) weakSelf = self;
     NSString *path = _currentVideoPath;
+
+    // 文件内容已变化(inode/size/mtime): 复用的 asset 指向旧文件数据, 必须丢弃重建
+    _reusableAsset = nil;
+    _reusableTrack = nil;
+    _assetPath = nil;
 
     vcam_player_log([NSString stringWithFormat:@"[vcam] Reloading media[gen=%ld]: %@ (type: %@)",
                      (long)gen, path, _mediaType == VCamMediaTypeVideo ? @"video" : @"image"]);

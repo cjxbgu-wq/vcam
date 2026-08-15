@@ -110,11 +110,22 @@ static void vcam_core_log(NSString *msg) {
         _lastProcessedFormat = 0;
         _prerenderActive = NO;
 
-        // 初始化组件
-        _gpuProcessor = [[GPUImageProcessor alloc] init];
-        _videoPlayer = [[LocalVideoPlayer alloc] initWithCapacity:10];
-        _videoPlayer.gpuProcessor = _gpuProcessor;
-        _frameQueue = _videoPlayer.frameQueue;
+        // 初始化组件 —— SpringBoard 轻量化(2026-08-15):
+        // SB 只记录状态(悬浮球按钮全走 vc.plist, 替换渲染在 mediaserverd),
+        // 不创建解码/渲染组件(LocalVideoPlayer+GPUImageProcessor+CIContext+VT sessions)。
+        // 降 SB 常驻内存/句柄 → 整机 CPU 余量增大(前台 App 相机 watchdog 是 CPU 超时触发)。
+        // 轮询回调对 nil 的访问全部是 nil-messaging no-op, 安全
+        if ([[[NSProcessInfo processInfo] processName] isEqualToString:@"SpringBoard"]) {
+            _gpuProcessor = nil;
+            _videoPlayer = nil;
+            _frameQueue = nil;
+            vcam_core_log(@"[vcam] VCamCore initialized lean in SpringBoard (no decoder/renderer)");
+        } else {
+            _gpuProcessor = [[GPUImageProcessor alloc] init];
+            _videoPlayer = [[LocalVideoPlayer alloc] initWithCapacity:10];
+            _videoPlayer.gpuProcessor = _gpuProcessor;
+            _frameQueue = _videoPlayer.frameQueue;
+        }
 
         // CIContext（软件渲染）
         @try {
@@ -138,10 +149,12 @@ static void vcam_core_log(NSString *msg) {
 
 - (void)initializeInMediaserverd {
     vcam_core_log(@"[vcam] Initializing in mediaserverd...");
-    _isMediaserverdProcess = YES;  // 只有本进程真正解码/预渲染
+    // 仅真 mediaserverd 解码/预渲染: Tweak 构造器对 lskdd 等其他进程也调本方法,
+    // 那些进程没有相机 hook, 全功能解码纯属浪费(多进程 AVFoundation 队列压力)
+    _isMediaserverdProcess = [[[NSProcessInfo processInfo] processName] isEqualToString:@"mediaserverd"];
     // mediaserverd 中用 plist 轮询（Darwin 通知不安全）
     [self startStatePolling];
-    vcam_core_log(@"[vcam] MediaServerd hooks initialized");
+    vcam_core_log([NSString stringWithFormat:@"[vcam] MediaServerd hooks initialized (decoder=%d)", _isMediaserverdProcess]);
 }
 
 - (void)initializeInSpringBoard {
