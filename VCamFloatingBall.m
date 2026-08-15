@@ -315,15 +315,20 @@ static void vcam_ball_log(NSString *msg) {
     CGFloat cellW = (contentW - 8 * 2) / 3;              // 64
     CGFloat cellH = 46;
     CGFloat gridY0 = 42 + 10;
-    struct { NSString *title; SEL sel; } cells[3][3] = {
-        { @"播", @selector(restartVideoTapped) }, { @"替", @selector(toggleReplacementTapped) }, { @"1", @selector(slot1Tapped) },
-        { @"▶", @selector(playPauseTapped) },     { @"关", @selector(closeWindowTapped) },      { @"2", @selector(slot2Tapped) },
-        { @"转", @selector(rotateRightTapped) },  { @"镜", @selector(mirrorTapped) },           { @"3", @selector(slot3Tapped) },
+    NSString *gridTitles[3][3] = {
+        { @"播", @"替", @"1" },
+        { @"▶", @"关", @"2" },
+        { @"转", @"镜", @"3" },
+    };
+    SEL gridSels[3][3] = {
+        { @selector(restartVideoTapped), @selector(toggleReplacementTapped), @selector(slot1Tapped) },
+        { @selector(playPauseTapped),     @selector(closeWindowTapped),      @selector(slot2Tapped) },
+        { @selector(rotateRightTapped),   @selector(mirrorTapped),           @selector(slot3Tapped) },
     };
     for (int r = 0; r < 3; r++) {
         for (int c = 0; c < 3; c++) {
             CGRect f = CGRectMake(pad + c * (cellW + 8), gridY0 + r * (cellH + 8), cellW, cellH);
-            VCamPanelButton *btn = [self makeButton:cells[r][c].title frame:f selector:cells[r][c].sel];
+            VCamPanelButton *btn = [self makeButton:gridTitles[r][c] frame:f selector:gridSels[r][c]];
             btn.titleLabel.font = [UIFont boldSystemFontOfSize:18];
             [_controlPageView addSubview:btn];
             if (r == 0 && c == 1) _replaceBtn = btn;    // 替 ↔ 原
@@ -546,7 +551,8 @@ static void vcam_ball_log(NSString *msg) {
     dispatch_async(dispatch_get_main_queue(), ^{
         PHPickerConfiguration *config = [[PHPickerConfiguration alloc] init];
         config.selectionLimit = 1;
-        config.filter = [PHPickerFilter videos];
+        // 不设 filter(SDK 15.6 无 +[PHPickerFilter videos] 便捷方法),
+        // 选择完成后用 public.movie 类型校验, 非视频拒绝
         PHPickerViewController *picker = [[PHPickerViewController alloc] initWithConfiguration:config];
         picker.delegate = self;
         // 从悬浮窗 rootViewController present, 保证显示在最顶层
