@@ -54,6 +54,13 @@ static void vcam_gpu_log(NSString *msg) {
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSValue *> *twoStepSessionPool;    // key -> session 指针
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSValue *> *twoStepStagingPool;    // key -> CVPixelBufferRef 指针(池持有引用)
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *twoStepTokenPool;     // key -> staging 内容帧代数
+// 2step 失败熔断(2026-08-15, App 相机黑屏根因): App 摄像头带 328x184 '18f0' 微型分析流,
+// VT 不支持该组合(-12905), 高频流上"失败→重建 session→再失败"每秒 8 次 → mediaserverd
+// wakeups 资源超限被杀 → 死循环重启(6s/次) → 所有相机黑屏。
+// 同 key 连续失败 ≥2 次即熔断: 永久跳过该流两步法(保留相机原帧, 分析流无视觉影响),
+// 不再创建/销毁 session
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *twoStepFailCountPool; // key -> 连续失败计数
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *twoStepDisabledPool;  // key -> 熔断标记
 @property (nonatomic, assign) VTPixelRotationSessionRef pixelRotationSession;
 // render 路径专用旋转 session（非线程安全: 预渲染线程与 render 线程并发用同一 session 会崩溃）
 @property (nonatomic, assign) VTPixelRotationSessionRef renderRotationSession;
@@ -112,6 +119,8 @@ static void vcam_gpu_log(NSString *msg) {
         _twoStepSessionPool = [[NSMutableDictionary alloc] init];
         _twoStepStagingPool = [[NSMutableDictionary alloc] init];
         _twoStepTokenPool = [[NSMutableDictionary alloc] init];
+        _twoStepFailCountPool = [[NSMutableDictionary alloc] init];
+        _twoStepDisabledPool = [[NSMutableDictionary alloc] init];
 
         // 软件渲染 CIContext（mediaserverd 没有 GPU 上下文）
         @try {
@@ -817,6 +826,12 @@ static void vcam_gpu_log(NSString *msg) {
         // 替换画面中断黑屏), 且 staging 被别的流重建导致本流缩放复用失效
         NSString *poolKey = [NSString stringWithFormat:@"%zu_%zu_%u", dstW, dstH, (unsigned)dstFormat];
 
+        // 失败熔断: 该流组合 VT 不支持(如 328x184 '18f0' 分析流) → 直接放弃替换。
+        // 高频流上反复尝试+重建 session 会造成 wakeups 风暴 → mediaserverd 被杀
+        if ([_twoStepDisabledPool[poolKey] boolValue]) {
+            return NO;
+        }
+
         // staging: 目标尺寸 BGRA 中转(每流独立, 池持有引用)
         CVPixelBufferRef staging = NULL;
         NSValue *sv = _twoStepStagingPool[poolKey];
@@ -845,20 +860,30 @@ static void vcam_gpu_log(NSString *msg) {
         }
 
         // 步骤2: 同尺寸 BGRA → 私有格式(per-key session)。
-        // 失败自愈: -12905 等 pipeline 状态错误 → 重建该流 session 重试一次
-        // (否则该流持续失败, writeFrame NO → 画面持续黑屏)
+        // 失败处理: 计数 + 熔断(不做高频 session 重建 —— 328x184 '18f0' 分析流场景
+        // 曾每秒 rebuild 8 次 → wakeups 风暴 → mediaserverd 被杀死循环)
         VTPixelTransferSessionRef s2 = [self twoStepSessionForKey:poolKey];
         OSStatus st2 = s2 ? VTPixelTransferSessionTransferImage(s2, staging, dst) : -1;
         if (st2 != noErr) {
-            vcam_gpu_log([NSString stringWithFormat:@"[vcam] 2step stage2 failed: %d key=%@ (rebuild session)", (int)st2, poolKey]);
-            [self invalidateTwoStepSessionForKey:poolKey];
-            s2 = [self twoStepSessionForKey:poolKey];
-            st2 = s2 ? VTPixelTransferSessionTransferImage(s2, staging, dst) : -1;
-            if (st2 != noErr) {
-                vcam_gpu_log([NSString stringWithFormat:@"[vcam] 2step stage2 retry failed: %d key=%@", (int)st2, poolKey]);
-                return NO;
+            NSInteger fails = [_twoStepFailCountPool[poolKey] integerValue] + 1;
+            _twoStepFailCountPool[poolKey] = @(fails);
+            if (fails >= 2) {
+                // 熔断: 该流组合确认不支持, 释放该流 session/staging, 之后永久跳过
+                _twoStepDisabledPool[poolKey] = @YES;
+                [self invalidateTwoStepSessionForKey:poolKey];
+                NSValue *stv = _twoStepStagingPool[poolKey];
+                if (stv) {
+                    CVPixelBufferRef b = (CVPixelBufferRef)[stv pointerValue];
+                    if (b) CVPixelBufferRelease(b);
+                    [_twoStepStagingPool removeObjectForKey:poolKey];
+                }
+                vcam_gpu_log([NSString stringWithFormat:@"[vcam] 2step CIRCUIT-BROKEN for stream %@ (unsupported combo, keep camera frame)", poolKey]);
+            } else {
+                vcam_gpu_log([NSString stringWithFormat:@"[vcam] 2step stage2 failed: %d key=%@ (fail %ld)", (int)st2, poolKey, (long)fails]);
             }
+            return NO;
         }
+        _twoStepFailCountPool[poolKey] = @0;
         return YES;
     }
 
