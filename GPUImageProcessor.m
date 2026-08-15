@@ -46,14 +46,14 @@ static void vcam_gpu_log(NSString *msg) {
 @property (nonatomic, assign) VTPixelTransferSessionRef yuvTransferSession;        // render 线程: 420v/420f 目标专用
 @property (nonatomic, assign) VTPixelTransferSessionRef privateTransferSession;    // render 线程: 私有格式目标专用(base, 隔离状态)
 @property (nonatomic, assign) VTPixelTransferSessionRef prerenderTransferSession;  // 预渲染线程专用
-// 私有格式两步法中转 buffer(目标尺寸 BGRA, renderLock 内专用)
-@property (nonatomic, assign) CVPixelBufferRef privateStagingBuffer;
-@property (nonatomic, assign) size_t privateStagingW;
-@property (nonatomic, assign) size_t privateStagingH;
-// staging 缩放复用: 记录 staging 内容对应的源帧代数与源尺寸(同帧重复渲染跳过缩放)
-@property (nonatomic, assign) uint64_t privateStagingToken;
-@property (nonatomic, assign) size_t privateStagingSrcW;
-@property (nonatomic, assign) size_t privateStagingSrcH;
+// 私有格式两步法中转: 已迁移到下方 per-key 池(2026-08-15), 旧单例字段移除
+// 两步法按流池化(2026-08-15): 相机多条流(预览/照片/录像)目标尺寸各异,
+// 共用一个 session/staging 交替不同尺寸 → VT 内部 pipeline 状态污染 → 偶发
+// -12905 → writeFrame NO → 替换画面中断(黑屏/闪回相机)。
+// session/staging/token 按 "dstW_dstH_fmt" 独立, 各流互不干扰
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSValue *> *twoStepSessionPool;    // key -> session 指针
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSValue *> *twoStepStagingPool;    // key -> CVPixelBufferRef 指针(池持有引用)
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *twoStepTokenPool;     // key -> staging 内容帧代数
 @property (nonatomic, assign) VTPixelRotationSessionRef pixelRotationSession;
 // render 路径专用旋转 session（非线程安全: 预渲染线程与 render 线程并发用同一 session 会崩溃）
 @property (nonatomic, assign) VTPixelRotationSessionRef renderRotationSession;
@@ -109,6 +109,9 @@ static void vcam_gpu_log(NSString *msg) {
         _prerenderTransferSession = NULL;
         _pixelRotationSession = NULL;
         _bgraBufferPoolMap = [[NSMutableDictionary alloc] init];
+        _twoStepSessionPool = [[NSMutableDictionary alloc] init];
+        _twoStepStagingPool = [[NSMutableDictionary alloc] init];
+        _twoStepTokenPool = [[NSMutableDictionary alloc] init];
 
         // 软件渲染 CIContext（mediaserverd 没有 GPU 上下文）
         @try {
@@ -149,6 +152,21 @@ static void vcam_gpu_log(NSString *msg) {
     if (_privateTransferSession) {
         InvalidateFunc invalidate = (InvalidateFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionInvalidate");
         if (invalidate) invalidate(_privateTransferSession);
+    }
+    // 释放两步法池(per-key session + staging buffer)
+    {
+        InvalidateFunc invalidate = (InvalidateFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionInvalidate");
+        for (NSValue *v in _twoStepSessionPool.allValues) {
+            VTPixelTransferSessionRef s = (VTPixelTransferSessionRef)[v pointerValue];
+            if (s && invalidate) invalidate(s);
+        }
+        for (NSValue *v in _twoStepStagingPool.allValues) {
+            CVPixelBufferRef b = (CVPixelBufferRef)[v pointerValue];
+            if (b) CVPixelBufferRelease(b);
+        }
+        [_twoStepSessionPool removeAllObjects];
+        [_twoStepStagingPool removeAllObjects];
+        [_twoStepTokenPool removeAllObjects];
     }
     // 释放旋转 session 与自适应旋转缓存
     {
@@ -227,6 +245,33 @@ static void vcam_gpu_log(NSString *msg) {
     } else {
         vcam_gpu_log([NSString stringWithFormat:@"[vcam] Failed to create private session: %d", (int)status]);
     }
+}
+
+// 两步法 per-key session 存取(renderLock 内调用, 无并发)
+- (VTPixelTransferSessionRef)twoStepSessionForKey:(NSString *)key {
+    NSValue *v = _twoStepSessionPool[key];
+    if (v) return (VTPixelTransferSessionRef)[v pointerValue];
+    VTPixelTransferSessionRef s = NULL;
+    if (VTPixelTransferSessionCreate(kCFAllocatorDefault, &s) == noErr && s) {
+        VTSessionSetProperty(s, CFSTR("ScalingMode"), CFSTR("Trim"));
+        _twoStepSessionPool[key] = [NSValue valueWithPointer:s];
+        return s;
+    }
+    vcam_gpu_log([NSString stringWithFormat:@"[vcam] failed to create 2step session for %@", key]);
+    return NULL;
+}
+
+- (void)invalidateTwoStepSessionForKey:(NSString *)key {
+    NSValue *v = _twoStepSessionPool[key];
+    if (!v) return;
+    VTPixelTransferSessionRef s = (VTPixelTransferSessionRef)[v pointerValue];
+    if (s) {
+        void (*invalidate)(VTPixelTransferSessionRef) =
+            (void (*)(VTPixelTransferSessionRef))dlsym(RTLD_DEFAULT, "VTPixelTransferSessionInvalidate");
+        if (invalidate) invalidate(s);
+    }
+    [_twoStepSessionPool removeObjectForKey:key];
+    // session 重建后 staging 内容仍有效(纯格式转换), token 保留以继续复用缩放
 }
 
 - (void)setupPixelRotationSession {
@@ -767,41 +812,52 @@ static void vcam_gpu_log(NSString *msg) {
     BOOL sameSize = (srcW == dstW && srcH == dstH);
 
     if (isPrivate && !sameSize) {
-        // 两步法: 中转 BGRA 按目标尺寸缓存复用(renderLock 内调用, 无并发)
-        if (!_privateStagingBuffer ||
-            _privateStagingW != dstW || _privateStagingH != dstH) {
-            if (_privateStagingBuffer) CVPixelBufferRelease(_privateStagingBuffer);
-            _privateStagingBuffer = [self createBufferWithWidth:dstW height:dstH format:kCVPixelFormatType_32BGRA];
-            _privateStagingW = dstW;
-            _privateStagingH = dstH;
-            _privateStagingToken = 0;  // 尺寸重建 → 缩放结果失效
-        }
-        if (!_privateStagingBuffer) return NO;
+        // 两步法按流池化: key = 目标尺寸+格式。相机多流(预览/照片/录像)各自独立的
+        // session/staging/token —— 共用单例会交替尺寸污染 VT 内部 pipeline(偶发 -12905,
+        // 替换画面中断黑屏), 且 staging 被别的流重建导致本流缩放复用失效
+        NSString *poolKey = [NSString stringWithFormat:@"%zu_%zu_%u", dstW, dstH, (unsigned)dstFormat];
 
-        // 缩放复用(性能优化): 同一源帧(frameToken 未变)已缩放到同尺寸 staging 时
-        // 跳过步骤1 —— 同帧被相机多条流(预览/照片/录像)重复渲染, 缩放只做一次
-        BOOL stagingFresh = (_privateStagingToken == self.frameToken &&
-                             _privateStagingSrcW == srcW && _privateStagingSrcH == srcH);
+        // staging: 目标尺寸 BGRA 中转(每流独立, 池持有引用)
+        CVPixelBufferRef staging = NULL;
+        NSValue *sv = _twoStepStagingPool[poolKey];
+        if (sv) staging = (CVPixelBufferRef)[sv pointerValue];
+        if (!staging) {
+            staging = [self createBufferWithWidth:dstW height:dstH format:kCVPixelFormatType_32BGRA];
+            if (!staging) return NO;
+            _twoStepStagingPool[poolKey] = [NSValue valueWithPointer:staging];  // 所有权归池
+            vcam_gpu_log([NSString stringWithFormat:@"[vcam] 2step staging created for stream %@", poolKey]);
+        }
+
+        // 缩放复用: 同一源帧(frameToken 未变)同流已缩放 → 跳过步骤1
+        uint64_t tok = self.frameToken;
+        NSNumber *cachedTok = _twoStepTokenPool[poolKey];
+        BOOL stagingFresh = (cachedTok && [cachedTok unsignedLongLongValue] == tok);
         if (!stagingFresh) {
-            // 步骤1: 缩放到目标尺寸 BGRA(bgra 专用 session, Trim crop fill)
-            if (!_bgraTransferSession) [self setupBGRATransferSession];
-            OSStatus st1 = _bgraTransferSession ?
-                VTPixelTransferSessionTransferImage(_bgraTransferSession, src, _privateStagingBuffer) : -1;
+            // 步骤1: 缩放到目标尺寸 BGRA(per-key session, Trim crop fill)
+            VTPixelTransferSessionRef s1 = [self twoStepSessionForKey:poolKey];
+            if (!s1) return NO;
+            OSStatus st1 = VTPixelTransferSessionTransferImage(s1, src, staging);
             if (st1 != noErr) {
-                vcam_gpu_log([NSString stringWithFormat:@"[vcam] 2step stage1 failed: %d", (int)st1]);
+                vcam_gpu_log([NSString stringWithFormat:@"[vcam] 2step stage1 failed: %d key=%@", (int)st1, poolKey]);
                 return NO;
             }
-            _privateStagingToken = self.frameToken;
-            _privateStagingSrcW = srcW;
-            _privateStagingSrcH = srcH;
+            _twoStepTokenPool[poolKey] = @(tok);
         }
-        // 步骤2: 同尺寸 BGRA → 私有格式
-        if (!_privateTransferSession) [self setupPrivateTransferSession];
-        OSStatus st2 = _privateTransferSession ?
-            VTPixelTransferSessionTransferImage(_privateTransferSession, _privateStagingBuffer, dst) : -1;
+
+        // 步骤2: 同尺寸 BGRA → 私有格式(per-key session)。
+        // 失败自愈: -12905 等 pipeline 状态错误 → 重建该流 session 重试一次
+        // (否则该流持续失败, writeFrame NO → 画面持续黑屏)
+        VTPixelTransferSessionRef s2 = [self twoStepSessionForKey:poolKey];
+        OSStatus st2 = s2 ? VTPixelTransferSessionTransferImage(s2, staging, dst) : -1;
         if (st2 != noErr) {
-            vcam_gpu_log([NSString stringWithFormat:@"[vcam] 2step stage2 failed: %d", (int)st2]);
-            return NO;
+            vcam_gpu_log([NSString stringWithFormat:@"[vcam] 2step stage2 failed: %d key=%@ (rebuild session)", (int)st2, poolKey]);
+            [self invalidateTwoStepSessionForKey:poolKey];
+            s2 = [self twoStepSessionForKey:poolKey];
+            st2 = s2 ? VTPixelTransferSessionTransferImage(s2, staging, dst) : -1;
+            if (st2 != noErr) {
+                vcam_gpu_log([NSString stringWithFormat:@"[vcam] 2step stage2 retry failed: %d key=%@", (int)st2, poolKey]);
+                return NO;
+            }
         }
         return YES;
     }

@@ -81,9 +81,11 @@ static void vcam_core_log(NSString *msg) {
     self = [super init];
     if (self) {
         _prerenderQueue = dispatch_queue_create("com.vcam.processing", DISPATCH_QUEUE_SERIAL);
-        // 预渲染绑定 Utility 优先级: 让位给 render 线程(相机回调), 预览流畅度优先
+        // 预渲染 Default 优先级(2026-08-15 从 Utility 提级): Utility 下大帧 VT 旋转
+        // (1244x1660 420f ~3MB)跟不上 24fps 节拍 → 实测 fps 波动 20.7~28 → 卡顿观感。
+        // Default 与 render(UserInteractive) 仍有差距, 争抢时 render 优先, 但不至饿死
         dispatch_set_target_queue(_prerenderQueue,
-                                  dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+                                  dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0));
         _processingQueue = dispatch_queue_create("com.vcam.processing.bg", DISPATCH_QUEUE_SERIAL);
         _processLock = [[NSLock alloc] init];
         _renderLock = [[NSLock alloc] init];
@@ -604,16 +606,18 @@ static void vcam_core_log(NSString *msg) {
         [self startPrerenderThread];
         vcam_core_log(@"[vcam] Live state changed to: enabled");
     } else {
-        // enable→disable: 停止解码
+        // enable→disable: 停止解码/预渲染, 但保留帧缓存(_liveYUV/_fallback)。
+        // _enabled=NO 时 render 直接 return → 相机真实画面自然恢复, 语义不变;
+        // 而下次 enable 时异步加载视频需要 0.5~4s(轨道解析+预解码), 期间
+        // render NO frame → 若缓存被清则黑屏。保留缓存 → 冻结上一帧画面平滑过渡
         [self stopPrerenderThread];
         [_videoPlayer stopDecodingThread];
         [_videoPlayer stopWatchingFile];
-        [self clearReplacementFrame];
 
         [_processLock lock];
         _enabled = NO;
         [_processLock unlock];
-        vcam_core_log(@"[vcam] Live state changed to: disabled");
+        vcam_core_log(@"[vcam] Live state changed to: disabled (frame cache kept)");
         [[VCamNotify sharedInstance] postNotification:VCamNotifyLiveChanged];
     }
 }

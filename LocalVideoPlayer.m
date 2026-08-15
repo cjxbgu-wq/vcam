@@ -407,9 +407,10 @@ static void vcam_player_log(NSString *msg) {
 
     _decodeThread = [[NSThread alloc] initWithTarget:self selector:@selector(decodeLoop) object:nil];
     _decodeThread.name = @"vcam.decoder";
-    // Utility 优先级: 解码让位给 render 线程(相机回调), 预览流畅度优先;
-    // 解码跟不上时预渲染消费式取帧自动降帧, 不阻塞 render
-    _decodeThread.qualityOfService = NSQualityOfServiceUtility;
+    // Default 优先级(2026-08-15 从 Utility 提级): Utility 下高负载时解码跟不上
+    // 24fps → 队列断供 → 预渲染冻结旧帧 → 画面停顿卡顿。Default 保证持续供给,
+    // 仍低于 render(UserInteractive), 争抢时预览优先
+    _decodeThread.qualityOfService = NSQualityOfServiceDefault;
     [_decodeThread start];
     vcam_player_log(@"[vcam] Decoding thread started");
 }
