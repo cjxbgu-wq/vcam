@@ -32,6 +32,44 @@ static void vcam_core_log(NSString *msg) {
     } @catch (NSException *e) {}
 }
 
+// 行级像素拷贝(性能优化): 同格式同尺寸 buffer 间按各自 bpr 逐行 memcpy,
+// 兼容 planar 多平面与 tiled 布局(整行原始字节拷贝, 布局逐字节保留)。
+// 用于渲染缓存命中路径(~0.5ms) 代替 VT 旋转+两步转换(5-15ms)。
+static void vcamCopyPixelRows(CVPixelBufferRef src, CVPixelBufferRef dst) {
+    if (!src || !dst) return;
+    CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+    CVPixelBufferLockBaseAddress(dst, 0);
+    size_t planes = CVPixelBufferGetPlaneCount(src);
+    if (planes == 0) {
+        uint8_t *s = (uint8_t *)CVPixelBufferGetBaseAddress(src);
+        uint8_t *d = (uint8_t *)CVPixelBufferGetBaseAddress(dst);
+        if (s && d) {
+            size_t sbpr = CVPixelBufferGetBytesPerRow(src);
+            size_t dbpr = CVPixelBufferGetBytesPerRow(dst);
+            size_t rows = CVPixelBufferGetHeight(src);
+            size_t rowBytes = MIN(sbpr, dbpr);
+            for (size_t y = 0; y < rows; y++) {
+                memcpy(d + y * dbpr, s + y * sbpr, rowBytes);
+            }
+        }
+    } else {
+        for (size_t p = 0; p < planes; p++) {
+            uint8_t *s = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(src, p);
+            uint8_t *d = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(dst, p);
+            if (!s || !d) continue;
+            size_t sbpr = CVPixelBufferGetBytesPerRowOfPlane(src, p);
+            size_t dbpr = CVPixelBufferGetBytesPerRowOfPlane(dst, p);
+            size_t rows = CVPixelBufferGetHeightOfPlane(src, p);
+            size_t rowBytes = MIN(sbpr, dbpr);
+            for (size_t y = 0; y < rows; y++) {
+                memcpy(d + y * dbpr, s + y * sbpr, rowBytes);
+            }
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(dst, 0);
+    CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+}
+
 @interface VCamCore ()
 @property (nonatomic, strong) dispatch_source_t pollingTimer;
 @property (nonatomic, assign) BOOL pollingActive;
@@ -50,8 +88,28 @@ static void vcam_core_log(NSString *msg) {
 @property (nonatomic, assign) size_t fallbackWidth;
 @property (nonatomic, assign) size_t fallbackHeight;
 // 同帧去重(对齐千面 _0x78/_0x70): 管线同一物理 buffer 连续经过多个消费者,
-// 第一次已就地改写, 后续直接跳过(不 retain, 仅指针比较)
+// 第一次已改写, 后续直接跳过(不 retain, 仅指针比较)
 @property (nonatomic, assign) CVPixelBufferRef dedupLastBuffer;
+
+// ===== 性能优化(2026-08-15) =====
+// 进程标记: 只有 mediaserverd 真正解码/预渲染; SpringBoard 的 VCamCore 只做状态记录,
+// 否则 SB 进程白白解码整个视频(30fps 解码+转换) → 桌面卡顿/按钮迟钝
+@property (nonatomic, assign) BOOL isMediaserverdProcess;
+// 预渲染代数: 每存入新帧 +1。render 端发现代数未变(视频 30fps vs 相机 30-60fps,
+// 同一源帧被多条流重复渲染)时直接 memcpy 渲染缓存, 跳过 VT 旋转+两步转换(5-15ms → ~0.5ms)
+@property (nonatomic, assign) uint64_t liveFrameGen;
+// 渲染结果缓存(renderLock 内访问): (gen, w, h, fmt, rotation, mirror) 全命中时行拷贝输出
+@property (nonatomic, assign) CVPixelBufferRef renderCacheBuffer;
+@property (nonatomic, assign) uint64_t renderCacheGen;
+@property (nonatomic, assign) size_t renderCacheW;
+@property (nonatomic, assign) size_t renderCacheH;
+@property (nonatomic, assign) OSType renderCacheFmt;
+@property (nonatomic, assign) int renderCacheRot;
+@property (nonatomic, assign) BOOL renderCacheMirror;
+// 预渲染重复源跳过: 无新帧入队(解码计数未变)且旋转/镜像未变时, 跳过重复的旋转+格式转换
+@property (nonatomic, assign) uint64_t lastPrerenderSrcGen;
+@property (nonatomic, assign) int lastPrerenderRot;
+@property (nonatomic, assign) BOOL lastPrerenderMirror;
 @end
 
 @implementation VCamCore
@@ -121,6 +179,7 @@ static void vcam_core_log(NSString *msg) {
 
 - (void)initializeInMediaserverd {
     vcam_core_log(@"[vcam] Initializing in mediaserverd...");
+    _isMediaserverdProcess = YES;  // 只有本进程真正解码/预渲染
     // mediaserverd 中用 plist 轮询（Darwin 通知不安全）
     [self startStatePolling];
     vcam_core_log(@"[vcam] MediaServerd hooks initialized");
@@ -156,7 +215,39 @@ static void vcam_core_log(NSString *msg) {
     if (bgra) CVPixelBufferRetain(bgra);
     CVPixelBufferRef yuv = _liveYUVPixelBuffer;
     if (yuv) CVPixelBufferRetain(yuv);
+    uint64_t gen = _liveFrameGen;
     [_processLock unlock];
+
+    // ===== 渲染缓存快路径(性能优化) =====
+    // 视频按源帧率(如30fps)出新帧, 相机多条流(预览|30-60fps + 照片流 + 录像流)以更高
+    // 频率取帧: 同一源帧(gen 未变)被重复渲染时, 直接行拷贝上次的输出结果,
+    // 跳过 VT 旋转+两步格式转换(5-15ms → ~0.5ms), 大幅降低 mediaserverd CPU → 少掉帧。
+    // renderLock 内访问: 多 hook 线程(预览/照片/录像)并发时防止与缓存更新竞争撕裂
+    if (bgra || yuv) {
+        int curRot = _gpuProcessor.rotationAngle;
+        BOOL curMirror = _gpuProcessor.mirrored;
+        [_renderLock lock];
+        BOOL cacheHit = (_renderCacheBuffer &&
+                         gen == _renderCacheGen &&
+                         targetW == _renderCacheW && targetH == _renderCacheH &&
+                         origFormat == _renderCacheFmt &&
+                         curRot == _renderCacheRot && curMirror == _renderCacheMirror);
+        if (cacheHit) {
+            vcamCopyPixelRows(_renderCacheBuffer, pixelBuffer);
+        }
+        [_renderLock unlock];
+        if (cacheHit) {
+            _frameCount++;
+            static uint64_t cacheHits = 0;
+            cacheHits++;
+            if (diagThisFrame) {
+                vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d CACHED hit(%llu total) %zux%zu fmt=0x%x",
+                               vcamRenderCount, (unsigned long long)cacheHits, targetW, targetH, (unsigned)origFormat]);
+            }
+            _dedupLastBuffer = pixelBuffer;
+            return;
+        }
+    }
 
     if (!bgra && !yuv) {
         // 无帧回退(对齐千面 0xb018-0xb05c): 用上一帧缓存(目标尺寸匹配)填充,
@@ -217,6 +308,31 @@ static void vcam_core_log(NSString *msg) {
         CVPixelBufferRetain(_fallbackFrame);
         _fallbackWidth = targetW;
         _fallbackHeight = targetH;
+
+        // 渲染结果缓存更新: 把本次输出(pixelBuffer 已是成品)拷入缓存 buffer,
+        // 同 gen 的后续渲染直接 memcpy(缓存快路径)。缓存 buffer 创建失败(私有
+        // 格式受限)则标记 gen=0 使快路径永不命中, 走原 VT 全路径
+        if (!_renderCacheBuffer || _renderCacheW != targetW || _renderCacheH != targetH ||
+            _renderCacheFmt != origFormat) {
+            if (_renderCacheBuffer) CVPixelBufferRelease(_renderCacheBuffer);
+            _renderCacheBuffer = NULL;
+            // 注意: 不带 IOSurface 属性(mediaserverd 约束, NULL attributes 安全)
+            CVPixelBufferRef buf = NULL;
+            if (CVPixelBufferCreate(NULL, targetW, targetH, origFormat, NULL, &buf) == kCVReturnSuccess && buf) {
+                _renderCacheBuffer = buf;
+                _renderCacheW = targetW;
+                _renderCacheH = targetH;
+                _renderCacheFmt = origFormat;
+            } else {
+                _renderCacheGen = 0;  // 该格式无法自建缓存 → 禁用快路径
+            }
+        }
+        if (_renderCacheBuffer) {
+            vcamCopyPixelRows(pixelBuffer, _renderCacheBuffer);
+            _renderCacheGen = gen;
+            _renderCacheRot = _gpuProcessor.rotationAngle;
+            _renderCacheMirror = _gpuProcessor.mirrored;
+        }
         [_renderLock unlock];
         _dedupLastBuffer = pixelBuffer;
     } else if (diagThisFrame) {
@@ -463,6 +579,22 @@ static void vcam_core_log(NSString *msg) {
                     continue;
                 }
 
+                // 重复源跳过: 无新帧入队(frameCount 未变, 如解码间隙/暂停回退当前帧)且
+                // 旋转/镜像未变时, 上一拍已产出相同内容 → 跳过旋转+VT 转换(省 ~5-10ms/拍 CPU)
+                // (用解码器单调递增的 frameCount 判断, 不用指针: 解码器会回收复用 buffer 指针)
+                int curRot = strongSelf.gpuProcessor.rotationAngle;
+                BOOL curMirror = strongSelf.gpuProcessor.mirrored;
+                uint64_t curCount = strongSelf.videoPlayer.frameCount;
+                if (curCount == strongSelf->_lastPrerenderSrcGen &&
+                    curRot == strongSelf->_lastPrerenderRot &&
+                    curMirror == strongSelf->_lastPrerenderMirror) {
+                    CVPixelBufferRelease(frame);
+                    continue;
+                }
+                strongSelf->_lastPrerenderSrcGen = curCount;
+                strongSelf->_lastPrerenderRot = curRot;
+                strongSelf->_lastPrerenderMirror = curMirror;
+
                 // 1. 旋转/镜像（如需要, 视频原尺寸; 解码帧为 420f, 旋转保持 420f）
                 CVPixelBufferRef rotated = [strongSelf.gpuProcessor rotateAndMirrorIfNeeded:frame];
                 CVPixelBufferRelease(frame);
@@ -484,6 +616,7 @@ static void vcam_core_log(NSString *msg) {
                     }
                     strongSelf->_liveBGRAPixelBuffer = bgra;  // 所有权转移; 失败时保留旧 BGRA
                 }
+                strongSelf->_liveFrameGen++;  // render 端缓存失效信号: 新一帧已就绪
                 [strongSelf.processLock unlock];
 
                 renderedFrames++;
@@ -505,6 +638,13 @@ static void vcam_core_log(NSString *msg) {
 #pragma mark - 状态控制
 
 - (void)setEnabled:(BOOL)enabled {
+    // SpringBoard 进程守卫: SB 不解码视频(替换渲染在 mediaserverd), 只记录状态。
+    // 否则 SB 会启动解码线程+预渲染线程白白解码整个视频 → 桌面卡顿/悬浮窗按钮迟钝
+    if (!_isMediaserverdProcess) {
+        _enabled = enabled;
+        return;
+    }
+
     [_processLock lock];
     if (_enabled == enabled) {
         // enable→enable (no reload) / disable→disable (no action)
@@ -562,7 +702,9 @@ static void vcam_core_log(NSString *msg) {
     vcam_core_log(@"[vcam] State polling timer started");
 
     __weak typeof(self) weakSelf = self;
-    [[VCamNotify sharedInstance] startPollingWithInterval:1.0 callback:^(BOOL enabled) {
+    // 0.3s 轮询: 悬浮球按钮(转/镜/播/切源)生效延迟从最长 1s 降到 0.3s 内,
+    // 读取在后台 notify 队列, 不占主线程
+    [[VCamNotify sharedInstance] startPollingWithInterval:0.3 callback:^(BOOL enabled) {
         VCamCore *strongSelf = weakSelf;
         if (!strongSelf) return;
         static int vcamCorePollCount = 0;
@@ -578,10 +720,12 @@ static void vcam_core_log(NSString *msg) {
 
         // 旋转/镜像跨进程同步: 悬浮球(SpringBoard)写 vc.plist, mediaserverd 轮询应用
         // (对齐千面 vc.plist manualRotation 字段; rotationAngle!=0 时 render 不做自适应旋转)
+        // 性能: 一次读 plist 提取全部控制字段(原来 5 个字段各读一次文件 = 5x IO)
+        NSDictionary *pl = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath] ?: @{};
         static NSInteger lastSyncedRotation = -1;
         static BOOL lastSyncedMirrored = NO;
-        NSInteger plistRotation = [VCamNotify plistRotation];
-        BOOL plistMirrored = [VCamNotify plistMirrored];
+        NSInteger plistRotation = [pl[@"manualRotation"] integerValue];
+        BOOL plistMirrored = [pl[@"mirrored"] boolValue];
         if (plistRotation != lastSyncedRotation) {
             strongSelf.gpuProcessor.rotationAngle = (int)plistRotation;
             lastSyncedRotation = plistRotation;
@@ -594,10 +738,10 @@ static void vcam_core_log(NSString *msg) {
         }
 
         // 视频源切换(悬浮球 1/2/3 键): activePlaybackPath 变化 → 自动重载新视频
-        // (无需 toggle enabled, 轮询 1s 内生效; 路径写入由悬浮球完成)
+        // (无需 toggle enabled, 轮询 0.3s 内生效; 路径写入由悬浮球完成)
         static NSString *lastSyncedPath = nil;
         static BOOL pathSyncInit = NO;
-        NSString *activePath = [VCamNotify activePlaybackPath];
+        NSString *activePath = pl[@"activePlaybackPath"];
         if (activePath.length > 0 && ![activePath isEqualToString:lastSyncedPath]) {
             if (pathSyncInit && strongSelf.enabled) {
                 vcam_core_log([NSString stringWithFormat:
@@ -611,7 +755,7 @@ static void vcam_core_log(NSString *msg) {
 
         // 暂停/继续(悬浮球 ▶ 键): paused → 解码线程停止取帧, 预渲染冻结最后一帧
         static BOOL lastSyncedPaused = NO;
-        BOOL plistPaused = [VCamNotify plistPaused];
+        BOOL plistPaused = [pl[@"paused"] boolValue];
         if (plistPaused != lastSyncedPaused) {
             strongSelf.videoPlayer.paused = plistPaused;
             vcam_core_log([NSString stringWithFormat:@"[vcam] paused synced: %d", plistPaused]);
@@ -620,7 +764,7 @@ static void vcam_core_log(NSString *msg) {
 
         // 从头重播(悬浮球 播 键): restartToken 自增 → 重载当前视频回到开头
         static NSInteger lastRestartToken = -1;
-        NSInteger restartToken = [VCamNotify plistRestartToken];
+        NSInteger restartToken = [pl[@"restartToken"] integerValue];
         if (restartToken != lastRestartToken) {
             if (lastRestartToken >= 0 && strongSelf.enabled && strongSelf.videoPlayer.currentVideoPath.length > 0) {
                 vcam_core_log(@"[vcam] restart token bumped, replay from beginning");

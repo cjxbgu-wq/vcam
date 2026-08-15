@@ -379,6 +379,9 @@ static void vcam_player_log(NSString *msg) {
 
 - (void)decodeLoop {
     @autoreleasepool {
+        // 绝对时间节拍器(与预渲染线程一致): nextTick += interval 累计节拍,
+        // 消除"解码耗时+sleep"逐帧累加导致的实际帧率偏低 → 预渲染队列断供 → 卡顿掉帧
+        CFAbsoluteTime nextTick = CFAbsoluteTimeGetCurrent();
         while (_shouldDecode && !_decodeThread.cancelled) {
             @autoreleasepool {
                 if (_mediaType == VCamMediaTypeImage) {
@@ -387,9 +390,11 @@ static void vcam_player_log(NSString *msg) {
                     continue;
                 }
 
-                // 暂停: 停止取新帧, 帧队列不再进帧, 预渲染回退 copyCurrentFrame 冻结画面
+                // 暂停: 停止取新帧, 帧队列不再进帧, 预渲染回退 copyCurrentFrame 冻结画面;
+                // 同时重置节拍基线, 恢复播放时不追帧(不快进)
                 if (_paused) {
                     [NSThread sleepForTimeInterval:0.05];
+                    nextTick = CFAbsoluteTimeGetCurrent();
                     continue;
                 }
 
@@ -399,17 +404,25 @@ static void vcam_player_log(NSString *msg) {
                     [_frameQueue enqueuePixelBuffer:buffer];
                     CVPixelBufferRelease(buffer);  // 队列已 retain
                     _frameCount++;
-                    // 按视频帧率控制解码速度, 避免加速播放(参考逆向: 按时间戳输出帧)
+                    // 按视频帧率绝对节拍输出(参考逆向: 按时间戳输出帧)
                     double frameInterval = (_videoFps > 1.0) ? (1.0 / _videoFps) : (1.0 / 30.0);
-                    [NSThread sleepForTimeInterval:frameInterval];
+                    nextTick += frameInterval;
+                    double wait = nextTick - CFAbsoluteTimeGetCurrent();
+                    if (wait > 0.001) {
+                        [NSThread sleepForTimeInterval:wait];
+                    } else {
+                        nextTick = CFAbsoluteTimeGetCurrent();  // 解码耗时超帧间隔, 重置基线防追帧爆发
+                    }
                 } else {
-                    // 没有读到帧，短暂休眠避免忙等
+                    // 没有读到帧，短暂休眠避免忙等; 重置基线避免恢复后爆发
                     [NSThread sleepForTimeInterval:0.005];
+                    nextTick = CFAbsoluteTimeGetCurrent();
                 }
 
                 // 控制队列大小，避免内存占用过高
                 if (_frameQueue.count > _frameQueue.capacity) {
                     [NSThread sleepForTimeInterval:0.01];
+                    nextTick = CFAbsoluteTimeGetCurrent();
                 }
             }
         }

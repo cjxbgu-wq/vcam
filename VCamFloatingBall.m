@@ -253,7 +253,22 @@ static void vcam_ball_log(NSString *msg) {
     btn.layer.cornerRadius = 9;
     btn.layer.masksToBounds = YES;
     [btn addTarget:self action:sel forControlEvents:UIControlEventTouchUpInside];
+    // 即时按压反馈: 按下高亮, 抬起/取消立即恢复 —— 按钮零延迟"有反应"的手感
+    [btn addTarget:self action:@selector(buttonTouchDown:) forControlEvents:UIControlEventTouchDown];
+    [btn addTarget:self action:@selector(buttonTouchUp:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
     return btn;
+}
+
+- (void)buttonTouchDown:(UIButton *)sender {
+    [UIView animateWithDuration:0.05 animations:^{
+        sender.backgroundColor = [UIColor colorWithRed:0.62 green:0.63 blue:0.66 alpha:1.0];
+    }];
+}
+
+- (void)buttonTouchUp:(UIButton *)sender {
+    [UIView animateWithDuration:0.12 animations:^{
+        sender.backgroundColor = [self vcButtonBgColor];
+    }];
 }
 
 #pragma mark - 面板创建（双页签 + 灰色主题, 紧凑尺寸）
