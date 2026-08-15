@@ -67,6 +67,18 @@ static void vcam_player_log(NSString *msg) {
 @property (nonatomic, strong) AVURLAsset *reusableAsset;
 @property (nonatomic, strong) AVAssetTrack *reusableTrack;
 
+// 加载请求串行化(2026-08-16, mediaserverd SIGSEGV 崩溃循环根因修复):
+// 旧实现 loadVideoFile 在 processingQueue 上 stopDecodingThread 只等 1s 即放弃,
+// 解码线程可能仍阻塞在 copyNextSampleBuffer 内, 随后 _assetReader 被替换 →
+// 旧 reader 被 ARC 释放(仍被解码线程使用) → use-after-free → SIGSEGV →
+// mediaserverd 反复崩溃 → AVFoundation 内部状态损坏(CommonURLAsset 队列永久卡死)
+// → watchdog 60s kill → 180s userspace panic。
+// 修复: AVAssetReader/TrackOutput 的 create/read/cancel/release 全部归解码线程,
+// 外部线程只投递"待加载路径 + 代数", 解码线程检测代数变化后自行重建 reader。
+@property (nonatomic, assign) volatile int64_t requestedLoadGen;
+@property (nonatomic, assign) volatile int64_t appliedLoadGen;
+@property (nonatomic, copy) NSString *pendingPath;
+
 // 解码线程控制
 @property (nonatomic, assign) BOOL shouldDecode;
 @property (nonatomic, strong) NSThread *decodeThread;
@@ -83,8 +95,8 @@ static void vcam_player_log(NSString *msg) {
         _frameQueue = [[NSQueue alloc] initWithCapacity:capacity pixelBufferMode:YES];
         _decodeQueue = dispatch_queue_create("com.vcam.videoreader", DISPATCH_QUEUE_SERIAL);
         _processingQueue = dispatch_queue_create("com.vcam.decoder", DISPATCH_QUEUE_SERIAL);
-        _preprocessContext = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @YES}];
-        _gpuProcessor = [[GPUImageProcessor alloc] init];
+        // gpuProcessor/preprocessContext 不再本地创建(2026-08-16): 从未使用,
+        // 每进程白创建 4 transfer + 2 rotation session 和 CIContext(VCamCore 会注入自己的实例)
         _preloadCache = [[NSMutableArray alloc] init];
         _preloadInfo = [[NSMutableDictionary alloc] init];
         _stateLock = [[NSLock alloc] init];
@@ -170,10 +182,6 @@ static void vcam_player_log(NSString *msg) {
 - (void)loadVideoFile:(NSString *)path completion:(void(^)(BOOL success, NSError *error))completion {
     vcam_player_log([NSString stringWithFormat:@"[vcam] Loading video: %@", path]);
 
-    // 停止之前的解码
-    [self stopDecodingThread];
-    [self clearFrameQueue];
-
     NSURL *url = [NSURL fileURLWithPath:path];
     _currentVideoPath = path;
     _mediaType = VCamMediaTypeVideo;
@@ -227,12 +235,36 @@ static void vcam_player_log(NSString *msg) {
     vcam_player_log([NSString stringWithFormat:@"[vcam] Video loaded: %@ (%.0fx%.0f @ %.1ffps, %.1fs, preferredRot=%d)",
                      path, (double)_videoWidth, (double)_videoHeight, _videoFps, _videoDuration, _preferredRotation]);
 
-    // 创建 AVAssetReader
+    // reader 重建投递解码线程(2026-08-16 线程安全修复): 本线程不触碰
+    // _assetReader/_videoOutput(解码线程可能正阻塞在 copyNextSampleBuffer 内,
+    // 此处替换会 free 正在使用的 reader → SIGSEGV)。参数(width/height/track/asset)
+    // 已在代数自增前全部写完, 解码线程检测代数变化后用新参数自行重建。
+    _pendingPath = [path copy];
+    __sync_add_and_fetch(&_requestedLoadGen, 1);
+
+    // 确保解码线程在跑(已在跑则 no-op), 连点合并: 代数只增, 解码线程只应用最新
+    [self startDecodingThread];
+
+    if (completion) completion(YES, nil);
+}
+
+// 解码线程内重建 reader(仅 decodeLoop 调用 —— reader 生命周期单线程持有,
+// create/read/cancel/release 全在此线程, 无 use-after-free 可能)
+- (void)rebuildReaderOnDecodeThread {
+    if (!_urlAsset || !_videoTrack) return;
+
+    // 释放旧 reader(同线程, 安全)
+    if (_assetReader) {
+        [_assetReader cancelReading];
+        _assetReader = nil;
+    }
+    _videoOutput = nil;
+    [self clearFrameQueue];
+
     NSError *readerErr = nil;
     _assetReader = [[AVAssetReader alloc] initWithAsset:_urlAsset error:&readerErr];
     if (readerErr || !_assetReader) {
         vcam_player_log([NSString stringWithFormat:@"[vcam] Failed to create asset reader: %@", readerErr]);
-        if (completion) completion(NO, readerErr);
         return;
     }
 
@@ -249,24 +281,31 @@ static void vcam_player_log(NSString *msg) {
 
     if (![_assetReader canAddOutput:_videoOutput]) {
         vcam_player_log(@"[vcam] Cannot add video output");
-        if (completion) completion(NO, [NSError errorWithDomain:@"VCam" code:5 userInfo:@{NSLocalizedDescriptionKey:@"Cannot add output"}]);
+        _assetReader = nil;
+        _videoOutput = nil;
         return;
     }
     [_assetReader addOutput:_videoOutput];
 
     if (![_assetReader startReading]) {
         vcam_player_log([NSString stringWithFormat:@"[vcam] Failed to start reading: %@", _assetReader.error]);
-        if (completion) completion(NO, _assetReader.error);
+        [_assetReader cancelReading];
+        _assetReader = nil;
+        _videoOutput = nil;
         return;
     }
 
-    // 预填充帧队列
-    [self prefillFrameQueue];
-
-    // 启动解码线程
-    [self startDecodingThread];
-
-    if (completion) completion(YES, nil);
+    // 预填几帧(等价旧 prefillFrameQueue, 但在解码线程 —— reader 单线程持有)
+    NSUInteger prefilled = 0;
+    while (prefilled < 5 && prefilled < _frameQueue.capacity) {
+        CVPixelBufferRef b = [self readNextFrame];
+        if (!b) break;
+        [_frameQueue enqueuePixelBuffer:b];
+        CVPixelBufferRelease(b);
+        prefilled++;
+    }
+    vcam_player_log([NSString stringWithFormat:@"[vcam] Reader rebuilt on decode thread: %@ (prefilled %lu frames, gen=%lld)",
+                     _pendingPath.lastPathComponent, (unsigned long)prefilled, (long long)_appliedLoadGen]);
 }
 
 - (void)loadImageFile:(NSString *)path completion:(void(^)(BOOL success, NSError *error))completion {
@@ -337,25 +376,7 @@ static void vcam_player_log(NSString *msg) {
     if (completion) completion(YES, nil);
 }
 
-#pragma mark - 预填充帧队列
-
-- (void)prefillFrameQueue {
-    if (_mediaType != VCamMediaTypeVideo) return;
-
-    vcam_player_log(@"[vcam] Prefilling frame queue...");
-    NSUInteger count = 0;
-    NSUInteger targetCount = MIN(5, _frameQueue.capacity);
-
-    for (NSUInteger i = 0; i < targetCount; i++) {
-        CVPixelBufferRef buffer = [self readNextFrame];
-        if (!buffer) break;
-        [_frameQueue enqueuePixelBuffer:buffer];
-        CVPixelBufferRelease(buffer);  // 队列已 retain
-        count++;
-    }
-
-    vcam_player_log([NSString stringWithFormat:@"[vcam] Frame queue prefilled with %lu frames", (unsigned long)count]);
-}
+#pragma mark - 帧读取（仅解码线程调用）
 
 - (CVPixelBufferRef)readNextFrame CF_RETURNS_RETAINED {
     if (!_videoOutput || _assetReader.status != AVAssetReaderStatusReading) {
@@ -427,7 +448,10 @@ static void vcam_player_log(NSString *msg) {
 #pragma mark - 解码线程
 
 - (void)startDecodingThread {
-    if (_isDecoding) return;
+    // 常驻线程(2026-08-16): 只创建一次, 不再启停 —— stop/start 交替存在竞争窗口
+    // (stop 1s 超时放弃后旧线程可能仍在 copyNextSampleBuffer 内, 此时 start 新线程
+    // → 双 decodeLoop 并发触碰 reader)。disable 仅置 _shouldDecode=NO 空转睡眠。
+    if (_decodeThread && _isDecoding) return;
     _shouldDecode = YES;
     _isDecoding = YES;
 
@@ -437,22 +461,15 @@ static void vcam_player_log(NSString *msg) {
     // 否则 AURemoteIO RPCTimeout → mediaserverd 被杀 → 全部相机黑屏(死循环重启)
     _decodeThread.qualityOfService = NSQualityOfServiceUtility;
     [_decodeThread start];
-    vcam_player_log(@"[vcam] Decoding thread started");
+    vcam_player_log(@"[vcam] Decoding thread started (persistent)");
 }
 
 - (void)stopDecodingThread {
+    // 常驻线程配套(2026-08-16): 不 cancel/join 线程, 只置停止位。
+    // decodeLoop 空转 0.1s 睡眠; reader 不在此动(归解码线程, 由下次 enable 的
+    // gen 变化或线程退出统一清理), 消除跨线程触碰 reader 的一切路径
     _shouldDecode = NO;
-    if (_decodeThread) {
-        [_decodeThread cancel];
-        // 等待线程退出（最多 1 秒）
-        NSDate *timeout = [NSDate dateWithTimeIntervalSinceNow:1.0];
-        while (_decodeThread.isExecuting && [timeout timeIntervalSinceNow] > 0) {
-            [NSThread sleepForTimeInterval:0.01];
-        }
-        _decodeThread = nil;
-    }
-    _isDecoding = NO;
-    vcam_player_log(@"[vcam] Decoding thread stopped");
+    vcam_player_log(@"[vcam] Decoding paused (thread persistent)");
 }
 
 - (void)decodeLoop {
@@ -460,8 +477,24 @@ static void vcam_player_log(NSString *msg) {
         // 绝对时间节拍器(与预渲染线程一致): nextTick += interval 累计节拍,
         // 消除"解码耗时+sleep"逐帧累加导致的实际帧率偏低 → 预渲染队列断供 → 卡顿掉帧
         CFAbsoluteTime nextTick = CFAbsoluteTimeGetCurrent();
-        while (_shouldDecode && !_decodeThread.cancelled) {
+        while (YES) {
             @autoreleasepool {
+                if (!_shouldDecode) {
+                    // disable: 空转等待(常驻线程约定, 不退出)
+                    [NSThread sleepForTimeInterval:0.1];
+                    continue;
+                }
+
+                // 加载代数变化 → 在本线程重建 reader(2026-08-16 线程安全修复:
+                // reader 的 create/read/cancel/release 全部归解码线程,
+                // 外部线程只投递代数, 消除切源/重播/enable 时的 use-after-free)
+                if (_requestedLoadGen != _appliedLoadGen) {
+                    _appliedLoadGen = _requestedLoadGen;
+                    if (_mediaType == VCamMediaTypeVideo) {
+                        [self rebuildReaderOnDecodeThread];
+                    }
+                }
+
                 if (_mediaType == VCamMediaTypeImage) {
                     // 图片模式：不需要持续解码，只保持缓存帧
                     [NSThread sleepForTimeInterval:0.1];
@@ -506,7 +539,6 @@ static void vcam_player_log(NSString *msg) {
             }
         }
     }
-    vcam_player_log(@"[vcam] Decoding loop exited");
 }
 
 #pragma mark - 帧获取
@@ -540,12 +572,17 @@ static void vcam_player_log(NSString *msg) {
     // 初始文件信息
     [self updateFileInfo];
 
-    // 注册 Darwin 通知监听（reload-media）
-    __weak typeof(self) weakSelf = self;
-    [[VCamNotify sharedInstance] registerForNotification:VCamNotifyReloadMedia callback:^(NSString *name) {
-        [weakSelf reloadMedia];
-    }];
-    vcam_player_log([NSString stringWithFormat:@"[vcam] Registered VCamNotify listener for reload-media"]);
+    // 注册 Darwin 通知监听（reload-media, 仅一次: registerForNotification 非幂等,
+    // 重复注册会累积回调 → reload 通知触发 N 次 reloadMedia)
+    static BOOL reloadListenerRegistered = NO;
+    if (!reloadListenerRegistered) {
+        reloadListenerRegistered = YES;
+        __weak typeof(self) weakSelf = self;
+        [[VCamNotify sharedInstance] registerForNotification:VCamNotifyReloadMedia callback:^(NSString *name) {
+            [weakSelf reloadMedia];
+        }];
+        vcam_player_log([NSString stringWithFormat:@"[vcam] Registered VCamNotify listener for reload-media"]);
+    }
 
     // 定时检查文件变化（每 2 秒）
     dispatch_queue_t watchQueue = dispatch_queue_create("com.vcam.filewatch", DISPATCH_QUEUE_SERIAL);

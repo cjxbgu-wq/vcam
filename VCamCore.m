@@ -194,9 +194,8 @@ static void vcam_core_log(NSString *msg) {
     if (yuv) CVPixelBufferRetain(yuv);
     uint64_t gen = _liveFrameGen;
     [_processLock unlock];
-    // 帧代数传给 GPU: 私有格式两步法的 staging 缩放按代数复用
-    // (同帧被相机多条流重复渲染时, 缩放只做一次 → render CPU 减半)
-    _gpuProcessor.frameToken = gen;
+    // 帧代数经 writeFrame:toPixelBuffer:token: 参数传递(不写 gpuProcessor 全局属性,
+    // 多 hook 线程并发 render 时全局赋值会互相覆盖导致 staging 误用别帧内容)
     CVPixelBufferRef bgra = NULL;
 
     // 注: 曾尝试渲染缓存(gen 相同则 memcpy 上次输出, 省 VT 转换) —— 已移除:
@@ -426,13 +425,13 @@ static void vcam_core_log(NSString *msg) {
     BOOL done = NO;
 
     // 路径1: VTPixelTransferSession（任意尺寸+格式组合, CropSourceToCleanAperture 自动 crop fill）
+    // 对齐千面(0xb0f8-0xb158): VT 是唯一路径, 失败直接保留相机帧 —— 千面无 CI 回退。
+    // (CI 软件渲染 12MP 照片帧需数秒且持 rotationRenderLock, 会饿死全部预览流的
+    //  自适应旋转 → 相机管线线程卡死 → mediaserverd watchdog 60s kill, 拍照黑屏根因)
     @try {
         if ([_gpuProcessor transferPixelBuffer:src toPixelBuffer:dst token:token]) {
             if (diag) {
                 vcam_core_log([NSString stringWithFormat:@"[vcam] write#%d VT ok", vcamWriteCount]);
-                // 像素级诊断: 转换前后 Y/G 采样对比(检测单次转换提亮) + attachments
-                [self dumpBufferDiagnostics:src label:@"src"];
-                [self dumpBufferDiagnostics:dst label:@"dst"];
             }
             done = YES;
         }
@@ -440,44 +439,7 @@ static void vcam_core_log(NSString *msg) {
         vcam_core_log([NSString stringWithFormat:@"[vcam] write#%d VT exception: %@", vcamWriteCount, e]);
     }
 
-    // 路径2: CoreImage crop fill 渲染（回退, 仅标准格式 —— CI 软件渲染器对私有 planar
-    // 格式不可靠, 可能留下未初始化数据导致绿屏）
-    if (!done && ![self isPrivateFormat:CVPixelBufferGetPixelFormatType(dst)]) {
-        @try {
-            if ([_gpuProcessor renderCropFill:src toPixelBuffer:dst]) {
-                if (diag) vcam_core_log([NSString stringWithFormat:@"[vcam] write#%d CI ok (fallback)", vcamWriteCount]);
-                done = YES;
-            }
-        } @catch (NSException *e) {
-            vcam_core_log([NSString stringWithFormat:@"[vcam] write#%d renderCropFill exception: %@", vcamWriteCount, e]);
-        }
-    }
-
-    if (done) return YES;
-
-    // 路径3: 同格式同尺寸非 planar memcpy（最后手段）
-    size_t srcW = CVPixelBufferGetWidth(src);
-    size_t srcH = CVPixelBufferGetHeight(src);
-    size_t dstW = CVPixelBufferGetWidth(dst);
-    size_t dstH = CVPixelBufferGetHeight(dst);
-    if (CVPixelBufferGetPixelFormatType(src) == CVPixelBufferGetPixelFormatType(dst) &&
-        srcW == dstW && srcH == dstH && CVPixelBufferGetPlaneCount(src) == 0) {
-        CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
-        CVPixelBufferLockBaseAddress(dst, 0);
-        void *srcBase = CVPixelBufferGetBaseAddress(src);
-        void *dstBase = CVPixelBufferGetBaseAddress(dst);
-        if (srcBase && dstBase) {
-            memcpy(dstBase, srcBase, MIN(CVPixelBufferGetDataSize(src), CVPixelBufferGetDataSize(dst)));
-            CVPixelBufferUnlockBaseAddress(dst, 0);
-            CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
-            return YES;
-        }
-        CVPixelBufferUnlockBaseAddress(dst, 0);
-        CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
-    }
-
-    // 全部失败: 保留原始相机帧（不显示黑屏/绿屏）
-    return NO;
+    return done ? YES : NO;
 }
 
 #pragma mark - 预渲染线程
