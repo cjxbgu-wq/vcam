@@ -68,6 +68,9 @@
 
 // 格式转换（BGRA -> YUV 等）
 - (BOOL)transferPixelBuffer:(CVPixelBufferRef)src toPixelBuffer:(CVPixelBufferRef)dst;
+// 带帧代数版本: token 用于两步法 per-key staging 缩放复用判断(线程安全,
+// 不再改全局 frameToken 属性 —— 多流并发写全局属性会互相覆盖导致 staging 误用别帧)
+- (BOOL)transferPixelBuffer:(CVPixelBufferRef)src toPixelBuffer:(CVPixelBufferRef)dst token:(uint64_t)token;
 
 // BGRA 缓冲区管理（从池中获取，减少分配开销）
 - (CVPixelBufferRef)getOrCreateBGRABufferWithWidth:(size_t)width height:(size_t)height CF_RETURNS_RETAINED;

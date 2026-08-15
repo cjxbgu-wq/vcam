@@ -210,10 +210,13 @@ static void vcam_core_log(NSString *msg) {
         // 尺寸不匹配时跳过会导致间隙闪现真实相机画面(不稳定感)
         if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d NO frame, fallback", vcamRenderCount]);
         [_renderLock lock];
-        if (_fallbackFrame) {
-            [_gpuProcessor transferPixelBuffer:_fallbackFrame toPixelBuffer:pixelBuffer];
-        }
+        CVPixelBufferRef fb = _fallbackFrame;
+        if (fb) CVPixelBufferRetain(fb);
         [_renderLock unlock];
+        if (fb) {
+            [_gpuProcessor transferPixelBuffer:fb toPixelBuffer:pixelBuffer];  // 内部自带格式锁
+            CVPixelBufferRelease(fb);
+        }
         return;
     }
 
@@ -226,11 +229,8 @@ static void vcam_core_log(NSString *msg) {
 
     // 3. 自适应旋转(对齐千面 render_disas 0xaf7c-0xafe4): 源/目标宽高比正交(一横一竖)时
     // CCW90 旋转(宽高互换), 预览流(竖向 buffer)与拍照/录像流(横向 buffer)各自正确方向,
-    // 否则拍照保存画面横躺(翻转根因)。rotation session 非线程安全, 在 renderLock 内用
-    // render 专用 session 调用
-    [_renderLock lock];
+    // 否则拍照保存画面横躺(翻转根因)。方法内部自带 rotationRenderLock
     CVPixelBufferRef src = [_gpuProcessor adaptiveRotateIfNeeded:base targetWidth:targetW targetHeight:targetH];
-    [_renderLock unlock];
 
     // 4. 写入相机帧: VT transfer(Trim 保比例 crop fill)主路径。
     //    全格式处理无白名单(对齐千面 0xb0f8-0xb154: 私有格式 |8v0/-8f0/p420 也 transfer,
@@ -419,15 +419,15 @@ static void vcam_core_log(NSString *msg) {
                        CVPixelBufferGetWidth(dst), CVPixelBufferGetHeight(dst), (unsigned)CVPixelBufferGetPixelFormatType(dst)]);
     }
 
-    // 路径1+2 加锁: pixelTransferSession/renderContext 非线程安全,
-    // BWNodeOutput/照片/视频多个 hook 节点在不同线程并发调用 writeFrame 会输出黑帧/崩溃
-    [_renderLock lock];
-    _gpuProcessor.frameToken = token;  // lock 内传递帧代数(并发安全)
+    // 并行锁体系(2026-08-15): 不再用全局 renderLock —— 拍照流(4032x3024 大帧 ~100ms)
+    // 持全局锁会阻塞所有预览流(拍照瞬间预览冻结/黑屏)。锁下沉到 GPU 内部:
+    //   一步 transfer 按目标格式 3 把锁(异格式流并行), 两步法 per-key 锁(异尺寸流并行),
+    //   rotation/CI 回退内部自锁。token 经参数传递(线程安全, 不写全局属性)
     BOOL done = NO;
 
     // 路径1: VTPixelTransferSession（任意尺寸+格式组合, CropSourceToCleanAperture 自动 crop fill）
     @try {
-        if ([_gpuProcessor transferPixelBuffer:src toPixelBuffer:dst]) {
+        if ([_gpuProcessor transferPixelBuffer:src toPixelBuffer:dst token:token]) {
             if (diag) {
                 vcam_core_log([NSString stringWithFormat:@"[vcam] write#%d VT ok", vcamWriteCount]);
                 // 像素级诊断: 转换前后 Y/G 采样对比(检测单次转换提亮) + attachments
@@ -453,7 +453,6 @@ static void vcam_core_log(NSString *msg) {
         }
     }
 
-    [_renderLock unlock];
     if (done) return YES;
 
     // 路径3: 同格式同尺寸非 planar memcpy（最后手段）
