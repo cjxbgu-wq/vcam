@@ -160,11 +160,10 @@ static void vcam_gpu_log(NSString *msg) {
     if (_bgraTransferSession) return;
     OSStatus status = VTPixelTransferSessionCreate(kCFAllocatorDefault, &_bgraTransferSession);
     if (status == noErr) {
-        // 对齐逆向 vcameracrack.dylib: RealTime + Trim
+        // 对齐千面 init 反汇编(0xa494-0xa518): 三个 session 仅设 ScalingMode=Trim, 无 RealTime
         // 千面导入 kVTScalingMode_Trim: 保宽高比填充目标 + 裁剪超出部分(crop fill)
-        VTSessionSetProperty(_bgraTransferSession, CFSTR("RealTime"), kCFBooleanTrue);
         VTSessionSetProperty(_bgraTransferSession, CFSTR("ScalingMode"), CFSTR("Trim"));
-        vcam_gpu_log(@"[vcam] BGRA VTPixelTransferSession created (RealTime + Trim)");
+        vcam_gpu_log(@"[vcam] BGRA VTPixelTransferSession created (Trim only)");
     } else {
         vcam_gpu_log([NSString stringWithFormat:@"[vcam] Failed to create BGRA session: %d", (int)status]);
     }
@@ -174,9 +173,8 @@ static void vcam_gpu_log(NSString *msg) {
     if (_yuvTransferSession) return;
     OSStatus status = VTPixelTransferSessionCreate(kCFAllocatorDefault, &_yuvTransferSession);
     if (status == noErr) {
-        VTSessionSetProperty(_yuvTransferSession, CFSTR("RealTime"), kCFBooleanTrue);
         VTSessionSetProperty(_yuvTransferSession, CFSTR("ScalingMode"), CFSTR("Trim"));
-        vcam_gpu_log(@"[vcam] YUV VTPixelTransferSession created (RealTime + Trim)");
+        vcam_gpu_log(@"[vcam] YUV VTPixelTransferSession created (Trim only)");
     } else {
         vcam_gpu_log([NSString stringWithFormat:@"[vcam] Failed to create YUV session: %d", (int)status]);
     }
@@ -187,7 +185,6 @@ static void vcam_gpu_log(NSString *msg) {
     // 预渲染线程专用 session（与 render 的 session 分离, 避免并发调用崩溃）
     OSStatus status = VTPixelTransferSessionCreate(kCFAllocatorDefault, &_prerenderTransferSession);
     if (status == noErr) {
-        VTSessionSetProperty(_prerenderTransferSession, CFSTR("RealTime"), kCFBooleanTrue);
         VTSessionSetProperty(_prerenderTransferSession, CFSTR("ScalingMode"), CFSTR("Trim"));
         vcam_gpu_log(@"[vcam] Prerender VTPixelTransferSession created (Trim)");
     } else {
@@ -202,7 +199,6 @@ static void vcam_gpu_log(NSString *msg) {
     // 混用会污染标准流(之前照片模式上下反复拉伸的教训)
     OSStatus status = VTPixelTransferSessionCreate(kCFAllocatorDefault, &_privateTransferSession);
     if (status == noErr) {
-        VTSessionSetProperty(_privateTransferSession, CFSTR("RealTime"), kCFBooleanTrue);
         VTSessionSetProperty(_privateTransferSession, CFSTR("ScalingMode"), CFSTR("Trim"));
         vcam_gpu_log(@"[vcam] Private-format VTPixelTransferSession created (Trim)");
     } else {
