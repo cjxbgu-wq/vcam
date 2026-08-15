@@ -463,8 +463,6 @@ static void vcam_gpu_log(NSString *msg) {
         vcam_gpu_log([NSString stringWithFormat:@"[vcam] Failed to create rotation buffer: %d", (int)status]);
         return NULL;
     }
-    // 传播颜色 attachments(同 adaptiveRotateIfNeeded: 裸 buffer 转私有格式 -12902)
-    CVBufferPropagateAttachments(input, dst);
 
     // 设置旋转角度（千面 prerender rotateBuffer 用 kVTRotation_* 常量值, 90=CW90 与其一致）
     if (_rotationAngle == 90) {
@@ -522,8 +520,6 @@ static void vcam_gpu_log(NSString *msg) {
     // VT transfer 同尺寸格式转换（预渲染专用 session）
     CVPixelBufferRef out = [self createBufferWithWidth:w height:h format:format];
     if (out) {
-        // 传播颜色 attachments(BGRA 回退源带解码帧颜色参数, BGRA→私有格式 VT 才有正确矩阵)
-        CVBufferPropagateAttachments(input, out);
         if (!_prerenderTransferSession) {
             [self setupPrerenderTransferSession];
         }
@@ -604,10 +600,6 @@ static void vcam_gpu_log(NSString *msg) {
     } else {
         rotated = [self createBufferWithWidth:srcH height:srcW format:fmt];
         if (!rotated) return (CVPixelBufferRef)CVPixelBufferRetain(src);
-        // 传播颜色 attachments(ColorPrimaries/TransferFunction/ChromaLocation/CleanAperture):
-        // 裸 buffer 缺这些参数, 420f(裸)→私有格式(-8f0) VT 报 -12902 kVTParameterErr(实测),
-        // 解码原帧直通(不旋转)时带附件故预览流 420f→420f 成功 —— 旋转路径必须补上
-        CVBufferPropagateAttachments(src, rotated);
         if (_adaptiveRotateCache) CVPixelBufferRelease(_adaptiveRotateCache);
         _adaptiveRotateCache = CVPixelBufferRetain(rotated);
         _adaptiveRotateCacheW = srcH;
