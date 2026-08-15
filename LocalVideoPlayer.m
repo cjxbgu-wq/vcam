@@ -182,11 +182,11 @@ static void vcam_player_log(NSString *msg) {
         return;
     }
 
-    // 创建输出（420v 双平面 video-range: -8f0 是相机 ISP 流(video-range 语义),
-    // 420v 源 range 匹配; 420f(full)→-8f0 因 range 冲突报 -12902(实测)
+    // 创建输出（420f 双平面 full-range: 静止照片流(420f)原格式直通颜色正确(用户已验证),
+    // 私有格式目标走两步法(先缩放后转格式)修复黑帧过曝
     // render 源用 YUV 转私有格式时 range 保持）
     NSDictionary *outputSettings = @{
-        (id)kCVPixelBufferPixelFormatTypeKey: @((OSType)'420v'),
+        (id)kCVPixelBufferPixelFormatTypeKey: @((OSType)'420f'),
         (id)kCVPixelBufferWidthKey:  @(_videoWidth),
         (id)kCVPixelBufferHeightKey: @(_videoHeight),
     };
@@ -339,7 +339,7 @@ static void vcam_player_log(NSString *msg) {
 
     // 重新创建输出（420f, 同上）
     NSDictionary *outputSettings = @{
-        (id)kCVPixelBufferPixelFormatTypeKey: @((OSType)'420v'),
+        (id)kCVPixelBufferPixelFormatTypeKey: @((OSType)'420f'),
         (id)kCVPixelBufferWidthKey:  @(_videoWidth),
         (id)kCVPixelBufferHeightKey: @(_videoHeight),
     };

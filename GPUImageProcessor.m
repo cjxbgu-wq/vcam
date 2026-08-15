@@ -46,6 +46,10 @@ static void vcam_gpu_log(NSString *msg) {
 @property (nonatomic, assign) VTPixelTransferSessionRef yuvTransferSession;        // render 线程: 420v/420f 目标专用
 @property (nonatomic, assign) VTPixelTransferSessionRef privateTransferSession;    // render 线程: 私有格式目标专用(base, 隔离状态)
 @property (nonatomic, assign) VTPixelTransferSessionRef prerenderTransferSession;  // 预渲染线程专用
+// 私有格式两步法中转 buffer(目标尺寸 BGRA, renderLock 内专用)
+@property (nonatomic, assign) CVPixelBufferRef privateStagingBuffer;
+@property (nonatomic, assign) size_t privateStagingW;
+@property (nonatomic, assign) size_t privateStagingH;
 @property (nonatomic, assign) VTPixelRotationSessionRef pixelRotationSession;
 // render 路径专用旋转 session（非线程安全: 预渲染线程与 render 线程并发用同一 session 会崩溃）
 @property (nonatomic, assign) VTPixelRotationSessionRef renderRotationSession;
@@ -683,14 +687,55 @@ static void vcam_gpu_log(NSString *msg) {
 - (BOOL)transferPixelBuffer:(CVPixelBufferRef)src toPixelBuffer:(CVPixelBufferRef)dst {
     if (!src || !dst) return NO;
 
-    // 一步 VT transfer, 不做任何手动处理:
-    //  - ScalingMode=Trim(初始化时已配置) 自动完成保比例 crop fill 缩放+格式转换
-    //  - 不在共享 src 上设置 clean aperture attachment: 多流(预览/照片)交替 render 会把
-    //    同一 src 的 CA 来回改写 → 输出几何来回变化(照片模式上下反复拉伸的根源)
-    //  - 对齐千面(逆向 0xb0f8-0xb154): 所有格式无白名单全 transfer, 按目标格式分三套隔离 session:
-    //    BGRA→bgra / 420v|420f→yuv / 私有格式→private(base), 防止 pipeline 状态互相污染
     OSType dstFormat = CVPixelBufferGetPixelFormatType(dst);
+    size_t dstW = CVPixelBufferGetWidth(dst);
+    size_t dstH = CVPixelBufferGetHeight(dst);
+    size_t srcW = CVPixelBufferGetWidth(src);
+    size_t srcH = CVPixelBufferGetHeight(src);
 
+    // 对齐千面 processPixelBuffer:toBuffer: 架构(0x10394 逆向):
+    //   rotate(保格式) → scaleBuffer 到目标尺寸 → transfer(同尺寸格式转换)
+    // 千面的 transfer 永远是"同尺寸"的 —— 私有格式目标(-8f0/|xv0/p420)必须两步:
+    //   1) VT+Trim: src → 目标尺寸 BGRA 中转(缩放在此完成)
+    //   2) VT 同尺寸: BGRA 中转 → 私有格式 dst(纯格式转换, CPU 路径稳定)
+    // 跨尺寸直接转私有格式时 VT 走硬件 scaler 路径 → 假成功输出黑帧(实测 dst Y 全 0,
+    // 相机管线后级增益黑帧 → 照片过曝发白)
+    BOOL isPrivate = !(dstFormat == kCVPixelFormatType_32BGRA ||
+                       (dstFormat & 0xffffffef) == '420f');
+    BOOL sameSize = (srcW == dstW && srcH == dstH);
+
+    if (isPrivate && !sameSize) {
+        // 两步法: 中转 BGRA 按目标尺寸缓存复用(renderLock 内调用, 无并发)
+        if (!_privateStagingBuffer ||
+            _privateStagingW != dstW || _privateStagingH != dstH) {
+            if (_privateStagingBuffer) CVPixelBufferRelease(_privateStagingBuffer);
+            _privateStagingBuffer = [self createBufferWithWidth:dstW height:dstH format:kCVPixelFormatType_32BGRA];
+            _privateStagingW = dstW;
+            _privateStagingH = dstH;
+        }
+        if (!_privateStagingBuffer) return NO;
+
+        // 步骤1: 缩放到目标尺寸 BGRA(bgra 专用 session, Trim crop fill)
+        if (!_bgraTransferSession) [self setupBGRATransferSession];
+        OSStatus st1 = _bgraTransferSession ?
+            VTPixelTransferSessionTransferImage(_bgraTransferSession, src, _privateStagingBuffer) : -1;
+        if (st1 != noErr) {
+            vcam_gpu_log([NSString stringWithFormat:@"[vcam] 2step stage1 failed: %d", (int)st1]);
+            return NO;
+        }
+        // 步骤2: 同尺寸 BGRA → 私有格式
+        if (!_privateTransferSession) [self setupPrivateTransferSession];
+        OSStatus st2 = _privateTransferSession ?
+            VTPixelTransferSessionTransferImage(_privateTransferSession, _privateStagingBuffer, dst) : -1;
+        if (st2 != noErr) {
+            vcam_gpu_log([NSString stringWithFormat:@"[vcam] 2step stage2 failed: %d", (int)st2]);
+            return NO;
+        }
+        return YES;
+    }
+
+    // 标准格式/同尺寸: 一步 transfer, 按目标格式三套隔离 session
+    // (对齐千面 render 0xb0f8-0xb154: BGRA→bgra / 420v|420f→yuv / 其他→private)
     VTPixelTransferSessionRef session = NULL;
     if (dstFormat == kCVPixelFormatType_32BGRA) {
         if (!_bgraTransferSession) [self setupBGRATransferSession];
