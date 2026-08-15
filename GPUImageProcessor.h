@@ -31,6 +31,11 @@
 @property (nonatomic, assign) BOOL mirrored;
 @property (nonatomic, readonly) BOOL rotationApiAvailable;
 
+// 当前源帧代数(VCamCore 每帧设置, 单调递增): 私有格式两步法的 staging BGRA
+// 按 (代数, 目标尺寸) 复用 —— 同一源帧被相机多条流重复渲染时缩放只做一次,
+// 第二条流起只做格式转换, render CPU 减半(管线饱和 → 卡顿/黑屏优化)
+@property (nonatomic, assign) uint64_t frameToken;
+
 // 核心处理方法
 - (CVPixelBufferRef)processPixelBuffer:(CVPixelBufferRef)input
                                 toWidth:(size_t)width

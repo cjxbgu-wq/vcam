@@ -50,6 +50,10 @@ static void vcam_gpu_log(NSString *msg) {
 @property (nonatomic, assign) CVPixelBufferRef privateStagingBuffer;
 @property (nonatomic, assign) size_t privateStagingW;
 @property (nonatomic, assign) size_t privateStagingH;
+// staging 缩放复用: 记录 staging 内容对应的源帧代数与源尺寸(同帧重复渲染跳过缩放)
+@property (nonatomic, assign) uint64_t privateStagingToken;
+@property (nonatomic, assign) size_t privateStagingSrcW;
+@property (nonatomic, assign) size_t privateStagingSrcH;
 @property (nonatomic, assign) VTPixelRotationSessionRef pixelRotationSession;
 // render 路径专用旋转 session（非线程安全: 预渲染线程与 render 线程并发用同一 session 会崩溃）
 @property (nonatomic, assign) VTPixelRotationSessionRef renderRotationSession;
@@ -704,16 +708,26 @@ static void vcam_gpu_log(NSString *msg) {
             _privateStagingBuffer = [self createBufferWithWidth:dstW height:dstH format:kCVPixelFormatType_32BGRA];
             _privateStagingW = dstW;
             _privateStagingH = dstH;
+            _privateStagingToken = 0;  // 尺寸重建 → 缩放结果失效
         }
         if (!_privateStagingBuffer) return NO;
 
-        // 步骤1: 缩放到目标尺寸 BGRA(bgra 专用 session, Trim crop fill)
-        if (!_bgraTransferSession) [self setupBGRATransferSession];
-        OSStatus st1 = _bgraTransferSession ?
-            VTPixelTransferSessionTransferImage(_bgraTransferSession, src, _privateStagingBuffer) : -1;
-        if (st1 != noErr) {
-            vcam_gpu_log([NSString stringWithFormat:@"[vcam] 2step stage1 failed: %d", (int)st1]);
-            return NO;
+        // 缩放复用(性能优化): 同一源帧(frameToken 未变)已缩放到同尺寸 staging 时
+        // 跳过步骤1 —— 同帧被相机多条流(预览/照片/录像)重复渲染, 缩放只做一次
+        BOOL stagingFresh = (_privateStagingToken == self.frameToken &&
+                             _privateStagingSrcW == srcW && _privateStagingSrcH == srcH);
+        if (!stagingFresh) {
+            // 步骤1: 缩放到目标尺寸 BGRA(bgra 专用 session, Trim crop fill)
+            if (!_bgraTransferSession) [self setupBGRATransferSession];
+            OSStatus st1 = _bgraTransferSession ?
+                VTPixelTransferSessionTransferImage(_bgraTransferSession, src, _privateStagingBuffer) : -1;
+            if (st1 != noErr) {
+                vcam_gpu_log([NSString stringWithFormat:@"[vcam] 2step stage1 failed: %d", (int)st1]);
+                return NO;
+            }
+            _privateStagingToken = self.frameToken;
+            _privateStagingSrcW = srcW;
+            _privateStagingSrcH = srcH;
         }
         // 步骤2: 同尺寸 BGRA → 私有格式
         if (!_privateTransferSession) [self setupPrivateTransferSession];

@@ -57,6 +57,9 @@ static void vcam_core_log(NSString *msg) {
 // 进程标记: 只有 mediaserverd 真正解码/预渲染; SpringBoard 的 VCamCore 只做状态记录,
 // 否则 SB 进程白白解码整个视频(30fps 解码+转换) → 桌面卡顿/按钮迟钝
 @property (nonatomic, assign) BOOL isMediaserverdProcess;
+// 源帧代数(单调递增): 每存入新帧 +1。render 设置到 gpuProcessor.frameToken,
+// 供私有格式两步法的 staging 缩放复用(同帧多流渲染时缩放只做一次, CPU 减半)
+@property (nonatomic, assign) uint64_t liveFrameGen;
 // 预渲染重复源跳过: 无新帧入队(解码计数未变)且旋转/镜像未变时, 跳过重复的旋转+格式转换
 @property (nonatomic, assign) uint64_t lastPrerenderSrcGen;
 @property (nonatomic, assign) int lastPrerenderRot;
@@ -160,19 +163,23 @@ static void vcam_core_log(NSString *msg) {
     vcamRenderCount++;
     BOOL diagThisFrame = (vcamRenderCount % 60 == 1);
 
-    // 1. 取预渲染缓存(视频原尺寸双格式, 等价千面 [player copyCurrentFrame])
+    // 1. 取预渲染缓存(YUV 主源, 等价千面 [player copyCurrentFrame])
     [_processLock lock];
-    CVPixelBufferRef bgra = _liveBGRAPixelBuffer;
-    if (bgra) CVPixelBufferRetain(bgra);
     CVPixelBufferRef yuv = _liveYUVPixelBuffer;
     if (yuv) CVPixelBufferRetain(yuv);
+    uint64_t gen = _liveFrameGen;
     [_processLock unlock];
+    // 帧代数传给 GPU: 私有格式两步法的 staging 缩放按代数复用
+    // (同帧被相机多条流重复渲染时, 缩放只做一次 → render CPU 减半)
+    _gpuProcessor.frameToken = gen;
+    CVPixelBufferRef bgra = NULL;
 
     // 注: 曾尝试渲染缓存(gen 相同则 memcpy 上次输出, 省 VT 转换) —— 已移除:
     // 相机帧是 IOSurface-backed(GPU/ISP 并发持有), VT 内部有同步而裸 memcpy 没有,
     // 周期性撞数据竞争窗口导致 mediaserverd 崩溃(相机闪退)。写入相机帧一律走 VT。
+    // 注2: 预渲染不再预产 BGRA(懒加载, 产能优化), BGRA 回退时现场转换。
 
-    if (!bgra && !yuv) {
+    if (!yuv) {
         // 无帧回退(对齐千面 0xb018-0xb05c): 用上一帧缓存(目标尺寸匹配)填充,
         // 视频解码间隙不闪回相机画面
         if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d NO frame, fallback", vcamRenderCount]);
@@ -189,12 +196,12 @@ static void vcam_core_log(NSString *msg) {
     //    YUV(420f) 源携带原生 range/矩阵 attachments: YUV→私有格式(-8f0/p420/|xv0)
     //    range 保持正确; BGRA 源转私有格式 VT 缺 range 信息 → 照片过曝(高光洗白)。
     //    420f→某私有格式若 VT 不支持(-12905), 下方自动回退 BGRA 源重试
-    CVPixelBufferRef base = yuv ? yuv : bgra;
+    CVPixelBufferRef base = yuv;
 
     // 3. 自适应旋转(对齐千面 render_disas 0xaf7c-0xafe4): 源/目标宽高比正交(一横一竖)时
-    //    CCW90 旋转(宽高互换), 预览流(竖向 buffer)与拍照/录像流(横向 buffer)各自正确方向,
-    //    否则拍照保存画面横躺(翻转根因)。rotation session 非线程安全, 在 renderLock 内用
-    //    render 专用 session 调用
+    // CCW90 旋转(宽高互换), 预览流(竖向 buffer)与拍照/录像流(横向 buffer)各自正确方向,
+    // 否则拍照保存画面横躺(翻转根因)。rotation session 非线程安全, 在 renderLock 内用
+    // render 专用 session 调用
     [_renderLock lock];
     CVPixelBufferRef src = [_gpuProcessor adaptiveRotateIfNeeded:base targetWidth:targetW targetHeight:targetH];
     [_renderLock unlock];
@@ -204,16 +211,22 @@ static void vcam_core_log(NSString *msg) {
     //    这正是千面能替换视频模式预览和拍照保存的原因), 失败保留原相机帧
     BOOL usedFallbackSource = NO;
     BOOL ok = [self writeFrame:src toPixelBuffer:pixelBuffer];
-    if (!ok && base == yuv && bgra != NULL) {
-        // YUV 源失败(该 420f→目标组合 VT 不支持): 回退 BGRA 源重试
+    if (!ok && base == yuv) {
+        // YUV 源失败(该 420f→目标组合 VT 不支持): 懒转 BGRA 回退(预渲染已不预产 BGRA,
+        // 罕见路径现场转换一次, 正常帧不付这个代价)
         if (src) CVPixelBufferRelease(src);
+        src = NULL;
         [_renderLock lock];
-        src = [_gpuProcessor adaptiveRotateIfNeeded:bgra targetWidth:targetW targetHeight:targetH];
+        CVPixelBufferRef lazyBGRA = [_gpuProcessor convertFormat:yuv toFormat:kCVPixelFormatType_32BGRA];
+        if (lazyBGRA) {
+            src = [_gpuProcessor adaptiveRotateIfNeeded:lazyBGRA targetWidth:targetW targetHeight:targetH];
+            CVPixelBufferRelease(lazyBGRA);
+        }
         [_renderLock unlock];
         ok = [self writeFrame:src toPixelBuffer:pixelBuffer];
         usedFallbackSource = ok;
         if (ok && diagThisFrame) {
-            vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d YUV->0x%x failed, retry via BGRA OK", vcamRenderCount, (unsigned)origFormat]);
+            vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d YUV->0x%x failed, retry via lazy BGRA OK", vcamRenderCount, (unsigned)origFormat]);
         }
     }
     if (ok) {
@@ -498,22 +511,19 @@ static void vcam_core_log(NSString *msg) {
                 CVPixelBufferRelease(frame);
                 if (!rotated) continue;
 
-                // 2. BGRA 版本（同尺寸, VT 转换; render 回退源 + BGRA 目标流用）
-                CVPixelBufferRef bgra = [strongSelf.gpuProcessor convertFormat:rotated toFormat:kCVPixelFormatType_32BGRA];
+                // 2. 懒 BGRA(产能优化): 不再每帧预转 BGRA —— 旋转+转换两个 VT 调用
+                //    每帧 ~68ms > 41.6ms(24fps 帧间隔), 预渲染只跑出 14.6fps → 卡顿。
+                //    YUV 是 render 主源(千面解码原生单源架构); BGRA 回退需求罕见
+                //    (仅 420f→某私有格式 VT 不支持时), 由 render 现场懒转。
+                //    只做旋转一个 VT → 预渲染恢复源视频帧率
 
                 // 3. 完整产出后才替换缓存（避免半成品被 render 读到）
-                //    主源=YUV(420f, 对齐千面解码原生单源), BGRA 为回退
                 [strongSelf.processLock lock];
                 if (strongSelf->_liveYUVPixelBuffer) {
                     CVPixelBufferRelease(strongSelf->_liveYUVPixelBuffer);
                 }
                 strongSelf->_liveYUVPixelBuffer = rotated;  // 所有权转移
-                if (bgra) {
-                    if (strongSelf->_liveBGRAPixelBuffer) {
-                        CVPixelBufferRelease(strongSelf->_liveBGRAPixelBuffer);
-                    }
-                    strongSelf->_liveBGRAPixelBuffer = bgra;  // 所有权转移; 失败时保留旧 BGRA
-                }
+                strongSelf->_liveFrameGen++;  // render 端 staging 复用的帧代数
                 [strongSelf.processLock unlock];
 
                 renderedFrames++;
