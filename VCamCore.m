@@ -227,7 +227,7 @@ static void vcam_core_log(NSString *msg) {
             CVPixelBufferRelease(lazyBGRA);
         }
         [_renderLock unlock];
-        ok = [self writeFrame:src toPixelBuffer:pixelBuffer];
+        ok = [self writeFrame:src toPixelBuffer:pixelBuffer token:0];  // 0 = 不复用 staging
         usedFallbackSource = ok;
         if (ok && diagThisFrame) {
             vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d YUV->0x%x failed, retry via lazy BGRA OK", vcamRenderCount, (unsigned)origFormat]);
