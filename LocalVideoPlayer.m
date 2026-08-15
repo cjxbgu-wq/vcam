@@ -53,6 +53,11 @@ static void vcam_player_log(NSString *msg) {
 @property (nonatomic, assign) int64_t reloadGeneration;
 @property (nonatomic, assign) int64_t currentGeneration;
 
+// PTS 实测有效帧率(支撑 effectiveFps readonly)
+@property (nonatomic, assign) CGFloat effectiveFpsInternal;
+@property (nonatomic, assign) BOOL hasLastPTS;
+@property (nonatomic, assign) double lastPTS;
+
 // 解码线程控制
 @property (nonatomic, assign) BOOL shouldDecode;
 @property (nonatomic, strong) NSThread *decodeThread;
@@ -76,6 +81,9 @@ static void vcam_player_log(NSString *msg) {
         _stateLock = [[NSLock alloc] init];
         _reloadGeneration = 0;
         _currentGeneration = 0;
+        _effectiveFpsInternal = 0;
+        _hasLastPTS = NO;
+        _lastPTS = 0;
         _shouldDecode = NO;
         _enabled = NO;
         _isEnabled = NO;
@@ -113,6 +121,13 @@ static void vcam_player_log(NSString *msg) {
 }
 
 #pragma mark - 视频加载
+
+// effectiveFps: PTS 实测优先, 回退标称帧率, 再回退 30
+- (CGFloat)effectiveFps {
+    if (_effectiveFpsInternal > 1.0) return _effectiveFpsInternal;
+    if (_videoFps > 1.0) return _videoFps;
+    return 30.0;
+}
 
 - (void)loadVideoAtPath:(NSString *)path completion:(void(^)(BOOL success, NSError *error))completion {
     if (!path || path.length == 0) {
@@ -154,6 +169,10 @@ static void vcam_player_log(NSString *msg) {
     _urlAsset = [AVURLAsset assetWithURL:url];
     _currentVideoPath = path;
     _mediaType = VCamMediaTypeVideo;
+    // 重置 PTS 实测状态(新视频从第一帧重新采样)
+    _hasLastPTS = NO;
+    _lastPTS = 0;
+    _effectiveFpsInternal = 0;
 
     // 获取视频轨道
     NSArray *tracks = [_urlAsset tracksWithMediaType:AVMediaTypeVideo];
@@ -333,6 +352,23 @@ static void vcam_player_log(NSString *msg) {
     CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
     if (pixelBuffer) {
         CVPixelBufferRetain(pixelBuffer);
+        // PTS 实测帧率校准: nominalFrameRate 是采样近似(VFR/转码视频常低估, 如 30fps
+        // 报 14.6), 节拍按标称跑会导致慢放→卡顿观感。用相邻帧 PTS 差实测校准
+        CMTime pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+        double ptsSec = CMTimeGetSeconds(pts);
+        if (CMTIME_IS_VALID(pts) && !isnan(ptsSec)) {
+            if (_hasLastPTS && ptsSec > _lastPTS) {
+                double interval = ptsSec - _lastPTS;
+                if (interval >= 0.005 && interval <= 0.2) {  // 5~200ms 有效帧间隔(5~200fps)
+                    double inst = 1.0 / interval;
+                    // EMA 平滑: 快速收敛 + 抗单帧抖动; 循环重读(PTS 回绕递减)不更新间隔
+                    _effectiveFpsInternal = (_effectiveFpsInternal > 1.0)
+                        ? (_effectiveFpsInternal * 0.8 + inst * 0.2) : inst;
+                }
+            }
+            _lastPTS = ptsSec;
+            _hasLastPTS = YES;
+        }
     }
     CFRelease(sampleBuffer);
     return pixelBuffer;
@@ -421,7 +457,8 @@ static void vcam_player_log(NSString *msg) {
                     CVPixelBufferRelease(buffer);  // 队列已 retain
                     _frameCount++;
                     // 按视频帧率绝对节拍输出(参考逆向: 按时间戳输出帧)
-                    double frameInterval = (_videoFps > 1.0) ? (1.0 / _videoFps) : (1.0 / 30.0);
+                    // effectiveFps = PTS 实测(校准 nominalFrameRate 低估导致的慢放卡顿)
+                    double frameInterval = 1.0 / [self effectiveFps];
                     nextTick += frameInterval;
                     double wait = nextTick - CFAbsoluteTimeGetCurrent();
                     if (wait > 0.001) {

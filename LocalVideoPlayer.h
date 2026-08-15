@@ -79,6 +79,9 @@ typedef NS_ENUM(NSInteger, VCamMediaType) {
 
 // 视频信息
 @property (nonatomic, assign) CGFloat videoFps;
+// PTS 实测有效帧率: nominalFrameRate 是采样近似值, VFR/转码视频常被低估
+// (如实测 14.6 标称), 解码/预渲染节拍用它校准, 否则视频慢放→卡顿观感
+@property (nonatomic, readonly) CGFloat effectiveFps;
 @property (nonatomic, assign) CGFloat videoDuration;
 @property (nonatomic, assign) size_t videoWidth;
 @property (nonatomic, assign) size_t videoHeight;

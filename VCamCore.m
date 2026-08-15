@@ -480,7 +480,8 @@ static void vcam_core_log(NSString *msg) {
 
         while (strongSelf.prerenderActive && strongSelf.enabled) {
             @autoreleasepool {
-                double fps = strongSelf.videoPlayer.videoFps > 1.0 ? strongSelf.videoPlayer.videoFps : 30.0;
+                // effectiveFps = PTS 实测帧率(校准 nominalFrameRate 低估导致的节拍慢放)
+                double fps = strongSelf.videoPlayer.effectiveFps;
                 nextTick += 1.0 / fps;
                 double wait = nextTick - CFAbsoluteTimeGetCurrent();
                 if (wait > 0.0005) {
