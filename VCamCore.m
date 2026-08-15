@@ -32,49 +32,6 @@ static void vcam_core_log(NSString *msg) {
     } @catch (NSException *e) {}
 }
 
-// 行级像素拷贝(性能优化): 同格式同尺寸 buffer 间按各自 bpr 逐行 memcpy。
-// 返回实际拷贝字节数 —— 0 表示该格式 CPU 线性地址不可用(如 -8f0 tiled 布局
-// GetBaseAddressOfPlane 恒为 NULL), 调用方据此禁用渲染缓存(否则会把未初始化
-// 内存写进相机帧 → 画面闪红/编码器读到垃圾 → 相机闪退)。
-static size_t vcamCopyPixelRows(CVPixelBufferRef src, CVPixelBufferRef dst) {
-    if (!src || !dst) return 0;
-    size_t copied = 0;
-    CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
-    CVPixelBufferLockBaseAddress(dst, 0);
-    size_t planes = CVPixelBufferGetPlaneCount(src);
-    if (planes == 0) {
-        uint8_t *s = (uint8_t *)CVPixelBufferGetBaseAddress(src);
-        uint8_t *d = (uint8_t *)CVPixelBufferGetBaseAddress(dst);
-        if (s && d) {
-            size_t sbpr = CVPixelBufferGetBytesPerRow(src);
-            size_t dbpr = CVPixelBufferGetBytesPerRow(dst);
-            size_t rows = CVPixelBufferGetHeight(src);
-            size_t rowBytes = MIN(sbpr, dbpr);
-            for (size_t y = 0; y < rows; y++) {
-                memcpy(d + y * dbpr, s + y * sbpr, rowBytes);
-            }
-            copied += rowBytes * rows;
-        }
-    } else {
-        for (size_t p = 0; p < planes; p++) {
-            uint8_t *s = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(src, p);
-            uint8_t *d = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(dst, p);
-            if (!s || !d) continue;
-            size_t sbpr = CVPixelBufferGetBytesPerRowOfPlane(src, p);
-            size_t dbpr = CVPixelBufferGetBytesPerRowOfPlane(dst, p);
-            size_t rows = CVPixelBufferGetHeightOfPlane(src, p);
-            size_t rowBytes = MIN(sbpr, dbpr);
-            for (size_t y = 0; y < rows; y++) {
-                memcpy(d + y * dbpr, s + y * sbpr, rowBytes);
-            }
-            copied += rowBytes * rows;
-        }
-    }
-    CVPixelBufferUnlockBaseAddress(dst, 0);
-    CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
-    return copied;
-}
-
 @interface VCamCore ()
 @property (nonatomic, strong) dispatch_source_t pollingTimer;
 @property (nonatomic, assign) BOOL pollingActive;
@@ -100,17 +57,6 @@ static size_t vcamCopyPixelRows(CVPixelBufferRef src, CVPixelBufferRef dst) {
 // 进程标记: 只有 mediaserverd 真正解码/预渲染; SpringBoard 的 VCamCore 只做状态记录,
 // 否则 SB 进程白白解码整个视频(30fps 解码+转换) → 桌面卡顿/按钮迟钝
 @property (nonatomic, assign) BOOL isMediaserverdProcess;
-// 预渲染代数: 每存入新帧 +1。render 端发现代数未变(视频 30fps vs 相机 30-60fps,
-// 同一源帧被多条流重复渲染)时直接 memcpy 渲染缓存, 跳过 VT 旋转+两步转换(5-15ms → ~0.5ms)
-@property (nonatomic, assign) uint64_t liveFrameGen;
-// 渲染结果缓存(renderLock 内访问): (gen, w, h, fmt, rotation, mirror) 全命中时行拷贝输出
-@property (nonatomic, assign) CVPixelBufferRef renderCacheBuffer;
-@property (nonatomic, assign) uint64_t renderCacheGen;
-@property (nonatomic, assign) size_t renderCacheW;
-@property (nonatomic, assign) size_t renderCacheH;
-@property (nonatomic, assign) OSType renderCacheFmt;
-@property (nonatomic, assign) int renderCacheRot;
-@property (nonatomic, assign) BOOL renderCacheMirror;
 // 预渲染重复源跳过: 无新帧入队(解码计数未变)且旋转/镜像未变时, 跳过重复的旋转+格式转换
 @property (nonatomic, assign) uint64_t lastPrerenderSrcGen;
 @property (nonatomic, assign) int lastPrerenderRot;
@@ -220,39 +166,11 @@ static size_t vcamCopyPixelRows(CVPixelBufferRef src, CVPixelBufferRef dst) {
     if (bgra) CVPixelBufferRetain(bgra);
     CVPixelBufferRef yuv = _liveYUVPixelBuffer;
     if (yuv) CVPixelBufferRetain(yuv);
-    uint64_t gen = _liveFrameGen;
     [_processLock unlock];
 
-    // ===== 渲染缓存快路径(性能优化) =====
-    // 视频按源帧率(如30fps)出新帧, 相机多条流(预览|30-60fps + 照片流 + 录像流)以更高
-    // 频率取帧: 同一源帧(gen 未变)被重复渲染时, 直接行拷贝上次的输出结果,
-    // 跳过 VT 旋转+两步格式转换(5-15ms → ~0.5ms), 大幅降低 mediaserverd CPU → 少掉帧。
-    // renderLock 内访问: 多 hook 线程(预览/照片/录像)并发时防止与缓存更新竞争撕裂
-    if (bgra || yuv) {
-        int curRot = _gpuProcessor.rotationAngle;
-        BOOL curMirror = _gpuProcessor.mirrored;
-        [_renderLock lock];
-        BOOL cacheHit = (_renderCacheBuffer &&
-                         gen == _renderCacheGen &&
-                         targetW == _renderCacheW && targetH == _renderCacheH &&
-                         origFormat == _renderCacheFmt &&
-                         curRot == _renderCacheRot && curMirror == _renderCacheMirror);
-        if (cacheHit) {
-            vcamCopyPixelRows(_renderCacheBuffer, pixelBuffer);
-        }
-        [_renderLock unlock];
-        if (cacheHit) {
-            _frameCount++;
-            static uint64_t cacheHits = 0;
-            cacheHits++;
-            if (diagThisFrame) {
-                vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d CACHED hit(%llu total) %zux%zu fmt=0x%x",
-                               vcamRenderCount, (unsigned long long)cacheHits, targetW, targetH, (unsigned)origFormat]);
-            }
-            _dedupLastBuffer = pixelBuffer;
-            return;
-        }
-    }
+    // 注: 曾尝试渲染缓存(gen 相同则 memcpy 上次输出, 省 VT 转换) —— 已移除:
+    // 相机帧是 IOSurface-backed(GPU/ISP 并发持有), VT 内部有同步而裸 memcpy 没有,
+    // 周期性撞数据竞争窗口导致 mediaserverd 崩溃(相机闪退)。写入相机帧一律走 VT。
 
     if (!bgra && !yuv) {
         // 无帧回退(对齐千面 0xb018-0xb05c): 用上一帧缓存(目标尺寸匹配)填充,
@@ -313,53 +231,6 @@ static size_t vcamCopyPixelRows(CVPixelBufferRef src, CVPixelBufferRef dst) {
         CVPixelBufferRetain(_fallbackFrame);
         _fallbackWidth = targetW;
         _fallbackHeight = targetH;
-
-        // 渲染结果缓存更新: 把本次输出(pixelBuffer 已是成品)拷入缓存 buffer,
-        // 同 gen 的后续渲染直接 memcpy(缓存快路径)。
-        // 安全约束(修复闪红/闪退):
-        //   1. 仅 CPU 线性可访问格式启用(BGRA/420f/420v/|xv0)——私有 tiled 格式
-        //      (-8f0/p420/|8f0) GetBaseAddress 恒 NULL, 拷贝 0 字节会把未初始化
-        //      内存写进相机帧(画面闪红, 编码器读到垃圾可能崩相机);
-        //      且 CVPixelBufferCreate 私有格式在 mediaserverd 有崩溃风险, 直接不创建
-        //   2. 拷贝字节数为 0 时禁用缓存(布局意外不可访问的兜底)
-        BOOL linearCacheable = (origFormat == kCVPixelFormatType_32BGRA ||
-                                origFormat == (OSType)'420f' ||
-                                origFormat == (OSType)'420v' ||
-                                origFormat == (OSType)0x7c787630 /* |xv0 */);
-        if (!linearCacheable) {
-            if (_renderCacheBuffer) {
-                CVPixelBufferRelease(_renderCacheBuffer);
-                _renderCacheBuffer = NULL;
-            }
-            _renderCacheGen = 0;
-        } else {
-            if (!_renderCacheBuffer || _renderCacheW != targetW || _renderCacheH != targetH ||
-                _renderCacheFmt != origFormat) {
-                if (_renderCacheBuffer) CVPixelBufferRelease(_renderCacheBuffer);
-                _renderCacheBuffer = NULL;
-                // 注意: 不带 IOSurface 属性(mediaserverd 约束, NULL attributes 安全)
-                CVPixelBufferRef buf = NULL;
-                if (CVPixelBufferCreate(NULL, targetW, targetH, origFormat, NULL, &buf) == kCVReturnSuccess && buf) {
-                    _renderCacheBuffer = buf;
-                    _renderCacheW = targetW;
-                    _renderCacheH = targetH;
-                    _renderCacheFmt = origFormat;
-                }
-            }
-            if (_renderCacheBuffer &&
-                vcamCopyPixelRows(pixelBuffer, _renderCacheBuffer) > 0) {
-                _renderCacheGen = gen;
-                _renderCacheRot = _gpuProcessor.rotationAngle;
-                _renderCacheMirror = _gpuProcessor.mirrored;
-            } else {
-                // 拷贝 0 字节: 该格式布局 CPU 不可访问 → 释放缓存禁用快路径
-                if (_renderCacheBuffer) {
-                    CVPixelBufferRelease(_renderCacheBuffer);
-                    _renderCacheBuffer = NULL;
-                }
-                _renderCacheGen = 0;
-            }
-        }
         [_renderLock unlock];
         _dedupLastBuffer = pixelBuffer;
     } else if (diagThisFrame) {
@@ -643,7 +514,6 @@ static size_t vcamCopyPixelRows(CVPixelBufferRef src, CVPixelBufferRef dst) {
                     }
                     strongSelf->_liveBGRAPixelBuffer = bgra;  // 所有权转移; 失败时保留旧 BGRA
                 }
-                strongSelf->_liveFrameGen++;  // render 端缓存失效信号: 新一帧已就绪
                 [strongSelf.processLock unlock];
 
                 renderedFrames++;
