@@ -49,7 +49,7 @@ static void MSHookMessageEx(Class cls, SEL sel, IMP newImp, IMP *origPtr) {
 static volatile int32_t vcamTweakLogCount = 0;
 static void vcam_tweak_log(NSString *msg) {
     int32_t n = __sync_add_and_fetch(&vcamTweakLogCount, 1);
-    if (n > 500) return;  // 限制日志量
+    if (n > 2000) return;  // 限制日志量(still 诊断需要更大预算)
     @try {
         NSString *logPath = @"/tmp/vcam_tweak_log.txt";
         NSString *ts = [NSDate date].description;
@@ -63,6 +63,102 @@ static void vcam_tweak_log(NSString *msg) {
             [fh closeFile];
         }
     } @catch (NSException *e) {}
+}
+
+#pragma mark - 照片过曝: 到达诊断 + 曝光元数据剥离(metaFix)
+// 背景(2026-08-15 千面对比实测): 拍照(静止照片/实况封面)过曝 = 照片合成管线基于
+// 真实镜头进光元数据(LuxLevel/ExposureTime 等)做曝光增益, 千面同样过曝。
+// 本实验超越千面: 在 still 管线入口剥离曝光元数据, 下游合成拿不到"暗光"信息
+// 理论上不再拉增益。A/B 开关: vc.plist "metaFix"(默认 YES), 3 秒内生效无需重启。
+static int vcamScalerArrCount = 0;
+static int vcamEncoderArrCount = 0;
+static int vcamPhotoEmitCount = 0;
+
+static BOOL vcamMetaFixCached = YES;
+static time_t vcamMetaFixTS = 0;
+static BOOL vcamMetaFixOn(void) {
+    time_t now = time(NULL);
+    if (now - vcamMetaFixTS >= 3) {
+        vcamMetaFixTS = now;
+        @try {
+            NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Media/DCIM/vc.plist"];
+            if (d && d[@"metaFix"]) vcamMetaFixCached = [d[@"metaFix"] boolValue];
+        } @catch (NSException *e) {}
+    }
+    return vcamMetaFixCached;
+}
+
+// 曝光相关附件 key(剥离目标; 颜色附件 Primaries/Transfer/Matrix 不在此列, 不受影响)
+static NSArray *vcamExposureKeys(void) {
+    static NSArray *keys;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        keys = @[@"ExposureTime", @"ExposureBiasValue", @"ExposureIndex",
+                 @"Sensitivity", @"ISOSensitivity", @"BrightnessValue",
+                 @"LuxLevel", @"AvgLuma", @"RecommendedAvgLuma",
+                 @"AnalogGain", @"DigitalGain", @"ISPGain", @"SensorGain", @"AGC"];
+    });
+    return keys;
+}
+
+// 从 CMSampleBuffer + CVPixelBuffer 双侧剥离曝光元数据(任意 mode 全清)
+static void vcamStripExposureMeta(CMSampleBufferRef sb, CVPixelBufferRef pb) {
+    if (!vcamMetaFixOn()) return;
+    for (NSString *key in vcamExposureKeys()) {
+        CFStringRef ck = (__bridge CFStringRef)key;
+        if (sb) CMRemoveAttachment(sb, ck);
+        if (pb) CMRemoveAttachment(pb, ck);
+    }
+}
+
+// 中心十字 5 点 Y/G 采样(与 VCamCore dumpBufferDiagnostics 同模式)
+static NSString *vcamLumaSamples(CVPixelBufferRef pb) {
+    if (!pb) return @"nil";
+    size_t w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb);
+    CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    NSMutableArray *samples = [NSMutableArray array];
+    size_t xs[5], ys[5];
+    size_t cx = w / 2, cy = h / 2;
+    xs[0] = cx;      ys[0] = cy;
+    xs[1] = cx / 2;  ys[1] = cy;
+    xs[2] = cx + cx / 2; ys[2] = cy;
+    xs[3] = cx;      ys[3] = cy / 2;
+    xs[4] = cx;      ys[4] = cy + cy / 2;
+    if (CVPixelBufferGetPlaneCount(pb) >= 1) {
+        uint8_t *base = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+        size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+        if (base) for (int i = 0; i < 5; i++)
+            if (xs[i] < w && ys[i] < h) [samples addObject:@(base[ys[i] * bpr + xs[i]])];
+    } else {
+        uint8_t *base = CVPixelBufferGetBaseAddress(pb);
+        size_t bpr = CVPixelBufferGetBytesPerRow(pb);
+        if (base) for (int i = 0; i < 5; i++)
+            if (xs[i] < w && ys[i] < h) [samples addObject:@(base[ys[i] * bpr + xs[i] * 4 + 1])];
+    }
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    return samples.description;
+}
+
+static NSString *vcamTrunc(NSString *s, NSUInteger n) {
+    if (!s || s.length <= n) return s ?: @"{}";
+    return [NSString stringWithFormat:@"%@...", [s substringToIndex:n]];
+}
+
+// still 管线到达诊断: 像素亮度(定位增益发生段) + 全部附件(找曝光元数据真实 key)
+static void vcamDumpStillArrival(NSString *tag, int idx, CMSampleBufferRef sb, CVPixelBufferRef pb) {
+    if (!pb) return;
+    OSType fmt = CVPixelBufferGetPixelFormatType(pb);
+    NSString *sbA = @"{}", *pbA = @"{}";
+    if (sb) {
+        CFDictionaryRef d1 = CMCopyDictionaryOfAttachments(NULL, sb, kCMAttachmentMode_ShouldPropagate);
+        if (d1) { sbA = vcamTrunc(CFBridgingRelease(d1).description, 700); }
+    }
+    CFDictionaryRef d2 = CMCopyDictionaryOfAttachments(NULL, pb, kCMAttachmentMode_ShouldPropagate);
+    if (d2) { pbA = vcamTrunc(CFBridgingRelease(d2).description, 700); }
+    vcam_tweak_log([NSString stringWithFormat:
+        @"[vcam][still] %@#%d fmt=0x%x %zux%zu Y/G=%@ metaFix=%d sbAtts=%@ pbAtts=%@",
+        tag, idx, (unsigned)fmt, CVPixelBufferGetWidth(pb), CVPixelBufferGetHeight(pb),
+        vcamLumaSamples(pb), vcamMetaFixOn(), sbA, pbA]);
 }
 
 #pragma mark - Hook 函数原始指针
@@ -116,6 +212,19 @@ static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBuffer
         // 就地改写原 sample buffer 的 CVPixelBuffer, 然后调原 IMP 发射(假帧流向所有下游)
         CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
         if (pixelBuffer) {
+            // 照片流格式(-8f0/|8f0/|8v0): 到达诊断 + 源头剥离曝光元数据
+            // (防 emit→scaler 之间基于元数据的增益; 视频流/预览流不动, 只动照片流)
+            OSType efmt = CVPixelBufferGetPixelFormatType(pixelBuffer);
+            BOOL photoStream = (efmt == 0x2d386630 /* -8f0 */ ||
+                                efmt == 0x7c386630 /* |8f0 */ ||
+                                efmt == 0x7c387630 /* |8v0 */);
+            if (photoStream) {
+                vcamPhotoEmitCount++;
+                if (vcamPhotoEmitCount <= 16 || vcamPhotoEmitCount % 300 == 0) {
+                    vcamDumpStillArrival(@"emitPhoto", vcamPhotoEmitCount, sampleBuffer, pixelBuffer);
+                }
+                vcamStripExposureMeta(sampleBuffer, pixelBuffer);
+            }
             @try {
                 [[VCamCore sharedInstance] renderReplacementToPixelBuffer:pixelBuffer];
             } @catch (NSException *e) {
@@ -135,6 +244,13 @@ static void hook_BWStillImageScalerNode_renderSampleBuffer(id self, SEL _cmd, CM
     if (sampleBuffer) {
         CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
         if (pixelBuffer) {
+            // 到达诊断(替换前): 若此处像素已亮于 emit 时写入值, 增益发生在 emit→scaler 段
+            vcamScalerArrCount++;
+            if (vcamScalerArrCount <= 16 || vcamScalerArrCount % 200 == 0) {
+                vcamDumpStillArrival(@"scaler", vcamScalerArrCount, sampleBuffer, pixelBuffer);
+            }
+            // 曝光元数据剥离(防 scaler 内部/下游基于元数据拉增益)
+            vcamStripExposureMeta(sampleBuffer, pixelBuffer);
             @try {
                 [[VCamCore sharedInstance] renderReplacementToPixelBuffer:pixelBuffer];
             } @catch (NSException *e) {
@@ -153,6 +269,13 @@ static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self, SEL _cmd, CMSamp
     if (sampleBuffer) {
         CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
         if (pixelBuffer) {
+            // 到达诊断(替换前): 若此处正常而最终照片过曝, 增益发生在编码器内部(元数据剥离是唯一机会)
+            vcamEncoderArrCount++;
+            if (vcamEncoderArrCount <= 16 || vcamEncoderArrCount % 200 == 0) {
+                vcamDumpStillArrival(@"encoder", vcamEncoderArrCount, sampleBuffer, pixelBuffer);
+            }
+            // 曝光元数据剥离(编码前最后机会)
+            vcamStripExposureMeta(sampleBuffer, pixelBuffer);
             @try {
                 [[VCamCore sharedInstance] renderReplacementToPixelBuffer:pixelBuffer];
             } @catch (NSException *e) {
