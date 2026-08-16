@@ -274,28 +274,31 @@ static void vcam_core_log(NSString *msg) {
         [self->_videoPlayer startDecodingThread]; // 空转线程恢复解码标志
     }
 
-    // 少数派方向流降频(2026-08-16 云闪付扫码 CPU 配额被杀修复):
-    // 扫码场景 3 流 90 renders/s CPU 67% → ~110s 被杀(telemetry v2 实证)。
-    // 其中两条横流(1280x720 -8f0/BGRA)是扫码头分析流(用户不可见), 全速替换纯烧配额。
-    // 方向少数派 = 辅助流: 实时按横竖渲染占比判定, 少数派流降到 ~15fps。
-    // 预览(多数派)不受影响; 视频通话录像流若为少数派 → 15fps 画面(远好于黑屏)。
-    // 计数每 150 帧重置(窗口化防长期倾斜)
+    // 辅助流降频 v2(2026-08-16 扫码 CPU 配额被杀修复, v1 数量少数派判定翻车:
+    // 扫码场景 1 竖预览 + 2 横分析流 → 竖(可见预览)反成数量少数派被降频 → 画面跳动)。
+    // 正确判据: 竖屏会话(窗口内见过竖流)中的 横向流 + BGRA 流 = 分析流:
+    //   - BGRA 格式从不用于显示层(预览用 |8v0/420f), 必是 CV 分析喂料(人脸/二维码)
+    //   - 竖屏 App 里的横流(传感器原生方向)是分析/辅助流, 用户不可见
+    // 全部辅助流共享 ~15fps 预算(合计), 可见预览流全速。
+    // 横屏 App(窗口内无竖流) → 横流即预览方向, 全速, 不误伤。
+    // 计数 150 帧窗口 >>2 衰减, 方向切换自适应
     {
         static int64_t landscapeCnt = 0, portraitCnt = 0;
-        static CFAbsoluteTime lastLandscapeTick = 0, lastPortraitTick = 0;
+        static CFAbsoluteTime lastAuxTick = 0;
         BOOL isLandscape = (targetW > targetH);
-        if (isLandscape) landscapeCnt++; else portraitCnt++;
+        BOOL isPortrait = (targetH > targetW);
+        if (isLandscape) landscapeCnt++; else if (isPortrait) portraitCnt++;
         if ((landscapeCnt + portraitCnt) >= 150) { landscapeCnt >>= 2; portraitCnt >>= 2; }
 
-        BOOL minority = isLandscape ? (landscapeCnt < portraitCnt)
-                                    : (portraitCnt < landscapeCnt);
-        if (minority) {
+        BOOL portraitSession = (portraitCnt > 0);
+        BOOL isAuxStream = portraitSession &&
+                           (isLandscape || origFormat == kCVPixelFormatType_32BGRA);
+        if (isAuxStream) {
             CFAbsoluteTime nowT = CFAbsoluteTimeGetCurrent();
-            CFAbsoluteTime last = isLandscape ? lastLandscapeTick : lastPortraitTick;
-            if (last > 0 && (nowT - last) < 0.066) {
-                return;  // 15fps 上限: 该方向本窗口内已写过, 跳过(保留相机帧)
+            if (lastAuxTick > 0 && (nowT - lastAuxTick) < 0.066) {
+                return;  // 辅助流 15fps 合计预算: 分析流喂真实帧(扫码反而更快)
             }
-            if (isLandscape) lastLandscapeTick = nowT; else lastPortraitTick = nowT;
+            lastAuxTick = nowT;
         }
     }
 

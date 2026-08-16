@@ -163,12 +163,12 @@ static void vcam_player_log(NSString *msg) {
     return 30.0;
 }
 
-// 解码分辨率上限(2026-08-16 CPU 配额被杀修复, 默认降到 1080):
+// 解码分辨率上限(2026-08-16 CPU 配额被杀修复, 默认 720):
 // kCVPixelBufferWidth/HeightKey 直接指定解码输出尺寸, AVAssetReader 底层走 VT
 // 缩放解码 —— SW 解码+预渲染旋转的 CPU 随像素数线性下降。
-// mediaserverd CPU 配额实测撑不住(替换活跃 ~150s 被杀): 解码降采样是确定性
-// 减负项(1244x1660 → 810x1080 省 ~2.4x), 预览 1080p 视觉差异小。
-// vc.plist "decodeMaxEdge": 0=不限制, 显式数值则用该值, 缺省 1080
+// mediaserverd CPU 配额实测: 扫码场景 CPU 67% ~110s 被杀, 必须 总量 <50%。
+// decodeMaxEdge 720(1244x1660 → 540x720): 解码+旋转 ~20%→~9%, 预览 720p
+// 视觉差异小(替换视频本身是压缩视频)。vc.plist "decodeMaxEdge": 0=不限制
 static size_t vcam_decode_max_edge(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -176,11 +176,11 @@ static size_t vcam_decode_max_edge(void) {
             NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Media/DCIM/vc.plist"];
             if (d && d[@"decodeMaxEdge"]) {
                 NSInteger v = [d[@"decodeMaxEdge"] integerValue];
-                cached = (int)(v >= 0 ? v : 1080);
+                cached = (int)(v >= 0 ? v : 720);
             } else {
-                cached = 1080;
+                cached = 720;
             }
-        } @catch (NSException *e) { cached = 1080; }
+        } @catch (NSException *e) { cached = 720; }
     }
     return (size_t)cached;
 }
