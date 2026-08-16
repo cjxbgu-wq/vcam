@@ -206,7 +206,7 @@ static void vcam_gpu_log(NSString *msg) {
             if (createDevice) {
                 id device = (__bridge id)createDevice();
                 if (device) {
-                    CIContext *gpuCtx = [CIContext contextWithMTLDevice:(__bridge id<MTLDevice>)device];
+                    CIContext *gpuCtx = [CIContext contextWithMTLDevice:device];
                     if (gpuCtx) {
                         _ciGPUContext = gpuCtx;
                         _metalAvailable = YES;
