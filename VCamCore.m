@@ -265,6 +265,17 @@ static void vcam_core_log(NSString *msg) {
     // (如 328x184 '18f0'), 替换它无视觉意义但每帧 VT 转换挤占 mediaserverd →
     // AURemoteIO RPC 超时 → mediaserverd 被杀死循环。可见预览流(≥720p)不受影响
     if (targetW * targetH < 640 * 480) {
+        // 跳过诊断(每 key 一次, 2026-08-16 跳动取证): 若用户报告"替换/真实画面
+        // 交替跳动", 该日志可确认是否有可见微型流(如抖音美颜链小流被送上屏)被跳过
+        static NSMutableSet *seenTinyStreams = nil;
+        if (!seenTinyStreams) seenTinyStreams = [NSMutableSet set];
+        NSString *tinyKey = [NSString stringWithFormat:@"%zu_%zu_%u", targetW, targetH, (unsigned)origFormat];
+        @synchronized(seenTinyStreams) {
+            if (![seenTinyStreams containsObject:tinyKey]) {
+                [seenTinyStreams addObject:tinyKey];
+                vcam_core_log([NSString stringWithFormat:@"[vcam] tiny stream skipped: %@ (flashes if visible)", tinyKey]);
+            }
+        }
         return;
     }
 

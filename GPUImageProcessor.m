@@ -1049,10 +1049,16 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
 
     BOOL isPrivate = !(dstFormat == kCVPixelFormatType_32BGRA ||
                        (dstFormat & 0xffffffef) == '420f');
-    BOOL sameSize = (srcW == dstW && srcH == dstH);
 
-    if (isPrivate && !sameSize) {
-        // 两步法 per-key: 每条流一把锁 —— 拍照流/预览流/录像流完全并行
+    // BGRA 目标也走两步法(2026-08-16 CPU 贴线修复): CPU 冻结机制只对两步法生效
+    // (token 复用跳过 stage1 缩放), 一步路径每帧全量转换无法降载 —— 实测 3 流场景
+    // (|8v0 + -8f0 + BGRA) CPU 持续 51-54% 贴 50% 红线(180s 窗口超限被杀=黑屏循环)。
+    // BGRA 流 staging 后: 冻结帧只做 stage2(BGRA→BGRA 同尺寸 blit ~1-2ms vs 全量
+    // ~5ms), 30fps 中 2/3 帧冻结 → 平均成本降 ~1/3。
+    // 私有格式统一两步(含 sameSize, 冻结对同尺寸私有流同样生效)。
+    // 420v/420f 目标保持一步直转: YUV→YUV 直转 range 正确, 走 BGRA 中转会引入
+    // 两次矩阵转换的 range 漂移(照片过曝教训)
+    if (isPrivate || dstFormat == kCVPixelFormatType_32BGRA) {
         NSLock *keyLock = [self twoStepLockForKey:poolKey];
         [keyLock lock];
         BOOL ok = [self twoStepTransferLocked:src toPixelBuffer:dst key:poolKey token:token];
