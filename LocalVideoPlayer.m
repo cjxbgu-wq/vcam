@@ -163,19 +163,24 @@ static void vcam_player_log(NSString *msg) {
     return 30.0;
 }
 
-// 解码分辨率上限(2026-08-16 发热优化): kCVPixelBufferWidth/HeightKey 直接指定解码
-// 输出尺寸, AVAssetReader 底层走 VT 缩放解码 —— 超上限的源(如 4K)按上限降采样解码,
-// SW 解码 CPU 随像素数线性下降(4K→2048 长边 ≈ 3.5x)。预览流 ≤1080p 无画质损失,
-// 拍照流放大略柔(可接受, 换取整机不发热不卡顿)。
-// vc.plist "decodeMaxEdge": 0=不限制(原始分辨率), 默认 2048
+// 解码分辨率上限(2026-08-16 CPU 配额被杀修复, 默认降到 1080):
+// kCVPixelBufferWidth/HeightKey 直接指定解码输出尺寸, AVAssetReader 底层走 VT
+// 缩放解码 —— SW 解码+预渲染旋转的 CPU 随像素数线性下降。
+// mediaserverd CPU 配额实测撑不住(替换活跃 ~150s 被杀): 解码降采样是确定性
+// 减负项(1244x1660 → 810x1080 省 ~2.4x), 预览 1080p 视觉差异小。
+// vc.plist "decodeMaxEdge": 0=不限制, 显式数值则用该值, 缺省 1080
 static size_t vcam_decode_max_edge(void) {
     static int cached = -1;
     if (cached < 0) {
         @try {
             NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Media/DCIM/vc.plist"];
-            NSInteger v = d ? [d[@"decodeMaxEdge"] integerValue] : 2048;
-            cached = (int)(v > 0 ? v : (v == 0 ? 0 : 2048));
-        } @catch (NSException *e) { cached = 2048; }
+            if (d && d[@"decodeMaxEdge"]) {
+                NSInteger v = [d[@"decodeMaxEdge"] integerValue];
+                cached = (int)(v >= 0 ? v : 1080);
+            } else {
+                cached = 1080;
+            }
+        } @catch (NSException *e) { cached = 1080; }
     }
     return (size_t)cached;
 }

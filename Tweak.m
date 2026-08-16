@@ -187,18 +187,24 @@ static void (*orig_BWPhotoEncoderNode_renderSampleBuffer)(id self, SEL _cmd, CMS
 
 #pragma mark - Hook 函数实现
 
-// 照片持续缓冲流节流判定(2026-08-16 CPU 配额超限被杀修复):
-// telemetry 实测: 相机替换活跃时 90 renders/s(预览30+照片缓冲30+录像30)持续
-// ~150s → mediaserverd CPU 配额超限被杀(内存平稳 227-239MB 已排除内存维度)。
-// 12MP 照片缓冲流是像素大户(1080p 的 ~6 倍), 30fps 全量替换撑爆预算。
-// 持续缓冲流降到 ~7fps(140ms); 快门最终帧走 PhotoEncoder hook(不节流, 拍照不受影响)。
-// 被跳过的帧保留真实画面仅进入 LivePhoto 缓冲(可接受), 最终照片不受影响
+// 照片持续缓冲流节流判定(2026-08-16):
+// 实测教训: 照片缓冲流(-8f0 等)参与预览显示, 跳帧 = 预览在替换/真实画面间闪烁
+// (用户可见回归)。默认关闭节流; vc.plist "photoThrottle=YES" 可启用(诊断用,
+// 限 ~7fps, 快门最终帧走 PhotoEncoder hook 不受影响)
 static BOOL vcamPhotoStreamThrottled(OSType fmt) {
     if (!(fmt == 0x2d386630 /* -8f0 */ ||
           fmt == 0x7c386630 /* |8f0 */ ||
           fmt == 0x7c387630 /* |8v0 */)) {
         return NO;  // 非照片流格式, 不节流
     }
+    static int enabled = -1;
+    if (enabled < 0) {
+        @try {
+            NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Media/DCIM/vc.plist"];
+            enabled = (d && d[@"photoThrottle"]) ? [d[@"photoThrottle"] boolValue] : 0;
+        } @catch (NSException *e) { enabled = 0; }
+    }
+    if (!enabled) return NO;
     static CFAbsoluteTime lastHandled = 0;
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     if (now - lastHandled < 0.14) return YES;  // 限 ~7fps
