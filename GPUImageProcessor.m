@@ -1049,16 +1049,19 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
 
     BOOL isPrivate = !(dstFormat == kCVPixelFormatType_32BGRA ||
                        (dstFormat & 0xffffffef) == '420f');
+    BOOL isYuv = ((dstFormat & 0xffffffef) == '420f');  // 420f/420v 掩码同判
+    uint64_t dstPixels = (uint64_t)dstW * dstH;
 
-    // BGRA 目标也走两步法(2026-08-16 CPU 贴线修复): CPU 冻结机制只对两步法生效
-    // (token 复用跳过 stage1 缩放), 一步路径每帧全量转换无法降载 —— 实测 3 流场景
-    // (|8v0 + -8f0 + BGRA) CPU 持续 51-54% 贴 50% 红线(180s 窗口超限被杀=黑屏循环)。
-    // BGRA 流 staging 后: 冻结帧只做 stage2(BGRA→BGRA 同尺寸 blit ~1-2ms vs 全量
-    // ~5ms), 30fps 中 2/3 帧冻结 → 平均成本降 ~1/3。
-    // 私有格式统一两步(含 sameSize, 冻结对同尺寸私有流同样生效)。
-    // 420v/420f 目标保持一步直转: YUV→YUV 直转 range 正确, 走 BGRA 中转会引入
-    // 两次矩阵转换的 range 漂移(照片过曝教训)
-    if (isPrivate || dstFormat == kCVPixelFormatType_32BGRA) {
+    // 420f/420v 预览流也走两步法(2026-08-16 卡顿根因修复): 实测 1080p 420f 一步
+    // 直转每帧 ~8-10ms × 30fps ≈ 25-30% CPU, 三流场景冲 53% 超红线 → 冻结触发
+    // (内容 10fps, 用户观感"播放一会儿非常卡顿")甚至 mediaserverd 被杀。
+    // 纳入 staging 后冻结帧只做 stage2(BGRA→420 同尺寸转换 ~2ms)。
+    // 例外: ≥10MP 大帧(拍照流 4032x3024=12MP)保持一步直转 —— 拍照编码流走 BGRA
+    // 中转曾致照片过曝(full-range 语义丢失), 且低频流冻结无收益;
+    // 预览/录像流(1080p=2MP, 2112x1188=2.5MP, 4K=8.3MP)全部 <10MP 走两步。
+    // BGRA 目标同理(同尺寸 blit 冻结后 ~1-2ms)。私有格式统一两步(含 sameSize)。
+    if (isPrivate || dstFormat == kCVPixelFormatType_32BGRA ||
+        (isYuv && dstPixels < 10000000ull)) {
         NSLock *keyLock = [self twoStepLockForKey:poolKey];
         [keyLock lock];
         BOOL ok = [self twoStepTransferLocked:src toPixelBuffer:dst key:poolKey token:token];
