@@ -277,6 +277,17 @@ static void vcam_core_log(NSString *msg) {
         [self->_videoPlayer startDecodingThread]; // 空转线程恢复解码标志
     }
 
+    // 1. 取预渲染缓存(YUV 主源, 等价千面 [player copyCurrentFrame]) + 帧代数
+    // (提前到 CPU 降载块之前获取: 冻结机制需要读写 gen)
+    [_processLock lock];
+    CVPixelBufferRef yuv = _liveYUVPixelBuffer;
+    if (yuv) CVPixelBufferRetain(yuv);
+    uint64_t gen = _liveFrameGen;
+    [_processLock unlock];
+    // 帧代数经 writeFrame:toPixelBuffer:token: 参数传递(不写 gpuProcessor 全局属性,
+    // 多 hook 线程并发 render 时全局赋值会互相覆盖导致 staging 误用别帧内容)
+    CVPixelBufferRef bgra = NULL;
+
     // CPU 闭环降载(2026-08-16 扫码 CPU 配额被杀最终修复 v3, 取代所有"猜流"启发式):
     // 教训链: 方向判定误伤录像流(跳动)/照片流跳帧闪预览/低分辨率照片流判定误伤
     // 抖音美颜链(比例跳动)+漏掉扫码页可见流 —— 任何"猜哪条流不可见"都不可靠。
@@ -311,16 +322,19 @@ static void vcam_core_log(NSString *msg) {
         }
         if (lowPower) {
             // 冻结节拍: 该流 100ms 内已做过完整替换 → 本帧传旧 token(staging 复用)
+            // @synchronized: 多 hook 线程(预览/照片/编码)并发 render, static 字典需保护
             static NSMutableDictionary<NSString *, NSDictionary *> *freezeState = nil;
             if (!freezeState) freezeState = [NSMutableDictionary dictionary];
             NSString *fk = [NSString stringWithFormat:@"%zu_%zu_%u", targetW, targetH, (unsigned)origFormat];
-            NSDictionary *st = freezeState[fk];
-            CFAbsoluteTime lastFull = st ? [st[@"t"] doubleValue] : 0;
-            uint64_t lastTok = st ? [st[@"tok"] unsignedLongLongValue] : 0;
-            if (lastFull > 0 && (nowT - lastFull) < 0.1 && lastTok != 0) {
-                gen = lastTok;  // 冻结: twoStep 跳过 stage1 缩放, CCW90 复用缓存
-            } else {
-                freezeState[fk] = @{@"t": @(nowT), @"tok": @(gen)};
+            @synchronized(freezeState) {
+                NSDictionary *st = freezeState[fk];
+                CFAbsoluteTime lastFull = st ? [st[@"t"] doubleValue] : 0;
+                uint64_t lastTok = st ? [st[@"tok"] unsignedLongLongValue] : 0;
+                if (lastFull > 0 && (nowT - lastFull) < 0.1 && lastTok != 0) {
+                    gen = lastTok;  // 冻结: twoStep 跳过 stage1 缩放, CCW90 复用缓存
+                } else {
+                    freezeState[fk] = @{@"t": @(nowT), @"tok": @(gen)};
+                }
             }
         }
     }
@@ -329,16 +343,6 @@ static void vcam_core_log(NSString *msg) {
     static int vcamRenderCount = 0;
     vcamRenderCount++;
     BOOL diagThisFrame = (vcamRenderCount % 600 == 1);
-
-    // 1. 取预渲染缓存(YUV 主源, 等价千面 [player copyCurrentFrame])
-    [_processLock lock];
-    CVPixelBufferRef yuv = _liveYUVPixelBuffer;
-    if (yuv) CVPixelBufferRetain(yuv);
-    uint64_t gen = _liveFrameGen;
-    [_processLock unlock];
-    // 帧代数经 writeFrame:toPixelBuffer:token: 参数传递(不写 gpuProcessor 全局属性,
-    // 多 hook 线程并发 render 时全局赋值会互相覆盖导致 staging 误用别帧内容)
-    CVPixelBufferRef bgra = NULL;
 
     // 注: 曾尝试渲染缓存(gen 相同则 memcpy 上次输出, 省 VT 转换) —— 已移除:
     // 相机帧是 IOSurface-backed(GPU/ISP 并发持有), VT 内部有同步而裸 memcpy 没有,
