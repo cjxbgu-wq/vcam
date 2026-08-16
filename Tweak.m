@@ -187,6 +187,25 @@ static void (*orig_BWPhotoEncoderNode_renderSampleBuffer)(id self, SEL _cmd, CMS
 
 #pragma mark - Hook 函数实现
 
+// 照片持续缓冲流节流判定(2026-08-16 CPU 配额超限被杀修复):
+// telemetry 实测: 相机替换活跃时 90 renders/s(预览30+照片缓冲30+录像30)持续
+// ~150s → mediaserverd CPU 配额超限被杀(内存平稳 227-239MB 已排除内存维度)。
+// 12MP 照片缓冲流是像素大户(1080p 的 ~6 倍), 30fps 全量替换撑爆预算。
+// 持续缓冲流降到 ~7fps(140ms); 快门最终帧走 PhotoEncoder hook(不节流, 拍照不受影响)。
+// 被跳过的帧保留真实画面仅进入 LivePhoto 缓冲(可接受), 最终照片不受影响
+static BOOL vcamPhotoStreamThrottled(OSType fmt) {
+    if (!(fmt == 0x2d386630 /* -8f0 */ ||
+          fmt == 0x7c386630 /* |8f0 */ ||
+          fmt == 0x7c387630 /* |8v0 */)) {
+        return NO;  // 非照片流格式, 不节流
+    }
+    static CFAbsoluteTime lastHandled = 0;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now - lastHandled < 0.14) return YES;  // 限 ~7fps
+    lastHandled = now;
+    return NO;
+}
+
 // Hook 1: BWNodeOutput emitSampleBuffer:
 // 主预览流 —— 所有 app 的相机预览/录像都经过这里(逆向: 就地改写原 buffer 后调原 IMP,
 // 假帧顺原生管线流向所有下游消费者: 预览/录像编码器/拍照编码器)
@@ -232,6 +251,13 @@ static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBuffer
                 }
                 vcamStripExposureMeta(sampleBuffer, pixelBuffer);
             }
+            // 照片缓冲流节流: CPU 配额保护(见 vcamPhotoStreamThrottled 注释)
+            if (vcamPhotoStreamThrottled(CVPixelBufferGetPixelFormatType(pixelBuffer))) {
+                if (orig_BWNodeOutput_emitSampleBuffer) {
+                    orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
+                }
+                return;
+            }
             @try {
                 [[VCamCore sharedInstance] renderReplacementToPixelBuffer:pixelBuffer];
             } @catch (NSException *e) {
@@ -258,6 +284,13 @@ static void hook_BWStillImageScalerNode_renderSampleBuffer(id self, SEL _cmd, CM
             }
             // 曝光元数据剥离(防 scaler 内部/下游基于元数据拉增益)
             vcamStripExposureMeta(sampleBuffer, pixelBuffer);
+            // 照片缓冲流节流: CPU 配额保护(emit 侧同一判定; encoder 快门路径不节流)
+            if (vcamPhotoStreamThrottled(CVPixelBufferGetPixelFormatType(pixelBuffer))) {
+                if (orig_BWStillImageScalerNode_renderSampleBuffer) {
+                    orig_BWStillImageScalerNode_renderSampleBuffer(self, _cmd, sampleBuffer, input);
+                }
+                return;
+            }
             @try {
                 [[VCamCore sharedInstance] renderReplacementToPixelBuffer:pixelBuffer];
             } @catch (NSException *e) {
