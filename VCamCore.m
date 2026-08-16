@@ -79,6 +79,14 @@ static void vcam_core_log(NSString *msg) {
 @property (nonatomic, assign) uint64_t lastPrerenderSrcGen;
 @property (nonatomic, assign) int lastPrerenderRot;
 @property (nonatomic, assign) BOOL lastPrerenderMirror;
+
+// ===== 相机空闲门控(2026-08-16 发热优化) =====
+// 根因: 替换开启期间解码+预渲染按视频帧率 30fps 常转, 而相机流只在 App 打开相机时
+// 才到达 hook —— "开着替换但没用相机"的绝大部分时间(桌面/后台/非相机 App)全是空转,
+// 这是常驻发热的主源。门控: render 心跳 >2s 无相机流 → 暂停解码(常驻线程空转睡眠,
+// CPU≈0)+预渲染睡眠; 相机流恢复(render 被调)同步即时唤醒(先吃缓存帧, 解码 ~100ms 内跟上)
+@property (nonatomic, assign) CFAbsoluteTime lastRenderActivity;
+@property (nonatomic, assign) BOOL pipelineIdle;
 @end
 
 @implementation VCamCore
@@ -198,6 +206,15 @@ static void vcam_core_log(NSString *msg) {
         return;
     }
 
+    // 相机活跃心跳 + 空闲即时唤醒(2026-08-16 发热优化): 走到这里 = 有真实可见相机流,
+    // 刷新心跳; 若管线处于空闲暂停态(相机关闭过)则同步恢复解码(常驻线程只翻标志, 零延迟),
+    // 本帧先吃 _liveYUVPixelBuffer 缓存帧, 解码 ~100ms 内跟上 —— 用户无感知
+    self->_lastRenderActivity = CFAbsoluteTimeGetCurrent();
+    if (self->_pipelineIdle) {
+        self->_pipelineIdle = NO;                 // 预渲染线程 ≤0.1s 内自行恢复
+        [self->_videoPlayer startDecodingThread]; // 空转线程恢复解码标志
+    }
+
     // 诊断: 降频至每 600 帧(30fps 相机流 ~20s 一条, disk writes 限额保护)
     static int vcamRenderCount = 0;
     vcamRenderCount++;
@@ -243,8 +260,9 @@ static void vcam_core_log(NSString *msg) {
 
     // 3. 自适应旋转(对齐千面 render_disas 0xaf7c-0xafe4): 源/目标宽高比正交(一横一竖)时
     // CCW90 旋转(宽高互换), 预览流(竖向 buffer)与拍照/录像流(横向 buffer)各自正确方向,
-    // 否则拍照保存画面横躺(翻转根因)。方法内部自带 rotationRenderLock
-    CVPixelBufferRef src = [_gpuProcessor adaptiveRotateIfNeeded:base targetWidth:targetW targetHeight:targetH];
+    // 否则拍照保存画面横躺(翻转根因)。方法内部自带 rotationRenderLock。
+    // token=gen: 同一帧被相机多条流渲染时 CCW90 只做一次, 后续流直接复用缓存(每流省 ~2-4ms)
+    CVPixelBufferRef src = [_gpuProcessor adaptiveRotateIfNeeded:base targetWidth:targetW targetHeight:targetH token:gen];
 
     // 4. 写入相机帧: VT transfer(Trim 保比例 crop fill)主路径。
     //    全格式处理无白名单(对齐千面 0xb0f8-0xb154: 私有格式 |8v0/-8f0/p420 也 transfer,
@@ -259,7 +277,7 @@ static void vcam_core_log(NSString *msg) {
         [_renderLock lock];
         CVPixelBufferRef lazyBGRA = [_gpuProcessor convertFormat:yuv toFormat:kCVPixelFormatType_32BGRA];
         if (lazyBGRA) {
-            src = [_gpuProcessor adaptiveRotateIfNeeded:lazyBGRA targetWidth:targetW targetHeight:targetH];
+            src = [_gpuProcessor adaptiveRotateIfNeeded:lazyBGRA targetWidth:targetW targetHeight:targetH token:0];
             CVPixelBufferRelease(lazyBGRA);
         }
         [_renderLock unlock];
@@ -478,6 +496,14 @@ static void vcam_core_log(NSString *msg) {
 
         while (strongSelf.prerenderActive && strongSelf.enabled) {
             @autoreleasepool {
+                // 空闲门控(2026-08-16 发热优化): 相机无流(render 心跳 >2s 无刷新) →
+                // 整条预渲染睡眠等待, 不取帧不转换; render 被调时清 pipelineIdle 自动恢复
+                if (strongSelf.pipelineIdle) {
+                    [NSThread sleepForTimeInterval:0.1];
+                    nextTick = CFAbsoluteTimeGetCurrent();
+                    continue;
+                }
+
                 // effectiveFps = PTS 实测帧率(校准 nominalFrameRate 低估导致的节拍慢放)
                 double fps = strongSelf.videoPlayer.effectiveFps;
                 nextTick += 1.0 / fps;
@@ -598,6 +624,11 @@ static void vcam_core_log(NSString *msg) {
         _enabled = YES;
         [_processLock unlock];
 
+        // 空闲门控基线(2026-08-16 发热优化): enable 后给 2s 心跳宽限, 期间预渲染正常跑
+        // (相机若已开着, render 心跳会持续刷新, 永不进入空闲)
+        _pipelineIdle = NO;
+        _lastRenderActivity = CFAbsoluteTimeGetCurrent();
+
         // 必须在 _enabled=YES 之后启动（否则预渲染 while(enabled) 读到 NO 立即退出, 之后永远不替换）
         [self startPrerenderThread];
         vcam_core_log(@"[vcam] Live state changed to: enabled");
@@ -613,6 +644,7 @@ static void vcam_core_log(NSString *msg) {
         [_processLock lock];
         _enabled = NO;
         [_processLock unlock];
+        _pipelineIdle = NO;  // 门控状态复位, 下次 enable 从正常态启动
         vcam_core_log(@"[vcam] Live state changed to: disabled (frame cache kept)");
         [[VCamNotify sharedInstance] postNotification:VCamNotifyLiveChanged];
     }
@@ -637,6 +669,17 @@ static void vcam_core_log(NSString *msg) {
             vcam_core_log([NSString stringWithFormat:@"[vcam] state change: %d -> %d, calling setEnabled", strongSelf.lastEnabledState, enabled]);
             strongSelf.lastEnabledState = enabled;
             [strongSelf setEnabled:enabled];
+        }
+
+        // 空闲看门狗(2026-08-16 发热优化): 替换开着但相机流心跳 >2s 未刷新
+        // (相机关闭/切后台/非相机 App) → 暂停解码+预渲染, CPU 归零;
+        // 相机重新打开时 render 同步清 pipelineIdle 即时恢复
+        if (strongSelf.isMediaserverdProcess && strongSelf.enabled && !strongSelf.pipelineIdle &&
+            strongSelf->_lastRenderActivity > 0 &&
+            (CFAbsoluteTimeGetCurrent() - strongSelf->_lastRenderActivity) > 2.0) {
+            strongSelf->_pipelineIdle = YES;
+            [strongSelf->_videoPlayer stopDecodingThread];
+            vcam_core_log(@"[vcam] camera idle >2s, pipeline paused (decode+prerender)");
         }
 
         // 旋转/镜像跨进程同步: 悬浮球(SpringBoard)写 vc.plist, mediaserverd 轮询应用

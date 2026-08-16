@@ -75,15 +75,12 @@ static void vcam_gpu_log(NSString *msg) {
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *twoStepFailCountPool; // key -> 连续失败计数
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *twoStepDisabledPool;  // key -> 熔断标记
 
-// 按流并行锁体系(2026-08-15, 对齐千面 render 无全局锁):
-// 旧版一把全局 renderLock 串行所有流 —— 拍照流(4032x3024 大帧 VT ~100ms)持锁期间
-// 预览流全部排队 → 拍照瞬间预览冻结/黑屏。现拆分:
-//   一步 transfer: 按目标格式 3 把锁(BGRA/420f/私有) —— 异格式流并行(拍照 420f 与预览 BGRA 互不阻塞)
-//   两步法: per-key 一把锁 —— 不同尺寸流完全并行
-//   旋转 session(renderRotationSession): 单把锁(同一 session 必须串行)
-@property (nonatomic, strong) NSLock *formatLockBGRA;
-@property (nonatomic, strong) NSLock *formatLockYUV;
-@property (nonatomic, strong) NSLock *formatLockPrivate;
+// 按流并行体系(2026-08-16 自研优化: VT 会话+锁全部 per-stream):
+// 旧版一步 transfer 按格式 3 把锁 —— 同格式的多条流(如 QQ 两条 420f 流)共用
+// 一个 session 串行执行, 多流场景 render 排队延迟大。现改为 per-(w,h,fmt) 池化:
+// 每条流独立 session + 独立锁, 全部流完全并行 VT transfer。
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSValue *> *oneStepSessionPool;   // key -> session
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSLock *> *oneStepKeyLockPool;   // key -> lock
 @property (nonatomic, strong) NSLock *rotationRenderLock;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSLock *> *twoStepKeyLockPool;
 @property (nonatomic, assign) VTPixelRotationSessionRef pixelRotationSession;
@@ -94,6 +91,8 @@ static void vcam_gpu_log(NSString *msg) {
 @property (nonatomic, assign) size_t adaptiveRotateCacheW;
 @property (nonatomic, assign) size_t adaptiveRotateCacheH;
 @property (nonatomic, assign) OSType adaptiveRotateCacheFmt;
+// 旋转结果帧代数: 同一帧(token)多流渲染时只 rotate 一次, 后续流直接复用
+@property (nonatomic, assign) uint64_t adaptiveRotatedGen;
 
 // 私有 API 函数指针
 @property (nonatomic, assign) VTPixelRotationSessionCreateFunc createRotationSession;
@@ -152,11 +151,11 @@ static void vcam_gpu_log(NSString *msg) {
         _twoStepTokenPool = [[NSMutableDictionary alloc] init];
         _twoStepFailCountPool = [[NSMutableDictionary alloc] init];
         _twoStepDisabledPool = [[NSMutableDictionary alloc] init];
-        _formatLockBGRA = [[NSLock alloc] init];
-        _formatLockYUV = [[NSLock alloc] init];
-        _formatLockPrivate = [[NSLock alloc] init];
+        _oneStepSessionPool = [[NSMutableDictionary alloc] init];
+        _oneStepKeyLockPool = [[NSMutableDictionary alloc] init];
         _rotationRenderLock = [[NSLock alloc] init];
         _twoStepKeyLockPool = [[NSMutableDictionary alloc] init];
+        _adaptiveRotatedGen = 0;
 
         // 软件渲染 CIContext（mediaserverd 没有 GPU 上下文）
         @try {
@@ -212,6 +211,12 @@ static void vcam_gpu_log(NSString *msg) {
         [_twoStepSessionPool removeAllObjects];
         [_twoStepStagingPool removeAllObjects];
         [_twoStepTokenPool removeAllObjects];
+        // 一步 transfer per-stream session 池
+        for (NSValue *v in _oneStepSessionPool.allValues) {
+            VTPixelTransferSessionRef s = (VTPixelTransferSessionRef)[v pointerValue];
+            if (s && invalidate) invalidate(s);
+        }
+        [_oneStepSessionPool removeAllObjects];
     }
     // 释放旋转 session 与自适应旋转缓存
     {
@@ -841,18 +846,17 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
     return YES;
 }
 
-// render 路径用: 千面自适应旋转(render_disas 0xaf7c-0xafe4)
-// rotationAngle==0 且源与目标宽高比正交(一横一竖)时 CCW90 旋转(千面 _kVTRotation_CCW90,
-// 宽高互换, 保持源格式) —— 预览流(竖向 buffer)与拍照/录像流(横向 buffer)方向不同,
-// 预渲染帧只按预览方向产出, 写横向 buffer 前需旋转, 否则画面横躺(拍照翻转的根因)。
-// 用 renderRotationSession(独立于预渲染 session), 调用方需持有 renderLock。
-// 旋转 buffer 按尺寸+格式缓存复用(千面 getRotateBufferWithWidth:height: 池化思想)。
+// render 路径用: 自适应正交旋转 —— 源/目标宽高比正交(一横一竖)时 CCW90 旋转
+// (宽高互换, 保持源格式), 预览流(竖向)与拍照/录像流(横向)各自正确方向。
+// token = 帧代数: 同一帧被相机多条流渲染时只 CCW90 一次, 后续流直接复用缓存
+// (每流省一次 VT rotate ~2-4ms, 多流场景 CPU 大降)。传 0 = 不缓存。
 - (CVPixelBufferRef)adaptiveRotateIfNeeded:(CVPixelBufferRef)src
                                targetWidth:(size_t)targetW
-                              targetHeight:(size_t)targetH CF_RETURNS_RETAINED {
+                              targetHeight:(size_t)targetH
+                                     token:(uint64_t)token CF_RETURNS_RETAINED {
     if (!src) return NULL;
     if (_rotationAngle != 0 || !_rotationApiAvailable || !_renderRotationSession) {
-        // 用户已手动旋转(预渲染已应用, 千面 rotationAngle 1/2/3 固定旋转不自适应)或 API 不可用
+        // 用户已手动旋转(预渲染已应用)或 API 不可用
         return (CVPixelBufferRef)CVPixelBufferRetain(src);
     }
 
@@ -862,7 +866,7 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
         return (CVPixelBufferRef)CVPixelBufferRetain(src);
     }
 
-    // 千面 0xaf90-0xafe4: srcRatio/dstRatio 方向正交(一横一竖) -> CCW90
+    // 源/目标宽高比正交(一横一竖) -> CCW90
     double srcRatio = (double)srcW / (double)srcH;
     double dstRatio = (double)targetW / (double)targetH;
     BOOL orthogonal = (srcRatio > 1.0 && dstRatio < 1.0) || (srcRatio < 1.0 && dstRatio > 1.0);
@@ -873,8 +877,19 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
     // rotation session + 缓存串行锁(内部自锁, 调用方无需再包全局锁)
     [_rotationRenderLock lock];
 
-    // CCW90: 宽高互换, 保持源格式(YUV 源旋转后仍是 YUV, 后续 YUV->私有格式转换 range 不变)
     OSType fmt = CVPixelBufferGetPixelFormatType(src);
+
+    // 同帧复用(2026-08-16): 同一帧(token)已旋转过且缓存尺寸/格式匹配 → 直接返回,
+    // 多流共享一次旋转结果
+    if (token != 0 && _adaptiveRotatedGen == token && _adaptiveRotateCache &&
+        _adaptiveRotateCacheW == srcH && _adaptiveRotateCacheH == srcW &&
+        _adaptiveRotateCacheFmt == fmt) {
+        CVPixelBufferRef hit = CVPixelBufferRetain(_adaptiveRotateCache);
+        [_rotationRenderLock unlock];
+        return hit;
+    }
+
+    // CCW90: 宽高互换, 保持源格式(YUV 源旋转后仍是 YUV, 后续 YUV->私有格式转换 range 不变)
     CVPixelBufferRef rotated = NULL;
     if (_adaptiveRotateCache && _adaptiveRotateCacheW == srcH && _adaptiveRotateCacheH == srcW && _adaptiveRotateCacheFmt == fmt) {
         rotated = CVPixelBufferRetain(_adaptiveRotateCache);  // 复用缓存(RotateImage 全覆盖写, 无需清空)
@@ -893,6 +908,9 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
 
     VTSessionSetProperty(_renderRotationSession, _rotationPropertyKey, _rotationCCW90Value);
     OSStatus st = _transferRotationImage(_renderRotationSession, src, rotated);
+    if (st == noErr && token != 0) {
+        _adaptiveRotatedGen = token;  // 旋转成功才登记代数(失败结果不可缓存)
+    }
     [_rotationRenderLock unlock];
     if (st != noErr) {
         vcam_gpu_log([NSString stringWithFormat:@"[vcam] adaptive CCW90 failed: %d fmt=%@ (keep unrotated)",
@@ -977,6 +995,33 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
     }
 }
 
+// 一步 transfer per-stream session/lock 获取(2026-08-16: 每流独立 session,
+// 同格式多条流不再共用 session 串行 —— 多流完全并行, render 排队延迟大降)
+- (VTPixelTransferSessionRef)oneStepSessionForKey:(NSString *)key {
+    @synchronized(self) {
+        NSValue *v = _oneStepSessionPool[key];
+        if (v) return (VTPixelTransferSessionRef)[v pointerValue];
+        VTPixelTransferSessionRef s = NULL;
+        if (VTPixelTransferSessionCreate(kCFAllocatorDefault, &s) == noErr && s) {
+            VTSessionSetProperty(s, CFSTR("ScalingMode"), CFSTR("Trim"));
+            _oneStepSessionPool[key] = [NSValue valueWithPointer:s];
+            return s;
+        }
+        return NULL;
+    }
+}
+
+- (NSLock *)oneStepLockForKey:(NSString *)key {
+    @synchronized(self) {
+        NSLock *l = _oneStepKeyLockPool[key];
+        if (!l) {
+            l = [[NSLock alloc] init];
+            _oneStepKeyLockPool[key] = l;
+        }
+        return l;
+    }
+}
+
 - (BOOL)transferPixelBuffer:(CVPixelBufferRef)src toPixelBuffer:(CVPixelBufferRef)dst token:(uint64_t)token {
     if (!src || !dst) return NO;
 
@@ -986,14 +1031,14 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
     size_t srcW = CVPixelBufferGetWidth(src);
     size_t srcH = CVPixelBufferGetHeight(src);
 
+    NSString *poolKey = [NSString stringWithFormat:@"%zu_%zu_%u", dstW, dstH, (unsigned)dstFormat];
+
     BOOL isPrivate = !(dstFormat == kCVPixelFormatType_32BGRA ||
                        (dstFormat & 0xffffffef) == '420f');
     BOOL sameSize = (srcW == dstW && srcH == dstH);
 
     if (isPrivate && !sameSize) {
-        // 两步法 per-key: 每条流一把锁 —— 拍照流/预览流/录像流完全并行,
-        // 互不阻塞(旧版全局锁时拍照大帧转换 ~100ms 会让预览冻结)
-        NSString *poolKey = [NSString stringWithFormat:@"%zu_%zu_%u", dstW, dstH, (unsigned)dstFormat];
+        // 两步法 per-key: 每条流一把锁 —— 拍照流/预览流/录像流完全并行
         NSLock *keyLock = [self twoStepLockForKey:poolKey];
         [keyLock lock];
         BOOL ok = [self twoStepTransferLocked:src toPixelBuffer:dst key:poolKey token:token];
@@ -1001,28 +1046,14 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
         return ok;
     }
 
-    // 一步 transfer: 按目标格式选 session + 对应格式锁(异格式流并行, 对齐千面
-    // 0xb0f8-0xb154 三套 session 隔离; 同格式流共用 session 需串行)
-    VTPixelTransferSessionRef session = NULL;
-    NSLock *fmtLock = NULL;
-    if (dstFormat == kCVPixelFormatType_32BGRA) {
-        if (!_bgraTransferSession) [self setupBGRATransferSession];
-        session = _bgraTransferSession;
-        fmtLock = _formatLockBGRA;
-    } else if ((dstFormat & 0xffffffef) == '420f') {  // 420v/420f 抹掉 video/full-range 位
-        if (!_yuvTransferSession) [self setupYUVTransferSession];
-        session = _yuvTransferSession;
-        fmtLock = _formatLockYUV;
-    } else {
-        if (!_privateTransferSession) [self setupPrivateTransferSession];
-        session = _privateTransferSession;
-        fmtLock = _formatLockPrivate;
-    }
-    if (!session || !fmtLock) return NO;
+    // 一步 transfer per-stream: 每条流独立 session+锁, 全流并行
+    NSLock *lock = [self oneStepLockForKey:poolKey];
+    VTPixelTransferSessionRef session = [self oneStepSessionForKey:poolKey];
+    if (!session || !lock) return NO;
 
-    [fmtLock lock];
+    [lock lock];
     OSStatus status = VTPixelTransferSessionTransferImage(session, src, dst);
-    [fmtLock unlock];
+    [lock unlock];
     if (status != noErr) {
         vcam_gpu_log([NSString stringWithFormat:@"[vcam] VT transfer failed: %d, %@ -> %@",
                       (int)status,

@@ -59,12 +59,14 @@
 // writeFrame 回退路径: crop fill 渲染到任意格式目标 buffer
 - (BOOL)renderCropFill:(CVPixelBufferRef)input toPixelBuffer:(CVPixelBufferRef)dst;
 
-// render 路径用: 千面自适应旋转(render_disas 0xaf7c-0xafe4) —— 源/目标宽高比正交
-// (一横一竖)时 CCW90 旋转(宽高互换, 保持源格式), 预览(竖向 buffer)与拍照/录像
-// (横向 buffer)各自得到正确方向; 用户已手动旋转(rotationAngle!=0)时不自适应
+// render 路径用: 自适应正交旋转 —— 源/目标宽高比正交(一横一竖)时 CCW90 旋转
+// (宽高互换, 保持源格式); 用户已手动旋转(rotationAngle!=0)时不自适应。
+// token = 帧代数: 同一帧被相机多条流渲染时只旋转一次, 后续流直接复用缓存
+// (每流省一次 VT rotate ~2-4ms)。传 0 = 不缓存(fallback 路径)。
 - (CVPixelBufferRef)adaptiveRotateIfNeeded:(CVPixelBufferRef)src
                                targetWidth:(size_t)targetW
-                              targetHeight:(size_t)targetH CF_RETURNS_RETAINED;
+                              targetHeight:(size_t)targetH
+                                     token:(uint64_t)token CF_RETURNS_RETAINED;
 
 // 格式转换（BGRA -> YUV 等）
 - (BOOL)transferPixelBuffer:(CVPixelBufferRef)src toPixelBuffer:(CVPixelBufferRef)dst;

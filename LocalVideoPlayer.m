@@ -163,6 +163,23 @@ static void vcam_player_log(NSString *msg) {
     return 30.0;
 }
 
+// 解码分辨率上限(2026-08-16 发热优化): kCVPixelBufferWidth/HeightKey 直接指定解码
+// 输出尺寸, AVAssetReader 底层走 VT 缩放解码 —— 超上限的源(如 4K)按上限降采样解码,
+// SW 解码 CPU 随像素数线性下降(4K→2048 长边 ≈ 3.5x)。预览流 ≤1080p 无画质损失,
+// 拍照流放大略柔(可接受, 换取整机不发热不卡顿)。
+// vc.plist "decodeMaxEdge": 0=不限制(原始分辨率), 默认 2048
+static size_t vcam_decode_max_edge(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        @try {
+            NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Media/DCIM/vc.plist"];
+            NSInteger v = d ? [d[@"decodeMaxEdge"] integerValue] : 2048;
+            cached = (int)(v > 0 ? v : (v == 0 ? 0 : 2048));
+        } @catch (NSException *e) { cached = 2048; }
+    }
+    return (size_t)cached;
+}
+
 - (void)loadVideoAtPath:(NSString *)path completion:(void(^)(BOOL success, NSError *error))completion {
     if (!path || path.length == 0) {
         vcam_player_log(@"Video file not found");
@@ -231,6 +248,26 @@ static void vcam_player_log(NSString *msg) {
     _videoHeight = (size_t)_videoTrack.naturalSize.height;
     _videoFps = _videoTrack.nominalFrameRate;
     _videoDuration = CMTimeGetSeconds(_urlAsset.duration);
+
+    // 解码降采样(2026-08-16 发热优化): 超上限源按上限等比缩放解码输出尺寸(偶数对齐,
+    // YUV 平面要求)。1080p 及以下源不受影响。
+    size_t maxEdge = vcam_decode_max_edge();
+    if (maxEdge > 0) {
+        size_t longEdge = MAX(_videoWidth, _videoHeight);
+        if (longEdge > maxEdge) {
+            double scale = (double)maxEdge / (double)longEdge;
+            size_t nw = ((size_t)((double)_videoWidth * scale)) & ~1u;
+            size_t nh = ((size_t)((double)_videoHeight * scale)) & ~1u;
+            if (nw >= 2 && nh >= 2) {
+                vcam_player_log([NSString stringWithFormat:
+                    @"[vcam] decode downscale: %zux%zu -> %zux%zu (maxEdge=%zu, CPU ~%.1fx down)",
+                    _videoWidth, _videoHeight, nw, nh, maxEdge,
+                    (double)(_videoWidth * _videoHeight) / (double)(nw * nh)]);
+                _videoWidth = nw;
+                _videoHeight = nh;
+            }
+        }
+    }
 
     // 视频自带旋转(preferredTransform): AVAssetReader 解码帧不应用它,
     // 记录下来由预渲染补偿(否则换视频后画面 180°/90° 翻转)
@@ -468,7 +505,12 @@ static void vcam_player_log(NSString *msg) {
     // 常驻线程(2026-08-16): 只创建一次, 不再启停 —— stop/start 交替存在竞争窗口
     // (stop 1s 超时放弃后旧线程可能仍在 copyNextSampleBuffer 内, 此时 start 新线程
     // → 双 decodeLoop 并发触碰 reader)。disable 仅置 _shouldDecode=NO 空转睡眠。
-    if (_decodeThread && _isDecoding) return;
+    if (_decodeThread && _isDecoding) {
+        // 线程仍在(空转睡眠): 恢复解码标志即可(修复 2026-08-16 恢复 bug ——
+        // 旧版此处直接 return, disable→enable 后 _shouldDecode 恒为 NO, 画面冻结)
+        _shouldDecode = YES;
+        return;
+    }
     _shouldDecode = YES;
     _isDecoding = YES;
 
