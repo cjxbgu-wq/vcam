@@ -20,8 +20,8 @@
 // ===== 资源自监控(2026-08-16 黑屏取证) =====
 // mediaserverd 周期性被杀(相机替换运行 ~4-5 分钟后, runs 持续增长)但无 .ips 落盘,
 // 无法从系统侧判死因维度。本探针每 30s 记一行进程资源快照到独立小文件
-// (30s/条 × ~100B = ~300B/s 无 -- 远低于配额; 文件跨进程重启保留):
-//   phys_footprint(物理足迹, jetsam 判定口径) / resident / faults / 渲染帧计数 /
+// (30s/条 × ~100B ≈ 3B/s -- 远低于配额; 文件跨进程重启保留):
+//   phys_footprint(物理足迹, jetsam 判定口径) / resident / 渲染帧计数 /
 //   流池 key 数(LRU 生效证据)。被杀后读最后几行即可判内存爬升 or 平稳(→CPU 方向)
 static void vcam_telemetry_sample(uint64_t renderedFrames, NSUInteger streamKeys) {
     static CFAbsoluteTime lastTel = 0;
@@ -31,17 +31,16 @@ static void vcam_telemetry_sample(uint64_t renderedFrames, NSUInteger streamKeys
 
     task_vm_info_data_t vmInfo;
     mach_msg_type_number_t vmCount = TASK_VM_INFO_COUNT;
-    uint64_t footprint = 0, resident = 0, faults = 0;
+    uint64_t footprint = 0, resident = 0;
     if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmInfo, &vmCount) == KERN_SUCCESS) {
         footprint = vmInfo.phys_footprint;
         resident = vmInfo.resident_size;
-        faults = vmInfo.faults;
     }
 
     @try {
         NSString *line = [NSString stringWithFormat:
-            @"%.0f fp=%lluMB res=%lluMB flt=%llu renders=%llu keys=%lu\n",
-            now, footprint >> 20, resident >> 20, faults, renderedFrames, (unsigned long)streamKeys];
+            @"%.0f fp=%lluMB res=%lluMB renders=%llu keys=%lu\n",
+            now, footprint >> 20, resident >> 20, renderedFrames, (unsigned long)streamKeys];
         NSString *path = @"/tmp/vcam_telemetry.txt";
         NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
         if (!fh) {
