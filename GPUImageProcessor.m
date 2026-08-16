@@ -1055,12 +1055,18 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
         return ok;
     }
 
-    // 一步 transfer per-stream: 每条流独立 session+锁, 全流并行
+    // 一步 transfer per-stream: 每条流独立 session+锁, 全流并行。
+    // 顺序必须是 先取锁对象→lock→再取 session: 若先取 session 后 lock,
+    // LRU 淘汰线程可在窗口内 invalidate 该 session(淘汰持同一把锁) → use-after-free。
+    // lock 后再查: 被淘汰的 key 此刻查不到 session → 本帧 NO(保留相机帧), 下帧重建
     NSLock *lock = [self oneStepLockForKey:poolKey];
-    VTPixelTransferSessionRef session = [self oneStepSessionForKey:poolKey];
-    if (!session || !lock) return NO;
-
+    if (!lock) return NO;
     [lock lock];
+    VTPixelTransferSessionRef session = [self oneStepSessionForKey:poolKey];
+    if (!session) {
+        [lock unlock];
+        return NO;
+    }
     OSStatus status = VTPixelTransferSessionTransferImage(session, src, dst);
     [lock unlock];
     if (status != noErr) {
@@ -1095,19 +1101,28 @@ static const NSUInteger kVcamMaxStreamKeys = 6;
             [_streamKeyOrder removeObjectAtIndex:0];
             if (!old) break;
 
+            // 修复(2026-08-16 崩溃循环): 淘汰必须先持该 key 的 per-key 锁 —— 否则
+            // 另一线程正持锁 transfer 该 staging/session, 我们并发 release →
+            // use-after-free → mediaserverd 启动即崩循环(相机全黑)。
+            // 锁对象先取栈引用(防淘汰后别人拿不到/自身被释放), 字典条目 unlock 后清。
+            // 死锁安全: transfer 路径持 keyLock 期间不再进入 @synchronized(self)
+            NSLock *olock = _oneStepKeyLockPool[old];
+            NSLock *tlock = _twoStepKeyLockPool[old];
+            if (olock) [olock lock];
+            if (tlock) [tlock lock];
+
             void (*invalidateSession)(VTPixelTransferSessionRef) =
                 (void (*)(VTPixelTransferSessionRef))dlsym(RTLD_DEFAULT, "VTPixelTransferSessionInvalidate");
 
-            // one-step session + 锁
+            // one-step session
             NSValue *osv = _oneStepSessionPool[old];
             if (osv) {
                 VTPixelTransferSessionRef s = (VTPixelTransferSessionRef)[osv pointerValue];
                 if (s && invalidateSession) invalidateSession(s);
                 [_oneStepSessionPool removeObjectForKey:old];
             }
-            [_oneStepKeyLockPool removeObjectForKey:old];
 
-            // two-step session(大头是 staging: 12MP 流级 BGRA ~12-48MB/条)
+            // two-step session + staging(大头: 12MP 流级 BGRA ~12-48MB/条)
             NSValue *tsv = _twoStepSessionPool[old];
             if (tsv) {
                 VTPixelTransferSessionRef s = (VTPixelTransferSessionRef)[tsv pointerValue];
@@ -1122,14 +1137,22 @@ static const NSUInteger kVcamMaxStreamKeys = 6;
             }
             [_twoStepTokenPool removeObjectForKey:old];
             [_twoStepFailCountPool removeObjectForKey:old];
-            [_twoStepKeyLockPool removeObjectForKey:old];
+
             // BGRA 分配池(__bridge 存储, 手动 release; 池内 idle buffer 随之释放)
             id poolObj = _bgraBufferPoolMap[old];
             if (poolObj) {
                 CVPixelBufferPoolRelease((__bridge CVPixelBufferPoolRef)poolObj);
                 [_bgraBufferPoolMap removeObjectForKey:old];
             }
+
+            // 锁池条目最后清(先 unlock 再 remove 与先 remove 再 unlock 等价安全,
+            // 统一: unlock 前移除, 持锁线程栈引用保证对象存活)
+            [_oneStepKeyLockPool removeObjectForKey:old];
+            [_twoStepKeyLockPool removeObjectForKey:old];
             // twoStepDisabledPool 故意不清(熔断永久)
+
+            if (tlock) [tlock unlock];
+            if (olock) [olock unlock];
 
             vcam_gpu_log([NSString stringWithFormat:@"[vcam] LRU evict stream key %@ (pool now %lu)", old, (unsigned long)_streamKeyOrder.count]);
         }
