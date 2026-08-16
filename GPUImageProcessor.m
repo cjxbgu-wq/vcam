@@ -98,6 +98,9 @@ static void vcam_gpu_log(NSString *msg) {
 // mediaserverd 内存超限被杀 → 相机黑屏(重进恢复=重启清零, 再累积再黑, 周期循环)。
 // 超 kVcamMaxStreamKeys 淘汰最久未用 key(释放 session+staging), 熔断标记保留
 @property (nonatomic, strong) NSMutableArray<NSString *> *streamKeyOrder;
+// 按流渲染统计(诊断窗口): key -> 渲染次数 / key -> 目标像素累计
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *streamRenderStats;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *streamPixelStats;
 
 // 私有 API 函数指针
 @property (nonatomic, assign) VTPixelRotationSessionCreateFunc createRotationSession;
@@ -162,6 +165,8 @@ static void vcam_gpu_log(NSString *msg) {
         _twoStepKeyLockPool = [[NSMutableDictionary alloc] init];
         _adaptiveRotatedGen = 0;
         _streamKeyOrder = [NSMutableArray array];
+        _streamRenderStats = [NSMutableDictionary dictionary];
+        _streamPixelStats = [NSMutableDictionary dictionary];
 
         // 软件渲染 CIContext（mediaserverd 没有 GPU 上下文）
         @try {
@@ -1052,6 +1057,7 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
         [keyLock lock];
         BOOL ok = [self twoStepTransferLocked:src toPixelBuffer:dst key:poolKey token:token];
         [keyLock unlock];
+        if (ok) [self noteStreamRender:poolKey pixels:(uint64_t)dstW * dstH];
         return ok;
     }
 
@@ -1076,7 +1082,16 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
                       [self stringForFormat:dstFormat]]);
         return NO;
     }
+    [self noteStreamRender:poolKey pixels:(uint64_t)dstW * dstH];
     return YES;
+}
+
+// 按流渲染统计累计(诊断)
+- (void)noteStreamRender:(NSString *)key pixels:(uint64_t)px {
+    @synchronized(self) {
+        _streamRenderStats[key] = @([_streamRenderStats[key] unsignedIntegerValue] + 1);
+        _streamPixelStats[key] = @([_streamPixelStats[key] unsignedLongLongValue] + px);
+    }
 }
 
 // 流 key LRU(2026-08-16 黑屏修复): 每次流访问把 key 移到 MRU 尾部,
@@ -1163,6 +1178,22 @@ static const NSUInteger kVcamMaxStreamKeys = 6;
 - (NSUInteger)activeStreamKeyCount {
     @synchronized(self) {
         return _streamKeyOrder.count;
+    }
+}
+
+// 按流渲染统计(诊断, 30s 窗口): takeStreamStats 输出并清零
+- (NSString *)takeStreamStats {
+    @synchronized(self) {
+        if (_streamRenderStats.count == 0) return @"";
+        NSMutableArray *parts = [NSMutableArray array];
+        for (NSString *k in _streamRenderStats) {
+            NSUInteger cnt = [_streamRenderStats[k] unsignedIntegerValue];
+            uint64_t mb = ([_streamPixelStats[k] unsignedLongLongValue] * 4ull) >> 20;  // BGRA 4B/px
+            [parts addObject:[NSString stringWithFormat:@"%@:%lu/%lluMB", k, (unsigned long)cnt, mb]];
+        }
+        [_streamRenderStats removeAllObjects];
+        [_streamPixelStats removeAllObjects];
+        return [parts componentsJoinedByString:@" "];
     }
 }
 

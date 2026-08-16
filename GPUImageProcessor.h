@@ -83,4 +83,7 @@
 // 当前活跃流 key 数(LRU 上限管理, 资源探针诊断用)
 - (NSUInteger)activeStreamKeyCount;
 
+// 按流渲染统计(诊断): 每 30s 窗口输出 "w_h_fmt:次数/总MB" 并清零重计
+- (NSString *)takeStreamStats;
+
 @end

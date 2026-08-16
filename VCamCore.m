@@ -17,17 +17,34 @@
 #import <CoreVideo/CoreVideo.h>
 #import <mach/mach.h>
 
-// ===== 资源自监控(2026-08-16 黑屏取证) =====
-// mediaserverd 周期性被杀(相机替换运行 ~4-5 分钟后, runs 持续增长)但无 .ips 落盘,
-// 无法从系统侧判死因维度。本探针每 30s 记一行进程资源快照到独立小文件
-// (30s/条 × ~100B ≈ 3B/s -- 远低于配额; 文件跨进程重启保留):
-//   phys_footprint(物理足迹, jetsam 判定口径) / resident / 渲染帧计数 /
-//   流池 key 数(LRU 生效证据)。被杀后读最后几行即可判内存爬升 or 平稳(→CPU 方向)
-static void vcam_telemetry_sample(uint64_t renderedFrames, NSUInteger streamKeys) {
+// ===== 资源自监控(2026-08-16 黑屏取证 v2: +CPU% +按流渲染统计) =====
+// mediaserverd 周期性被杀(相机替换活跃 ~150s)但无 .ips 落盘, 系统侧无法判死因。
+// v2 探针每 30s 记一行: 内存(已证平稳)/进程 CPU%(所有线程 user+system 累计差分)/
+// 按流(w_h_fmt)渲染计数+像素量 —— 被杀前最后一行即可定位烧 CPU 配额的具体流
+static NSString *vcam_process_cpu_seconds(void) {
+    thread_array_t threads;
+    mach_msg_type_number_t tcount = 0;
+    double total = 0;
+    if (task_threads(mach_task_self(), &threads, &tcount) == KERN_SUCCESS) {
+        for (mach_msg_type_number_t i = 0; i < tcount; i++) {
+            thread_basic_info_data_t bi;
+            mach_msg_type_number_t bc = THREAD_BASIC_INFO_COUNT;
+            if (thread_info(threads[i], THREAD_BASIC_INFO, (thread_info_t)&bi, &bc) == KERN_SUCCESS) {
+                total += bi.user_time.seconds + bi.user_time.microseconds / 1e6;
+                total += bi.system_time.seconds + bi.system_time.microseconds / 1e6;
+            }
+            mach_port_deallocate(mach_task_self(), threads[i]);
+        }
+        vm_deallocate(mach_task_self(), (vm_address_t)threads, tcount * sizeof(thread_t));
+    }
+    return [NSString stringWithFormat:@"%.1f", total];
+}
+
+static void vcam_telemetry_sample(uint64_t renderedFrames, NSString *streamStats) {
     static CFAbsoluteTime lastTel = 0;
+    static double lastCpu = 0;
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     if (lastTel > 0 && (now - lastTel) < 30.0) return;
-    lastTel = now;
 
     task_vm_info_data_t vmInfo;
     mach_msg_type_number_t vmCount = TASK_VM_INFO_COUNT;
@@ -37,10 +54,16 @@ static void vcam_telemetry_sample(uint64_t renderedFrames, NSUInteger streamKeys
         resident = vmInfo.resident_size;
     }
 
+    double cpuSec = [vcam_process_cpu_seconds() doubleValue];
+    double cpuPct = (lastTel > 0 && now > lastTel) ? ((cpuSec - lastCpu) / (now - lastTel) * 100.0) : 0;
+    lastTel = now;
+    lastCpu = cpuSec;
+
     @try {
         NSString *line = [NSString stringWithFormat:
-            @"%.0f fp=%lluMB res=%lluMB renders=%llu keys=%lu\n",
-            now, footprint >> 20, resident >> 20, renderedFrames, (unsigned long)streamKeys];
+            @"%.0f fp=%lluMB res=%lluMB cpu=%.0f%% renders=%llu | %@\n",
+            now, footprint >> 20, resident >> 20, cpuPct, renderedFrames,
+            streamStats.length ? streamStats : @"-"];
         NSString *path = @"/tmp/vcam_telemetry.txt";
         NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
         if (!fh) {
@@ -718,11 +741,10 @@ static void vcam_core_log(NSString *msg) {
             vcam_core_log(@"[vcam] camera idle >2s, pipeline paused (decode+prerender)");
         }
 
-        // 资源探针(2026-08-16 黑屏取证): 每 30s 一行内存/渲染/池快照(函数内节流),
-        // mediaserverd 被杀后文件保留 → 读被杀前曲线判死因维度
+        // 资源探针(2026-08-16 黑屏取证 v2): 每 30s 一行内存/CPU%/按流渲染统计
         if (strongSelf.isMediaserverdProcess) {
             vcam_telemetry_sample(strongSelf->_frameCount,
-                                  [strongSelf->_gpuProcessor activeStreamKeyCount]);
+                                  [strongSelf->_gpuProcessor takeStreamStats]);
         }
 
         // 旋转/镜像跨进程同步: 悬浮球(SpringBoard)写 vc.plist, mediaserverd 轮询应用
