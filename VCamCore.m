@@ -307,14 +307,15 @@ static void vcam_core_log(NSString *msg) {
     // 两步法 staging(token) 机制天然支持: 传旧 token → 跳过昂贵缩放(stage1 ~4ms),
     // 只做格式转换(stage2 ~2ms) → 单帧成本降 ~60%, 画面=低帧率视频(连续无感)。
     // 解码/预渲染同步 10fps(降载期), CCW90 随冻结 token 自动复用。
-    // 每 5s 采样进程 CPU%: >46% 进降载, <38% 退出(滞回防抖动)
+    // 每 2s 采样进程 CPU%(2026-08-16 加快响应): >46% 进降载, <38% 退出(滞回防抖动)。
+    // 5s 间隔时突发三流全速可烧 5s 才触发, 冻结晚 → CPU 窗口配额累积 → 被杀循环
     {
         static CFAbsoluteTime lastCpuCheck = 0;
         static CFAbsoluteTime lastCpuSample = 0;
         static double lastCpuSec = 0;
         static BOOL lowPower = NO;
         CFAbsoluteTime nowT = CFAbsoluteTimeGetCurrent();
-        if (nowT - lastCpuCheck > 5.0) {
+        if (nowT - lastCpuCheck > 2.0) {
             double cpuSec = [vcam_process_cpu_seconds() doubleValue];
             if (lastCpuSec > 0 && nowT > lastCpuSample) {
                 double pct = (cpuSec - lastCpuSec) / (nowT - lastCpuSample) * 100.0;
