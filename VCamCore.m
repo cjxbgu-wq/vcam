@@ -15,6 +15,44 @@
 #import "VCamCore.h"
 #import <CoreImage/CoreImage.h>
 #import <CoreVideo/CoreVideo.h>
+#import <mach/mach.h>
+
+// ===== 资源自监控(2026-08-16 黑屏取证) =====
+// mediaserverd 周期性被杀(相机替换运行 ~4-5 分钟后, runs 持续增长)但无 .ips 落盘,
+// 无法从系统侧判死因维度。本探针每 30s 记一行进程资源快照到独立小文件
+// (30s/条 × ~100B = ~300B/s 无 -- 远低于配额; 文件跨进程重启保留):
+//   phys_footprint(物理足迹, jetsam 判定口径) / resident / faults / 渲染帧计数 /
+//   流池 key 数(LRU 生效证据)。被杀后读最后几行即可判内存爬升 or 平稳(→CPU 方向)
+static void vcam_telemetry_sample(uint64_t renderedFrames, NSUInteger streamKeys) {
+    static CFAbsoluteTime lastTel = 0;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (lastTel > 0 && (now - lastTel) < 30.0) return;
+    lastTel = now;
+
+    task_vm_info_data_t vmInfo;
+    mach_msg_type_number_t vmCount = TASK_VM_INFO_COUNT;
+    uint64_t footprint = 0, resident = 0, faults = 0;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmInfo, &vmCount) == KERN_SUCCESS) {
+        footprint = vmInfo.phys_footprint;
+        resident = vmInfo.resident_size;
+        faults = vmInfo.faults;
+    }
+
+    @try {
+        NSString *line = [NSString stringWithFormat:
+            @"%.0f fp=%lluMB res=%lluMB flt=%llu renders=%llu keys=%lu\n",
+            now, footprint >> 20, resident >> 20, faults, renderedFrames, (unsigned long)streamKeys];
+        NSString *path = @"/tmp/vcam_telemetry.txt";
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (!fh) {
+            [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        } else {
+            [fh seekToEndOfFile];
+            [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        }
+    } @catch (NSException *e) {}
+}
 
 // 日志总开关(2026-08-16, diskwrites 崩溃循环止血): mediaserverd 的 EXC_RESOURCE
 // disk writes 配额极低(12.43KB/s 记账/每日 ~1GB, 每行日志按 4KB 脏页记账)。
@@ -679,6 +717,13 @@ static void vcam_core_log(NSString *msg) {
             strongSelf->_pipelineIdle = YES;
             [strongSelf->_videoPlayer stopDecodingThread];
             vcam_core_log(@"[vcam] camera idle >2s, pipeline paused (decode+prerender)");
+        }
+
+        // 资源探针(2026-08-16 黑屏取证): 每 30s 一行内存/渲染/池快照(函数内节流),
+        // mediaserverd 被杀后文件保留 → 读被杀前曲线判死因维度
+        if (strongSelf.isMediaserverdProcess) {
+            vcam_telemetry_sample(strongSelf->_frameCount,
+                                  [strongSelf->_gpuProcessor activeStreamKeyCount]);
         }
 
         // 旋转/镜像跨进程同步: 悬浮球(SpringBoard)写 vc.plist, mediaserverd 轮询应用

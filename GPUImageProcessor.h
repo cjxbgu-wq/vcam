@@ -80,4 +80,7 @@
 // 配置预处理目标尺寸/格式
 - (void)configureWithWidth:(size_t)width height:(size_t)height format:(OSType)format;
 
+// 当前活跃流 key 数(LRU 上限管理, 资源探针诊断用)
+- (NSUInteger)activeStreamKeyCount;
+
 @end

@@ -1136,6 +1136,13 @@ static const NSUInteger kVcamMaxStreamKeys = 6;
     }
 }
 
+// 资源探针用: 当前 LRU 活跃 key 数
+- (NSUInteger)activeStreamKeyCount {
+    @synchronized(self) {
+        return _streamKeyOrder.count;
+    }
+}
+
 // 两步法主体(调用方已持 per-key 锁)
 - (BOOL)twoStepTransferLocked:(CVPixelBufferRef)src toPixelBuffer:(CVPixelBufferRef)dst
                           key:(NSString *)poolKey token:(uint64_t)token {
