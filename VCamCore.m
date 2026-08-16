@@ -331,34 +331,48 @@ static void vcam_core_log(NSString *msg) {
     // 唯一两全: 全流全帧替换(永不闪) + CPU 接近红线时冻结内容源 ——
     // 两步法 staging(token) 机制天然支持: 传旧 token → 跳过昂贵缩放(stage1 ~4ms),
     // 只做格式转换(stage2 ~2ms) → 单帧成本降 ~60%, 画面=低帧率视频(连续无感)。
-    // 解码/预渲染同步 10fps(降载期), CCW90 随冻结 token 自动复用。
-    // 每 2s 采样进程 CPU%(2026-08-16 加快响应): >46% 进降载, <38% 退出(滞回防抖动)。
-    // 5s 间隔时突发三流全速可烧 5s 才触发, 冻结晚 → CPU 窗口配额累积 → 被杀循环
+    // 解码/预渲染同步 15fps(降载期), CCW90 随冻结 token 自动复用。
+    //
+    // 采样修正(2026-08-16 振荡修复): task_threads 是瞬时快照, 线程退出/加入会让
+    // 累计时间差分出现负值(实测 -5%~-50%) → 冻结误判 OFF → 又冲高误判 ON →
+    // 12s 内 3 次横跳 = 用户观感"非常卡顿"的直接来源。修: 负差分丢弃(不更新基线,
+    // 本次不判退); EMA 平滑抗单次毛刺。
+    // 滞回时间窗: 进入后 ≥5s 不许退出, 退出后 ≥8s 不许再进 —— 防高频振荡
     {
         static CFAbsoluteTime lastCpuCheck = 0;
         static CFAbsoluteTime lastCpuSample = 0;
         static double lastCpuSec = 0;
+        static double emaPct = 0;              // EMA 平滑后 CPU%
+        static BOOL emaInit = NO;
         static BOOL lowPower = NO;
+        static CFAbsoluteTime lastModeSwitch = 0;  // 上次 ON/OFF 切换时刻
         CFAbsoluteTime nowT = CFAbsoluteTimeGetCurrent();
         if (nowT - lastCpuCheck > 2.0) {
             double cpuSec = [vcam_process_cpu_seconds() doubleValue];
-            if (lastCpuSec > 0 && nowT > lastCpuSample) {
-                double pct = (cpuSec - lastCpuSec) / (nowT - lastCpuSample) * 100.0;
-                if (pct > 46.0 && !lowPower) {
+            double delta = cpuSec - lastCpuSec;
+            if (lastCpuSec > 0 && nowT > lastCpuSample && delta >= 0) {
+                double pct = delta / (nowT - lastCpuSample) * 100.0;
+                emaPct = emaInit ? (emaPct * 0.6 + pct * 0.4) : pct;
+                emaInit = YES;
+                BOOL minHoldOk = (nowT - lastModeSwitch) > (lowPower ? 5.0 : 8.0);
+                if (emaPct > 46.0 && !lowPower && minHoldOk) {
                     lowPower = YES;
-                    vcam_core_log([NSString stringWithFormat:@"[vcam] CPU %.0f%% >46%%, freeze mode ON", pct]);
-                } else if (pct < 38.0 && lowPower) {
+                    lastModeSwitch = nowT;
+                    vcam_core_log([NSString stringWithFormat:@"[vcam] CPU %.0f%% (ema) >46%%, freeze ON", emaPct]);
+                } else if (emaPct < 38.0 && lowPower && minHoldOk) {
                     lowPower = NO;
-                    vcam_core_log([NSString stringWithFormat:@"[vcam] CPU %.0f%% <38%%, freeze mode OFF", pct]);
+                    lastModeSwitch = nowT;
+                    vcam_core_log([NSString stringWithFormat:@"[vcam] CPU %.0f%% (ema) <38%%, freeze OFF", emaPct]);
                 }
             }
-            lastCpuSec = cpuSec;
+            // 负差分(线程快照抖动): 只推进时间基线, 不更新 CPU 基线(下轮重算), 不判退
             lastCpuSample = nowT;
+            if (delta >= 0 || lastCpuSec == 0) lastCpuSec = cpuSec;
             lastCpuCheck = nowT;
             self.lowPowerDecode = lowPower;  // 解码/预渲染同步降速
         }
         if (lowPower) {
-            // 冻结节拍: 该流 100ms 内已做过完整替换 → 本帧传旧 token(staging 复用)
+            // 冻结节拍: 该流 66ms(=15fps) 内已做过完整替换 → 本帧传旧 token(staging 复用)
             // @synchronized: 多 hook 线程(预览/照片/编码)并发 render, static 字典需保护
             static NSMutableDictionary<NSString *, NSDictionary *> *freezeState = nil;
             if (!freezeState) freezeState = [NSMutableDictionary dictionary];
@@ -367,7 +381,7 @@ static void vcam_core_log(NSString *msg) {
                 NSDictionary *st = freezeState[fk];
                 CFAbsoluteTime lastFull = st ? [st[@"t"] doubleValue] : 0;
                 uint64_t lastTok = st ? [st[@"tok"] unsignedLongLongValue] : 0;
-                if (lastFull > 0 && (nowT - lastFull) < 0.1 && lastTok != 0) {
+                if (lastFull > 0 && (nowT - lastFull) < 0.066 && lastTok != 0) {
                     gen = lastTok;  // 冻结: twoStep 跳过 stage1 缩放, CCW90 复用缓存
                 } else {
                     freezeState[fk] = @{@"t": @(nowT), @"tok": @(gen)};
@@ -663,9 +677,9 @@ static void vcam_core_log(NSString *msg) {
                 }
 
                 // effectiveFps = PTS 实测帧率(校准 nominalFrameRate 低估导致的节拍慢放);
-                // CPU 降载期上限 10fps(内容连续, render 端有冻结帧机制兜底)
+                // CPU 降载期上限 15fps(内容连续, render 端有冻结帧机制兜底)
                 double fps = MIN(strongSelf.videoPlayer.effectiveFps,
-                                 strongSelf.lowPowerDecode ? 10.0 : 240.0);
+                                 strongSelf.lowPowerDecode ? 15.0 : 240.0);
                 nextTick += 1.0 / fps;
                 double wait = nextTick - CFAbsoluteTimeGetCurrent();
                 if (wait > 0.0005) {
@@ -843,9 +857,17 @@ static void vcam_core_log(NSString *msg) {
         }
 
         // 资源探针(2026-08-16 黑屏取证 v2): 每 30s 一行内存/CPU%/按流渲染统计
+        // 修复(2026-08-16): takeStreamStats 是"取出并清零"语义, 之前每 0.15s 轮询调用
+        // → 统计被高频清零, telemetry 里只剩最后 0.15s 的数据(9 vs 实际 1376)。
+        // 节流到 30s 窗口到点才取, 统计恢复真实
         if (strongSelf.isMediaserverdProcess) {
-            vcam_telemetry_sample(strongSelf->_frameCount,
-                                  [strongSelf->_gpuProcessor takeStreamStats]);
+            static CFAbsoluteTime lastStatsTake = 0;
+            CFAbsoluteTime nowStats = CFAbsoluteTimeGetCurrent();
+            if (nowStats - lastStatsTake >= 30.0) {
+                lastStatsTake = nowStats;
+                vcam_telemetry_sample(strongSelf->_frameCount,
+                                      [strongSelf->_gpuProcessor takeStreamStats]);
+            }
         }
 
         // 旋转/镜像跨进程同步: 悬浮球(SpringBoard)写 vc.plist, mediaserverd 轮询应用

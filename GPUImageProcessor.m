@@ -1329,7 +1329,23 @@ static const NSUInteger kVcamMaxStreamKeys = 6;
         }
 
         // GPU 渲染直写相机帧(dst 是 IOSurface-backed, Metal 可直接导入)
+        // 计时探针(2026-08-16): 每 300 帧记一次平均耗时 —— 若 >5ms 说明 Metal 在
+        // mediaserverd 实际走了 CPU fallback(CoreImage 软件管线), 需要回退 VT 主路径
+        CFAbsoluteTime rStart = CFAbsoluteTimeGetCurrent();
         [_ciGPUContext render:out toCVPixelBuffer:dst];
+        {
+            static uint64_t gpuRenderCount = 0;
+            static double gpuRenderTotalMs = 0;
+            double ms = (CFAbsoluteTimeGetCurrent() - rStart) * 1000.0;
+            gpuRenderCount++;
+            gpuRenderTotalMs += ms;
+            if (gpuRenderCount % 300 == 0) {
+                vcam_gpu_log([NSString stringWithFormat:@"[vcam] GPU render avg %.2fms/frame (%llu frames)",
+                              gpuRenderTotalMs / gpuRenderCount, (unsigned long long)gpuRenderCount]);
+                gpuRenderCount = 0;
+                gpuRenderTotalMs = 0;
+            }
+        }
         return YES;
     } @catch (NSException *e) {
         vcam_gpu_log([NSString stringWithFormat:@"[vcam] GPU render exception: %@", e]);
