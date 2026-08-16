@@ -13,7 +13,20 @@ NSString *const VCamNotifyLiveChanged = @"com.vcam.ios.live.changed";
 NSString *const VCamPlistPath         = @"/var/mobile/Media/DCIM/vc.plist";
 NSString *const VCamStateBackupPath   = @"/var/mobile/vc.plist";
 
+// 日志总开关(2026-08-16, diskwrites 崩溃循环止血): 默认静默, vc.plist "logEnabled=YES" 打开
+static BOOL vcam_log_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        @try {
+            NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Media/DCIM/vc.plist"];
+            cached = (d && d[@"logEnabled"]) ? [d[@"logEnabled"] boolValue] : 0;
+        } @catch (NSException *e) { cached = 0; }
+    }
+    return cached == 1;
+}
+
 static void vcam_notify_log(NSString *msg) {
+    if (!vcam_log_enabled()) return;
     @try {
         NSString *logPath = @"/tmp/vcam_notify_log.txt";
         NSString *ts = [NSDate date].description;

@@ -16,7 +16,22 @@
 #import <CoreImage/CoreImage.h>
 #import <CoreVideo/CoreVideo.h>
 
+// 日志总开关(2026-08-16, diskwrites 崩溃循环止血): mediaserverd 的 EXC_RESOURCE
+// disk writes 配额极低(12.43KB/s 记账/每日 ~1GB, 每行日志按 4KB 脏页记账)。
+// 默认全部静默; 诊断时 SSH 写 vc.plist "logEnabled=YES" + respring 打开
+static BOOL vcam_log_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        @try {
+            NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Media/DCIM/vc.plist"];
+            cached = (d && d[@"logEnabled"]) ? [d[@"logEnabled"] boolValue] : 0;
+        } @catch (NSException *e) { cached = 0; }
+    }
+    return cached == 1;
+}
+
 static void vcam_core_log(NSString *msg) {
+    if (!vcam_log_enabled()) return;
     @try {
         NSString *logPath = @"/tmp/vcam_core_log.txt";
         NSString *ts = [NSDate date].description;

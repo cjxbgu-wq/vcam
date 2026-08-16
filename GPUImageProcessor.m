@@ -21,7 +21,20 @@ OSStatus VTSessionSetProperty(CFTypeRef session, CFStringRef propertyKey, CFType
 typedef OSStatus (*VTPixelRotationSessionCreateFunc)(CFAllocatorRef, VTPixelRotationSessionRef *);
 typedef OSStatus (*VTPixelRotationSessionTransferImageFunc)(VTPixelRotationSessionRef, CVPixelBufferRef, CVPixelBufferRef);
 
+// 日志总开关(2026-08-16, diskwrites 崩溃循环止血): 默认静默, vc.plist "logEnabled=YES" 打开
+static BOOL vcam_log_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        @try {
+            NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Media/DCIM/vc.plist"];
+            cached = (d && d[@"logEnabled"]) ? [d[@"logEnabled"] boolValue] : 0;
+        } @catch (NSException *e) { cached = 0; }
+    }
+    return cached == 1;
+}
+
 static void vcam_gpu_log(NSString *msg) {
+    if (!vcam_log_enabled()) return;
     @try {
         NSString *logPath = @"/tmp/vcam_gpu_log.txt";
         NSString *ts = [NSDate date].description;
