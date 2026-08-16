@@ -274,32 +274,18 @@ static void vcam_core_log(NSString *msg) {
         [self->_videoPlayer startDecodingThread]; // 空转线程恢复解码标志
     }
 
-    // 辅助流降频 v2(2026-08-16 扫码 CPU 配额被杀修复, v1 数量少数派判定翻车:
-    // 扫码场景 1 竖预览 + 2 横分析流 → 竖(可见预览)反成数量少数派被降频 → 画面跳动)。
-    // 正确判据: 竖屏会话(窗口内见过竖流)中的 横向流 + BGRA 流 = 分析流:
-    //   - BGRA 格式从不用于显示层(预览用 |8v0/420f), 必是 CV 分析喂料(人脸/二维码)
-    //   - 竖屏 App 里的横流(传感器原生方向)是分析/辅助流, 用户不可见
-    // 全部辅助流共享 ~15fps 预算(合计), 可见预览流全速。
-    // 横屏 App(窗口内无竖流) → 横流即预览方向, 全速, 不误伤。
-    // 计数 150 帧窗口 >>2 衰减, 方向切换自适应
-    {
-        static int64_t landscapeCnt = 0, portraitCnt = 0;
-        static CFAbsoluteTime lastAuxTick = 0;
-        BOOL isLandscape = (targetW > targetH);
-        BOOL isPortrait = (targetH > targetW);
-        if (isLandscape) landscapeCnt++; else if (isPortrait) portraitCnt++;
-        if ((landscapeCnt + portraitCnt) >= 150) { landscapeCnt >>= 2; portraitCnt >>= 2; }
-
-        BOOL portraitSession = (portraitCnt > 0);
-        BOOL isAuxStream = portraitSession &&
-                           (isLandscape || origFormat == kCVPixelFormatType_32BGRA);
-        if (isAuxStream) {
-            CFAbsoluteTime nowT = CFAbsoluteTimeGetCurrent();
-            if (lastAuxTick > 0 && (nowT - lastAuxTick) < 0.066) {
-                return;  // 辅助流 15fps 合计预算: 分析流喂真实帧(扫码反而更快)
-            }
-            lastAuxTick = nowT;
-        }
+    // 低分辨率照片格式流跳过(2026-08-16 扫码 CPU 配额被杀最终修复):
+    // iOS daemon CPU 限制 = 50% over 180s 滑动窗口(系统级, 无豁免 API),
+    // 3 流全速替换 67% 必被杀。确定性特征识别不可见分析流:
+    //   - 真实拍照流 = 传感器全分辨率(12MP, 长边 4032), 保持替换(拍照功能)
+    //   - FullRange 照片格式(-8f0/|8f0) 且 长边 <2000 = 扫码/场景分析缓冲,
+    //     用户绝对不可见(预览显示走视频范围格式 420f/|8v0/420v), 跳过零风险
+    // 历史教训(全撤): 方向/数量启发式会误伤录像流(画面跳动); 照片流跳帧会闪预览。
+    // 本判定是格式+分辨率的确定性组合, 不依赖会话状态, 对任何 App 行为一致。
+    BOOL isFullRangePhoto = (origFormat == 0x2d386630 /* -8f0 */ ||
+                             origFormat == 0x7c386630 /* |8f0 */);
+    if (isFullRangePhoto && MAX(targetW, targetH) < 2000) {
+        return;  // 分析缓冲喂真实帧(扫码/人脸检测反而更快更准)
     }
 
     // 诊断: 降频至每 600 帧(30fps 相机流 ~20s 一条, disk writes 限额保护)
