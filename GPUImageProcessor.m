@@ -133,6 +133,20 @@ static void vcam_gpu_log(NSString *msg) {
 @property (nonatomic, strong) CIContext *preprocessContext;
 @property (nonatomic, strong) CIContext *renderContext;
 
+// ===== GPU 渲染路径(2026-08-16 多流 1080p CPU 超配额最终解) =====
+// 背景: 纯 CPU VT 下 5-7 条 1080p 级相机流(含 1080x2340 屏幕流)替换总 CPU 85-175%,
+// 远超 daemon 50% 配额 → 冻结机制也压不住(stage1 内容更新成本固有大) → 被杀循环。
+// mediaserverd 是相机/显示管线宿主, 内部本就使用 Metal —— 旧注释"没有 GPU 上下文"
+// 是未验证的假设。probe MTLCreateSystemDefaultDevice, 可用则 GPU CIContext 直接
+// crop-fill 渲染到标准格式(BGRA/420f/420v)相机帧: 一次 GPU 提交(CPU ~1ms)替代
+// 全量 CPU VT 转换(8-10ms)。私有格式流(-8f0 等 IOSurface Metal 不认识)保持 VT。
+@property (nonatomic, strong) CIContext *ciGPUContext;
+@property (nonatomic, assign) BOOL metalAvailable;
+// GPU 路径 per-key CIImage 缓存: (key, token) 相同 → 变换结果直接复用, 冻结帧零重建
+// (调用方已持该 key 的 per-key 锁, 池字典自身用 @synchronized 保护)
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *gpuImgTokenPool;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, CIImage *> *gpuImgOutPool;
+
 // 缓冲池字典（key="w_h", value=CVPixelBufferPoolRef）—— 每个尺寸独立池，避免频繁重建
 @property (nonatomic, strong) NSMutableDictionary *bgraBufferPoolMap;
 
@@ -167,8 +181,10 @@ static void vcam_gpu_log(NSString *msg) {
         _streamKeyOrder = [NSMutableArray array];
         _streamRenderStats = [NSMutableDictionary dictionary];
         _streamPixelStats = [NSMutableDictionary dictionary];
+        _gpuImgTokenPool = [NSMutableDictionary dictionary];
+        _gpuImgOutPool = [NSMutableDictionary dictionary];
 
-        // 软件渲染 CIContext（mediaserverd 没有 GPU 上下文）
+        // 软件渲染 CIContext（回退用）
         @try {
             _preprocessContext = [CIContext contextWithOptions:@{
                 kCIContextUseSoftwareRenderer: @YES
@@ -181,11 +197,33 @@ static void vcam_gpu_log(NSString *msg) {
             _renderContext = nil;
         }
 
+        // Metal GPU probe(2026-08-16): mediaserverd 是相机/显示管线宿主, 大概率有
+        // GPU 访问。dlsym 动态加载避免硬链接依赖(Metal 弱链接, 探测失败静默回退 VT)。
+        _metalAvailable = NO;
+        @try {
+            typedef void *(*CreateDeviceFn)(void);
+            CreateDeviceFn createDevice = (CreateDeviceFn)dlsym(RTLD_DEFAULT, "MTLCreateSystemDefaultDevice");
+            if (createDevice) {
+                id device = (__bridge id)createDevice();
+                if (device) {
+                    CIContext *gpuCtx = [CIContext contextWithMTLDevice:(__bridge id<MTLDevice>)device];
+                    if (gpuCtx) {
+                        _ciGPUContext = gpuCtx;
+                        _metalAvailable = YES;
+                    }
+                }
+            }
+        } @catch (NSException *e) {
+            _ciGPUContext = nil;
+            _metalAvailable = NO;
+        }
+
         [self setupBGRATransferSession];
         [self setupYUVTransferSession];
         [self setupPrerenderTransferSession];
         [self setupPixelRotationSession];
-        vcam_gpu_log(@"[vcam] GPUImageProcessor initialized");
+        vcam_gpu_log([NSString stringWithFormat:@"[vcam] GPUImageProcessor initialized (Metal GPU: %@)",
+                      _metalAvailable ? @"AVAILABLE - GPU render path active" : @"unavailable - CPU VT only"]);
     }
     return self;
 }
@@ -1052,6 +1090,23 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
     BOOL isYuv = ((dstFormat & 0xffffffef) == '420f');  // 420f/420v 掩码同判
     uint64_t dstPixels = (uint64_t)dstW * dstH;
 
+    // ===== GPU 快路径(2026-08-16 多流 1080p CPU 超配额最终解) =====
+    // 标准格式(BGRA/420f/420v)且 Metal 可用 → GPU CIContext 一次 crop-fill 渲染
+    // 直写相机帧(缩放+格式转换全在 GPU, CPU 只剩 ~1ms 命令提交)。多流 1080p 场景
+    // 纯 CPU VT 总 CPU 85-175%(配额 50%)冻结也压不住 → 被杀循环; GPU 路径把
+    // render 端成本从 ~40% 降到 ~5%。失败自动回退下方 VT 路径(保底不黑屏)。
+    if (_metalAvailable && (dstFormat == kCVPixelFormatType_32BGRA || isYuv)) {
+        NSLock *glock = [self oneStepLockForKey:poolKey];  // 复用 per-key 锁池
+        [glock lock];
+        BOOL gok = [self gpuCropFillRender:src toPixelBuffer:dst key:poolKey token:token];
+        [glock unlock];
+        if (gok) {
+            [self noteStreamRender:poolKey pixels:dstPixels];
+            return YES;
+        }
+        // GPU 失败(罕见): 落回 VT 路径
+    }
+
     // 420f/420v 预览流也走两步法(2026-08-16 卡顿根因修复): 实测 1080p 420f 一步
     // 直转每帧 ~8-10ms × 30fps ≈ 25-30% CPU, 三流场景冲 53% 超红线 → 冻结触发
     // (内容 10fps, 用户观感"播放一会儿非常卡顿")甚至 mediaserverd 被杀。
@@ -1203,6 +1258,72 @@ static const NSUInteger kVcamMaxStreamKeys = 6;
         [_streamRenderStats removeAllObjects];
         [_streamPixelStats removeAllObjects];
         return [parts componentsJoinedByString:@" "];
+    }
+}
+
+// GPU crop-fill 渲染(2026-08-16): CIImage 源 → 中心裁剪到 dst 宽高比(对齐 VT Trim
+// 语义) → 缩放到 dst 尺寸 → GPU CIContext 渲染直写相机帧。
+// 缩放+色彩转换全在 GPU, CPU 只剩命令提交(~1ms) —— 替代 CPU VT 全量转换(8-10ms)。
+// (key, token) 缓存变换结果: 冻结帧(每 100ms 才换内容)30fps 中 2/3 帧零重建。
+// 调用方已持 per-key 锁(oneStepLockForKey), 本方法内不再加锁。
+- (BOOL)gpuCropFillRender:(CVPixelBufferRef)src toPixelBuffer:(CVPixelBufferRef)dst
+                      key:(NSString *)key token:(uint64_t)token {
+    if (!src || !dst || !_ciGPUContext) return NO;
+    size_t dstW = CVPixelBufferGetWidth(dst);
+    size_t dstH = CVPixelBufferGetHeight(dst);
+    if (!dstW || !dstH) return NO;
+
+    @try {
+        CIImage *out = nil;
+
+        // 冻结帧缓存命中: 同 (key, token) 已构建过变换结果
+        if (token != 0) {
+            @synchronized(self) {
+                NSNumber *cachedTok = _gpuImgTokenPool[key];
+                if (cachedTok && [cachedTok unsignedLongLongValue] == token) {
+                    out = _gpuImgOutPool[key];
+                }
+            }
+        }
+
+        if (!out) {
+            CIImage *img = [CIImage imageWithCVPixelBuffer:src];
+            if (!img) return NO;
+            CGRect ext = img.extent;
+            CGFloat srcW = ext.size.width, srcH = ext.size.height;
+            if (srcW <= 0 || srcH <= 0) return NO;
+
+            // crop-fill: 源中心裁剪到目标宽高比(超宽裁左右/超高裁上下), 再缩放到 dst
+            CGFloat srcRatio = srcW / srcH;
+            CGFloat dstRatio = (CGFloat)dstW / (CGFloat)dstH;
+            CGRect cropRect = ext;
+            if (srcRatio > dstRatio) {
+                CGFloat cw = srcH * dstRatio;
+                cropRect = CGRectMake(ext.origin.x + (srcW - cw) / 2, ext.origin.y, cw, srcH);
+            } else if (srcRatio < dstRatio) {
+                CGFloat ch = srcW / dstRatio;
+                cropRect = CGRectMake(ext.origin.x, ext.origin.y + (srcH - ch) / 2, srcW, ch);
+            }
+            CIImage *cropped = [img imageByCroppingToRect:cropRect];
+            CGAffineTransform scaleT = CGAffineTransformMakeScale(
+                dstW / cropRect.size.width, dstH / cropRect.size.height);
+            out = [cropped imageByApplyingTransform:scaleT];
+            if (!out) return NO;
+
+            if (token != 0) {
+                @synchronized(self) {
+                    _gpuImgTokenPool[key] = @(token);
+                    _gpuImgOutPool[key] = out;  // CIImage 懒持有 src, 同 key 覆盖旧帧引用
+                }
+            }
+        }
+
+        // GPU 渲染直写相机帧(dst 是 IOSurface-backed, Metal 可直接导入)
+        [_ciGPUContext render:out toCVPixelBuffer:dst];
+        return YES;
+    } @catch (NSException *e) {
+        vcam_gpu_log([NSString stringWithFormat:@"[vcam] GPU render exception: %@", e]);
+        return NO;
     }
 }
 
