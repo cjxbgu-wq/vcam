@@ -199,31 +199,27 @@ static void vcam_gpu_log(NSString *msg) {
 
         // Metal GPU probe(2026-08-16): mediaserverd 是相机/显示管线宿主, 大概率有
         // GPU 访问。dlsym 动态加载避免硬链接依赖(Metal 弱链接, 探测失败静默回退 VT)。
+        // 实测判决(2026-08-16 v2): 探针显示 6.4ms/帧 —— CoreImage+MTL 在 mediaserverd
+        // 落到 CPU 回退管线(真 GPU ~1-2ms), 比 VT 两步法(内容复用帧 ~1.5ms)更贵。
+        // probe 保留(记录设备能力供未来验证), 路径永久禁用 —— 走 VT token 复用路径
         _metalAvailable = NO;
         @try {
             typedef void *(*CreateDeviceFn)(void);
             CreateDeviceFn createDevice = (CreateDeviceFn)dlsym(RTLD_DEFAULT, "MTLCreateSystemDefaultDevice");
             if (createDevice) {
                 id device = (__bridge id)createDevice();
-                if (device) {
-                    CIContext *gpuCtx = [CIContext contextWithMTLDevice:device];
-                    if (gpuCtx) {
-                        _ciGPUContext = gpuCtx;
-                        _metalAvailable = YES;
-                    }
-                }
+                BOOL devicePresent = (device != nil);
+                vcam_gpu_log([NSString stringWithFormat:@"[vcam] Metal device probe: %@ (CI/MTL path DISABLED - CPU fallback measured 6.4ms/frame, VT token-reuse path is cheaper)",
+                              devicePresent ? @"present" : @"absent"]);
             }
         } @catch (NSException *e) {
-            _ciGPUContext = nil;
-            _metalAvailable = NO;
         }
 
         [self setupBGRATransferSession];
         [self setupYUVTransferSession];
         [self setupPrerenderTransferSession];
         [self setupPixelRotationSession];
-        vcam_gpu_log([NSString stringWithFormat:@"[vcam] GPUImageProcessor initialized (Metal GPU: %@)",
-                      _metalAvailable ? @"AVAILABLE - GPU render path active" : @"unavailable - CPU VT only"]);
+        vcam_gpu_log(@"[vcam] GPUImageProcessor initialized (VT token-reuse path, CI/MTL disabled)");
     }
     return self;
 }

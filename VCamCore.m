@@ -371,18 +371,30 @@ static void vcam_core_log(NSString *msg) {
             lastCpuCheck = nowT;
             self.lowPowerDecode = lowPower;  // 解码/预渲染同步降速
         }
-        if (lowPower) {
-            // 冻结节拍: 该流 66ms(=15fps) 内已做过完整替换 → 本帧传旧 token(staging 复用)
-            // @synchronized: 多 hook 线程(预览/照片/编码)并发 render, static 字典需保护
+        // 按流尺寸的内容更新节流(2026-08-16 吞吐量治理, 常开取代 lowPower-only 冻结):
+        // 物理约束: 多流全速替换像素吞吐 22GB/30s >> daemon CPU 配额(telemetry 实测
+        // CPU 51-157% 持续, mediaserverd 照片场景 30s 内被杀 3 次 = 拍照黑屏崩溃)。
+        // 相机流 30-60fps 但视频内容仅 24fps —— 按内容节拍更新, 窗口内重复 render
+        // 传旧 token → VT 两步法跳过 stage1 昂贵缩放, 只付 ~1.5ms stage2 blit。
+        // 窗口按像素分级: ≥10MP(拍照编码流) 1fps / ≥3MP(照片模式取景器) 12fps /
+        // 其他(常规预览) 24fps(=视频内容率, 无感); lowPower 时统一收紧 15fps
+        {
             static NSMutableDictionary<NSString *, NSDictionary *> *freezeState = nil;
             if (!freezeState) freezeState = [NSMutableDictionary dictionary];
+            uint64_t px = (uint64_t)targetW * targetH;
+            double window = px > 10000000ull ? 1.0
+                          : px > 3000000ull ? 0.083
+                          : (lowPower ? 0.066 : 0.042);
             NSString *fk = [NSString stringWithFormat:@"%zu_%zu_%u", targetW, targetH, (unsigned)origFormat];
             @synchronized(freezeState) {
                 NSDictionary *st = freezeState[fk];
                 CFAbsoluteTime lastFull = st ? [st[@"t"] doubleValue] : 0;
                 uint64_t lastTok = st ? [st[@"tok"] unsignedLongLongValue] : 0;
-                if (lastFull > 0 && (nowT - lastFull) < 0.066 && lastTok != 0) {
-                    gen = lastTok;  // 冻结: twoStep 跳过 stage1 缩放, CCW90 复用缓存
+                if (lastFull > 0 && (nowT - lastFull) < window && lastTok != 0) {
+                    gen = lastTok;  // 窗口内: 跳过 stage1 缩放, CCW90 复用缓存
+                    // 抑制帧也推进节拍基准: 否则 60fps 流"隔帧全禁"(全渲染→长抑制→
+                    // 又全渲染), 内容率掉一半; 每帧推进 → 内容精确稳定在 1/window
+                    freezeState[fk] = @{@"t": @(nowT), @"tok": @(lastTok)};
                 } else {
                     freezeState[fk] = @{@"t": @(nowT), @"tok": @(gen)};
                 }
