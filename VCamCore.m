@@ -274,6 +274,31 @@ static void vcam_core_log(NSString *msg) {
         [self->_videoPlayer startDecodingThread]; // 空转线程恢复解码标志
     }
 
+    // 少数派方向流降频(2026-08-16 云闪付扫码 CPU 配额被杀修复):
+    // 扫码场景 3 流 90 renders/s CPU 67% → ~110s 被杀(telemetry v2 实证)。
+    // 其中两条横流(1280x720 -8f0/BGRA)是扫码头分析流(用户不可见), 全速替换纯烧配额。
+    // 方向少数派 = 辅助流: 实时按横竖渲染占比判定, 少数派流降到 ~15fps。
+    // 预览(多数派)不受影响; 视频通话录像流若为少数派 → 15fps 画面(远好于黑屏)。
+    // 计数每 150 帧重置(窗口化防长期倾斜)
+    {
+        static int64_t landscapeCnt = 0, portraitCnt = 0;
+        static CFAbsoluteTime lastLandscapeTick = 0, lastPortraitTick = 0;
+        BOOL isLandscape = (targetW > targetH);
+        if (isLandscape) landscapeCnt++; else portraitCnt++;
+        if ((landscapeCnt + portraitCnt) >= 150) { landscapeCnt >>= 2; portraitCnt >>= 2; }
+
+        BOOL minority = isLandscape ? (landscapeCnt < portraitCnt)
+                                    : (portraitCnt < landscapeCnt);
+        if (minority) {
+            CFAbsoluteTime nowT = CFAbsoluteTimeGetCurrent();
+            CFAbsoluteTime last = isLandscape ? lastLandscapeTick : lastPortraitTick;
+            if (last > 0 && (nowT - last) < 0.066) {
+                return;  // 15fps 上限: 该方向本窗口内已写过, 跳过(保留相机帧)
+            }
+            if (isLandscape) lastLandscapeTick = nowT; else lastPortraitTick = nowT;
+        }
+    }
+
     // 诊断: 降频至每 600 帧(30fps 相机流 ~20s 一条, disk writes 限额保护)
     static int vcamRenderCount = 0;
     vcamRenderCount++;
