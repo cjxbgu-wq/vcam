@@ -55,6 +55,9 @@ typedef NS_ENUM(NSInteger, VCamMediaType) {
 // 暂停(跨进程: 悬浮球写 vc.plist paused, mediaserverd 轮询设置):
 // YES 时解码线程停止取新帧, 预渲染冻结在最后一帧; NO 恢复
 @property (nonatomic, assign) BOOL paused;
+// CPU 降载(VCamCore 设置, 2026-08-16): YES 时解码节拍降为 1/3(~10fps),
+// 替换内容低帧率更新但连续(render 端冻结帧机制保证不闪)
+@property (nonatomic, assign) BOOL lowPowerDecode;
 
 // 输出尺寸/格式
 @property (nonatomic, assign) size_t outputWidth;

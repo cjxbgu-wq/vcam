@@ -147,6 +147,9 @@ static void vcam_core_log(NSString *msg) {
 // CPU≈0)+预渲染睡眠; 相机流恢复(render 被调)同步即时唤醒(先吃缓存帧, 解码 ~100ms 内跟上)
 @property (nonatomic, assign) CFAbsoluteTime lastRenderActivity;
 @property (nonatomic, assign) BOOL pipelineIdle;
+// CPU 闭环降载(2026-08-16): 进程 CPU 接近 daemon 50% 红线时置 YES ——
+// 解码/预渲染节拍降为 1/3(替换内容 ~10fps 更新, 连续无感), 冻结帧走 staging 复用
+@property (nonatomic, assign) BOOL lowPowerDecode;
 @end
 
 @implementation VCamCore
@@ -274,18 +277,52 @@ static void vcam_core_log(NSString *msg) {
         [self->_videoPlayer startDecodingThread]; // 空转线程恢复解码标志
     }
 
-    // 低分辨率照片格式流跳过(2026-08-16 扫码 CPU 配额被杀最终修复):
-    // iOS daemon CPU 限制 = 50% over 180s 滑动窗口(系统级, 无豁免 API),
-    // 3 流全速替换 67% 必被杀。确定性特征识别不可见分析流:
-    //   - 真实拍照流 = 传感器全分辨率(12MP, 长边 4032), 保持替换(拍照功能)
-    //   - FullRange 照片格式(-8f0/|8f0) 且 长边 <2000 = 扫码/场景分析缓冲,
-    //     用户绝对不可见(预览显示走视频范围格式 420f/|8v0/420v), 跳过零风险
-    // 历史教训(全撤): 方向/数量启发式会误伤录像流(画面跳动); 照片流跳帧会闪预览。
-    // 本判定是格式+分辨率的确定性组合, 不依赖会话状态, 对任何 App 行为一致。
-    BOOL isFullRangePhoto = (origFormat == 0x2d386630 /* -8f0 */ ||
-                             origFormat == 0x7c386630 /* |8f0 */);
-    if (isFullRangePhoto && MAX(targetW, targetH) < 2000) {
-        return;  // 分析缓冲喂真实帧(扫码/人脸检测反而更快更准)
+    // CPU 闭环降载(2026-08-16 扫码 CPU 配额被杀最终修复 v3, 取代所有"猜流"启发式):
+    // 教训链: 方向判定误伤录像流(跳动)/照片流跳帧闪预览/低分辨率照片流判定误伤
+    // 抖音美颜链(比例跳动)+漏掉扫码页可见流 —— 任何"猜哪条流不可见"都不可靠。
+    // 物理约束: iOS daemon CPU 限 50% over 180s, 3 流全速替换 67% 必被杀。
+    // 唯一两全: 全流全帧替换(永不闪) + CPU 接近红线时冻结内容源 ——
+    // 两步法 staging(token) 机制天然支持: 传旧 token → 跳过昂贵缩放(stage1 ~4ms),
+    // 只做格式转换(stage2 ~2ms) → 单帧成本降 ~60%, 画面=低帧率视频(连续无感)。
+    // 解码/预渲染同步 10fps(降载期), CCW90 随冻结 token 自动复用。
+    // 每 5s 采样进程 CPU%: >46% 进降载, <38% 退出(滞回防抖动)
+    {
+        static CFAbsoluteTime lastCpuCheck = 0;
+        static CFAbsoluteTime lastCpuSample = 0;
+        static double lastCpuSec = 0;
+        static BOOL lowPower = NO;
+        CFAbsoluteTime nowT = CFAbsoluteTimeGetCurrent();
+        if (nowT - lastCpuCheck > 5.0) {
+            double cpuSec = [vcam_process_cpu_seconds() doubleValue];
+            if (lastCpuSec > 0 && nowT > lastCpuSample) {
+                double pct = (cpuSec - lastCpuSec) / (nowT - lastCpuSample) * 100.0;
+                if (pct > 46.0 && !lowPower) {
+                    lowPower = YES;
+                    vcam_core_log([NSString stringWithFormat:@"[vcam] CPU %.0f%% >46%%, freeze mode ON", pct]);
+                } else if (pct < 38.0 && lowPower) {
+                    lowPower = NO;
+                    vcam_core_log([NSString stringWithFormat:@"[vcam] CPU %.0f%% <38%%, freeze mode OFF", pct]);
+                }
+            }
+            lastCpuSec = cpuSec;
+            lastCpuSample = nowT;
+            lastCpuCheck = nowT;
+            self.lowPowerDecode = lowPower;  // 解码/预渲染同步降速
+        }
+        if (lowPower) {
+            // 冻结节拍: 该流 100ms 内已做过完整替换 → 本帧传旧 token(staging 复用)
+            static NSMutableDictionary<NSString *, NSDictionary *> *freezeState = nil;
+            if (!freezeState) freezeState = [NSMutableDictionary dictionary];
+            NSString *fk = [NSString stringWithFormat:@"%zu_%zu_%u", targetW, targetH, (unsigned)origFormat];
+            NSDictionary *st = freezeState[fk];
+            CFAbsoluteTime lastFull = st ? [st[@"t"] doubleValue] : 0;
+            uint64_t lastTok = st ? [st[@"tok"] unsignedLongLongValue] : 0;
+            if (lastFull > 0 && (nowT - lastFull) < 0.1 && lastTok != 0) {
+                gen = lastTok;  // 冻结: twoStep 跳过 stage1 缩放, CCW90 复用缓存
+            } else {
+                freezeState[fk] = @{@"t": @(nowT), @"tok": @(gen)};
+            }
+        }
     }
 
     // 诊断: 降频至每 600 帧(30fps 相机流 ~20s 一条, disk writes 限额保护)
@@ -577,8 +614,10 @@ static void vcam_core_log(NSString *msg) {
                     continue;
                 }
 
-                // effectiveFps = PTS 实测帧率(校准 nominalFrameRate 低估导致的节拍慢放)
-                double fps = strongSelf.videoPlayer.effectiveFps;
+                // effectiveFps = PTS 实测帧率(校准 nominalFrameRate 低估导致的节拍慢放);
+                // CPU 降载期上限 10fps(内容连续, render 端有冻结帧机制兜底)
+                double fps = MIN(strongSelf.videoPlayer.effectiveFps,
+                                 strongSelf.lowPowerDecode ? 10.0 : 240.0);
                 nextTick += 1.0 / fps;
                 double wait = nextTick - CFAbsoluteTimeGetCurrent();
                 if (wait > 0.0005) {

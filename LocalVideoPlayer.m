@@ -583,7 +583,9 @@ static size_t vcam_decode_max_edge(void) {
                     _frameCount++;
                     // 按视频帧率绝对节拍输出(参考逆向: 按时间戳输出帧)
                     // effectiveFps = PTS 实测(校准 nominalFrameRate 低估导致的慢放卡顿)
-                    double frameInterval = 1.0 / [self effectiveFps];
+                    // CPU 降载期上限 ~10fps(节拍×3, 内容连续; render 冻结帧兜底)
+                    double effFps = MIN([self effectiveFps], _lowPowerDecode ? 10.0 : 240.0);
+                    double frameInterval = 1.0 / effFps;
                     nextTick += frameInterval;
                     double wait = nextTick - CFAbsoluteTimeGetCurrent();
                     if (wait > 0.001) {
