@@ -178,10 +178,11 @@ static void (*orig_BWPhotoEncoderNode_renderSampleBuffer)(id self, SEL _cmd, CMS
 // 主预览流 —— 所有 app 的相机预览/录像都经过这里(逆向: 就地改写原 buffer 后调原 IMP,
 // 假帧顺原生管线流向所有下游消费者: 预览/录像编码器/拍照编码器)
 static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sampleBuffer) {
-    // 诊断: 记录预览流触发 + 格式(每 60 帧一次)
+    // 诊断: 降频至每 1800 帧(相机多流 30fps 下 ~20s 一条; mediaserverd disk writes
+    // 限额 12.43KB/s, 高频日志按 4KB 脏页/行记账曾引发 EXC_RESOURCE 崩溃循环)
     static int vcamEmitCount = 0;
     vcamEmitCount++;
-    if (vcamEmitCount % 60 == 1) {
+    if (vcamEmitCount % 1800 == 1) {
         CVPixelBufferRef pb = sampleBuffer ? CMSampleBufferGetImageBuffer(sampleBuffer) : NULL;
         OSType fmt = pb ? CVPixelBufferGetPixelFormatType(pb) : 0;
         vcam_tweak_log([NSString stringWithFormat:@"[vcam] emit#%d fmt=0x%x cls=%@", vcamEmitCount, (unsigned)fmt, NSStringFromClass([self class])]);
@@ -193,13 +194,6 @@ static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBuffer
             SEL mediaTypeSel = sel_registerName("mediaType");
             if ([self respondsToSelector:mediaTypeSel]) {
                 uint32_t mt = ((uint32_t(*)(id, SEL))objc_msgSend)(self, mediaTypeSel);
-                // 诊断: 每 60 帧记录 mediaType 实际值
-                if (vcamEmitCount % 60 == 1) {
-                    char mts[5] = {0};
-                    mts[0] = (char)(mt >> 24); mts[1] = (char)(mt >> 16);
-                    mts[2] = (char)(mt >> 8); mts[3] = (char)mt;
-                    vcam_tweak_log([NSString stringWithFormat:@"[vcam] emit#%d mediaType=0x%x (%s) cls=%@", vcamEmitCount, (unsigned)mt, mts, NSStringFromClass([self class])]);
-                }
                 if (mt != 'vide') {
                     // 非视频帧(音频/元数据), 直通原 IMP
                     if (orig_BWNodeOutput_emitSampleBuffer) {
@@ -220,7 +214,7 @@ static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBuffer
                                 efmt == 0x7c387630 /* |8v0 */);
             if (photoStream) {
                 vcamPhotoEmitCount++;
-                if (vcamPhotoEmitCount <= 16 || vcamPhotoEmitCount % 300 == 0) {
+                if (vcamPhotoEmitCount <= 16 || vcamPhotoEmitCount % 3600 == 0) {
                     vcamDumpStillArrival(@"emitPhoto", vcamPhotoEmitCount, sampleBuffer, pixelBuffer);
                 }
                 vcamStripExposureMeta(sampleBuffer, pixelBuffer);
@@ -246,7 +240,7 @@ static void hook_BWStillImageScalerNode_renderSampleBuffer(id self, SEL _cmd, CM
         if (pixelBuffer) {
             // 到达诊断(替换前): 若此处像素已亮于 emit 时写入值, 增益发生在 emit→scaler 段
             vcamScalerArrCount++;
-            if (vcamScalerArrCount <= 16 || vcamScalerArrCount % 200 == 0) {
+            if (vcamScalerArrCount <= 16 || vcamScalerArrCount % 3600 == 0) {
                 vcamDumpStillArrival(@"scaler", vcamScalerArrCount, sampleBuffer, pixelBuffer);
             }
             // 曝光元数据剥离(防 scaler 内部/下游基于元数据拉增益)
@@ -271,7 +265,7 @@ static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self, SEL _cmd, CMSamp
         if (pixelBuffer) {
             // 到达诊断(替换前): 若此处正常而最终照片过曝, 增益发生在编码器内部(元数据剥离是唯一机会)
             vcamEncoderArrCount++;
-            if (vcamEncoderArrCount <= 16 || vcamEncoderArrCount % 200 == 0) {
+            if (vcamEncoderArrCount <= 16 || vcamEncoderArrCount % 3600 == 0) {
                 vcamDumpStillArrival(@"encoder", vcamEncoderArrCount, sampleBuffer, pixelBuffer);
             }
             // 曝光元数据剥离(编码前最后机会)

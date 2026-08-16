@@ -181,14 +181,10 @@ static void vcam_darwin_callback(CFNotificationCenterRef center, void *observer,
     uint64_t intervalNs = interval * NSEC_PER_SEC;
     dispatch_source_set_timer(_pollingTimer, dispatch_time(DISPATCH_TIME_NOW, 0), intervalNs, intervalNs / 2);
     dispatch_source_set_event_handler(_pollingTimer, ^{
+        // 心跳日志已移除(2026-08-16): mediaserverd 的 EXC_RESOURCE disk writes 限额
+        // 仅 12.43KB/s(每日 ~1GB), 高频日志每行按 4KB 脏页记账曾达 69KB/s → 4 小时
+        // 耗尽 1GB → 系统杀进程 → coalition 计数跨重启 → 6 秒崩溃循环
         BOOL enabled = [VCamNotify isPlistEnabled];
-        static int vcamPollCount = 0;
-        vcamPollCount++;
-        if (vcamPollCount % 5 == 1) {  // 每 5 次记一次, 避免刷屏
-            NSFileManager *fm = [NSFileManager defaultManager];
-            BOOL exists = [fm fileExistsAtPath:VCamPlistPath];
-            vcam_notify_log([NSString stringWithFormat:@"[vcam] poll#%d enabled=%d pathExists=%d path=%@", vcamPollCount, enabled, exists, VCamPlistPath]);
-        }
         if (self->_pollingCallback) {
             self->_pollingCallback(enabled);
         }

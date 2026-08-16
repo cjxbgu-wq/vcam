@@ -183,10 +183,10 @@ static void vcam_core_log(NSString *msg) {
         return;
     }
 
-    // 诊断: 每 60 帧记录 render 入口
+    // 诊断: 降频至每 600 帧(30fps 相机流 ~20s 一条, disk writes 限额保护)
     static int vcamRenderCount = 0;
     vcamRenderCount++;
-    BOOL diagThisFrame = (vcamRenderCount % 60 == 1);
+    BOOL diagThisFrame = (vcamRenderCount % 600 == 1);
 
     // 1. 取预渲染缓存(YUV 主源, 等价千面 [player copyCurrentFrame])
     [_processLock lock];
@@ -410,7 +410,7 @@ static void vcam_core_log(NSString *msg) {
 
     static int vcamWriteCount = 0;
     vcamWriteCount++;
-    BOOL diag = (vcamWriteCount % 300 == 1);
+    BOOL diag = (vcamWriteCount % 900 == 1);
     if (diag) {
         vcam_core_log([NSString stringWithFormat:@"[vcam] write#%d VT begin %zux%zu(0x%x) -> %zux%zu(0x%x)",
                        vcamWriteCount,
@@ -616,11 +616,8 @@ static void vcam_core_log(NSString *msg) {
     [[VCamNotify sharedInstance] startPollingWithInterval:0.15 callback:^(BOOL enabled) {
         VCamCore *strongSelf = weakSelf;
         if (!strongSelf) return;
-        static int vcamCorePollCount = 0;
-        vcamCorePollCount++;
-        if (vcamCorePollCount % 5 == 1) {
-            vcam_core_log([NSString stringWithFormat:@"[vcam] core poll#%d enabled=%d lastEnabled=%d", vcamCorePollCount, enabled, strongSelf.lastEnabledState]);
-        }
+        // poll 心跳日志已移除(2026-08-16): mediaserverd disk writes 限额 12.43KB/s,
+        // 高频日志按 4KB 脏页/行记账 → EXC_RESOURCE 杀进程(崩溃循环根因)
         if (enabled != strongSelf.lastEnabledState) {
             vcam_core_log([NSString stringWithFormat:@"[vcam] state change: %d -> %d, calling setEnabled", strongSelf.lastEnabledState, enabled]);
             strongSelf.lastEnabledState = enabled;

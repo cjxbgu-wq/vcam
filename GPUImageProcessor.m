@@ -101,6 +101,12 @@ static void vcam_gpu_log(NSString *msg) {
 @property (nonatomic, assign) CVPixelBufferRef prerenderRotatePool1;
 @property (nonatomic, assign) CVPixelBufferRef prerenderRotatePool2;
 @property (nonatomic, assign) int prerenderRotateSlot;
+// 镜像专用 buffer(mirror-only 场景: 无旋转时需先复制到自有 buffer 再原地行反转,
+// 解码器输出的 buffer 不可写)。预渲染线程独占, 按尺寸+格式缓存
+@property (nonatomic, assign) CVPixelBufferRef prerenderMirrorBuffer;
+@property (nonatomic, assign) size_t prerenderMirrorW;
+@property (nonatomic, assign) size_t prerenderMirrorH;
+@property (nonatomic, assign) OSType prerenderMirrorFmt;
 
 // CIContext（软件渲染，mediaserverd 没有 GPU 上下文）
 // 两个独立 CIContext: 预渲染线程用 preprocessContext, render 线程回退用 renderContext（CIContext 非线程安全）
@@ -206,11 +212,15 @@ static void vcam_gpu_log(NSString *msg) {
         CVPixelBufferRelease(_adaptiveRotateCache);
         _adaptiveRotateCache = NULL;
     }
-    // 释放预渲染旋转 3 槽池
+    // 释放预渲染旋转 3 槽池 + 镜像 buffer
     for (int i = 0; i < 3; i++) {
         CVPixelBufferRef b = [self prerenderRotateBufferAtSlot:i];
         if (b) CVPixelBufferRelease(b);
         [self setPrerenderRotateBuffer:NULL atSlot:i];
+    }
+    if (_prerenderMirrorBuffer) {
+        CVPixelBufferRelease(_prerenderMirrorBuffer);
+        _prerenderMirrorBuffer = NULL;
     }
     // 释放所有缓冲池
     for (id key in _bgraBufferPoolMap) {
@@ -594,58 +604,169 @@ static void vcam_gpu_log(NSString *msg) {
     else _prerenderRotatePool2 = buf;
 }
 
-// 预渲染用: 需要旋转/镜像时做变换(保持源格式), 否则原帧 retain 返回
-// 总旋转 = 视频自带(sourceRotation, preferredTransform 补偿) + 用户手动(rotationAngle)
-// 3 槽轮转 buffer 池化(不再每帧 CVPixelBufferCreate ~3MB)
+// CPU 水平镜像(原地行反转): 420f/420v Y 平面按 1 字节粒度、UV 平面按 2 字节粒度
+// (CbCr 对不能拆开), BGRA 按 4 字节粒度。~3MB 帧约 1ms(预渲染线程可承受)。
+// 千面二进制无任何 Flip 属性字符串 —— VTPixelRotationSession 的 flip 在 420f 上
+// 不支持(-12914), 镜像必须自己实现(对齐千面: VT 只做纯旋转)
+static void vcamMirrorRowsInPlace(CVPixelBufferRef pb) {
+    if (!pb) return;
+    CVPixelBufferLockBaseAddress(pb, 0);
+    int planes = (int)CVPixelBufferGetPlaneCount(pb);
+    if (planes <= 0) {
+        // 单平面 BGRA: 4 字节/像素
+        uint8_t *base = (uint8_t *)CVPixelBufferGetBaseAddress(pb);
+        size_t bpr = CVPixelBufferGetBytesPerRow(pb);
+        size_t w = CVPixelBufferGetWidth(pb) * 4;
+        size_t h = CVPixelBufferGetHeight(pb);
+        for (size_t y = 0; y < h && base; y++) {
+            uint8_t *row = base + y * bpr;
+            for (size_t l = 0, r = w - 4; l < r; l += 4, r -= 4) {
+                uint32_t t = *(uint32_t *)(row + l);
+                *(uint32_t *)(row + l) = *(uint32_t *)(row + r);
+                *(uint32_t *)(row + r) = t;
+            }
+        }
+    } else {
+        for (int p = 0; p < planes; p++) {
+            uint8_t *base = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, p);
+            size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, p);
+            size_t pw = CVPixelBufferGetWidthOfPlane(pb, p);
+            size_t ph = CVPixelBufferGetHeightOfPlane(pb, p);
+            size_t px = (p == 0) ? 1 : 2;  // Y=1字节/px, UV=2字节/px(CbCr 对)
+            size_t rowBytes = pw * px;
+            for (size_t y = 0; y < ph && base; y++) {
+                uint8_t *row = base + y * bpr;
+                for (size_t l = 0, r = rowBytes - px; l < r; l += px, r -= px) {
+                    for (size_t b = 0; b < px; b++) {
+                        uint8_t t = row[l + b];
+                        row[l + b] = row[r + b];
+                        row[r + b] = t;
+                    }
+                }
+            }
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(pb, 0);
+}
+
+// 逐平面复制(格式/尺寸需一致, bytesPerRow 允许不同 → 逐行 min 拷贝)
+static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
+    if (!src || !dst) return NO;
+    if (CVPixelBufferGetPixelFormatType(src) != CVPixelBufferGetPixelFormatType(dst)) return NO;
+    int planes = (int)CVPixelBufferGetPlaneCount(src);
+    CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+    CVPixelBufferLockBaseAddress(dst, 0);
+    if (planes <= 0) {
+        uint8_t *s = (uint8_t *)CVPixelBufferGetBaseAddress(src);
+        uint8_t *d = (uint8_t *)CVPixelBufferGetBaseAddress(dst);
+        size_t sbpr = CVPixelBufferGetBytesPerRow(src), dbpr = CVPixelBufferGetBytesPerRow(dst);
+        size_t w = CVPixelBufferGetWidth(src) * 4, h = CVPixelBufferGetHeight(src);
+        for (size_t y = 0; y < h && s && d; y++)
+            memcpy(d + y * dbpr, s + y * sbpr, w);
+    } else {
+        for (int p = 0; p < planes; p++) {
+            uint8_t *s = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(src, p);
+            uint8_t *d = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(dst, p);
+            size_t sbpr = CVPixelBufferGetBytesPerRowOfPlane(src, p);
+            size_t dbpr = CVPixelBufferGetBytesPerRowOfPlane(dst, p);
+            size_t px = (p == 0) ? 1 : 2;
+            size_t w = CVPixelBufferGetWidthOfPlane(src, p) * px;
+            size_t h = CVPixelBufferGetHeightOfPlane(src, p);
+            for (size_t y = 0; y < h && s && d; y++)
+                memcpy(d + y * dbpr, s + y * sbpr, w);
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(dst, 0);
+    CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+    return YES;
+}
+
+// 预渲染用: 旋转(VT 纯旋转, 永不设 flip 属性 —— 420f 上 VT flip 报 -12914,
+// 千面二进制亦无任何 Flip 字符串) + 镜像(CPU 行反转)。保持源格式。
+// 总旋转 = 视频自带(sourceRotation) + 用户手动(rotationAngle)
 - (CVPixelBufferRef)rotateAndMirrorIfNeeded:(CVPixelBufferRef)input CF_RETURNS_RETAINED {
     if (!input) return NULL;
     int total = (_sourceRotation + _rotationAngle) % 360;
     if (total < 0) total += 360;
-    if (total == 0 && !_mirrored) {
+    BOOL needRotate = (total != 0);
+    BOOL needMirror = _mirrored;
+    if (!needRotate && !needMirror) {
         return (CVPixelBufferRef)CVPixelBufferRetain(input);
     }
-    if (!_rotationApiAvailable || !_pixelRotationSession || !_transferRotationImage) {
-        // 旋转 API 不可用, 回退原帧（不旋转）
-        return (CVPixelBufferRef)CVPixelBufferRetain(input);
-    }
+
     size_t inW = CVPixelBufferGetWidth(input);
     size_t inH = CVPixelBufferGetHeight(input);
-    size_t rotW = (total == 90 || total == 270) ? inH : inW;
-    size_t rotH = (total == 90 || total == 270) ? inW : inH;
     OSType fmt = CVPixelBufferGetPixelFormatType(input);
 
-    // 槽位轮转: 尺寸/格式变化时重建该槽
-    int slot = _prerenderRotateSlot;
-    _prerenderRotateSlot = (slot + 1) % 3;
-    CVPixelBufferRef dst = [self prerenderRotateBufferAtSlot:slot];
-    if (!dst || CVPixelBufferGetWidth(dst) != rotW || CVPixelBufferGetHeight(dst) != rotH ||
-        CVPixelBufferGetPixelFormatType(dst) != fmt) {
-        if (dst) CVPixelBufferRelease(dst);
-        dst = NULL;
-        OSStatus cst = CVPixelBufferCreate(kCFAllocatorDefault, rotW, rotH, fmt, NULL, &dst);
-        if (cst != noErr || !dst) {
-            [self setPrerenderRotateBuffer:NULL atSlot:slot];
-            return (CVPixelBufferRef)CVPixelBufferRetain(input);  // 失败回退原帧
+    // 阶段1: 纯旋转(VT) → 产出可写池 buffer; 失败/不需要时用原帧
+    CVPixelBufferRef work = NULL;
+    BOOL workIsWritable = NO;
+    if (needRotate && _rotationApiAvailable && _pixelRotationSession && _transferRotationImage) {
+        size_t rotW = (total == 90 || total == 270) ? inH : inW;
+        size_t rotH = (total == 90 || total == 270) ? inW : inH;
+        int slot = _prerenderRotateSlot;
+        _prerenderRotateSlot = (slot + 1) % 3;
+        CVPixelBufferRef dst = [self prerenderRotateBufferAtSlot:slot];
+        if (!dst || CVPixelBufferGetWidth(dst) != rotW || CVPixelBufferGetHeight(dst) != rotH ||
+            CVPixelBufferGetPixelFormatType(dst) != fmt) {
+            if (dst) CVPixelBufferRelease(dst);
+            dst = NULL;
+            OSStatus cst = CVPixelBufferCreate(kCFAllocatorDefault, rotW, rotH, fmt, NULL, &dst);
+            if (cst != noErr || !dst) {
+                [self setPrerenderRotateBuffer:NULL atSlot:slot];
+            } else {
+                [self setPrerenderRotateBuffer:CVPixelBufferRetain(dst) atSlot:slot];
+            }
         }
-        [self setPrerenderRotateBuffer:CVPixelBufferRetain(dst) atSlot:slot];  // 池持有 1 引用
+        if (dst) {
+            CFTypeRef rotValue;
+            if (total == 90)       rotValue = _rotationCW90Value;
+            else if (total == 270) rotValue = _rotationCCW90Value;
+            else                   rotValue = _rotation180Value;
+            VTSessionSetProperty(_pixelRotationSession, _rotationPropertyKey, rotValue);
+            OSStatus st = _transferRotationImage(_pixelRotationSession, input, dst);
+            if (st == noErr) {
+                work = CVPixelBufferRetain(dst);  // 池 buffer 可写, 后续可原地镜像
+                workIsWritable = YES;
+            } else {
+                static int rotFailLogged = 0;
+                if (rotFailLogged++ < 2) {
+                    vcam_gpu_log([NSString stringWithFormat:@"[vcam] prerender rotate failed: %d (keep unrotated)", (int)st]);
+                }
+            }
+        }
+    }
+    if (!work) {
+        work = (CVPixelBufferRef)CVPixelBufferRetain(input);  // 解码器 buffer, 不可写
     }
 
-    // 旋转角度显式覆盖(含 0°): 只镜像场景(total=0)若不设置, session 会残留
-    // 上一次的角度 → 多次点击转/镜后画面多转 90/270(方向错乱根因之一)
-    CFTypeRef rotValue;
-    if (total == 90)       rotValue = _rotationCW90Value;
-    else if (total == 270) rotValue = _rotationCCW90Value;
-    else if (total == 180) rotValue = _rotation180Value;
-    else                   rotValue = kCFBooleanFalse;  // 显式归零防残留
-    VTSessionSetProperty(_pixelRotationSession, _rotationPropertyKey, rotValue);
-    VTSessionSetProperty(_pixelRotationSession, _flipHorizontalKey, _mirrored ? kCFBooleanTrue : kCFBooleanFalse);
-
-    OSStatus st = _transferRotationImage(_pixelRotationSession, input, dst);
-    if (st != noErr) {
-        vcam_gpu_log([NSString stringWithFormat:@"[vcam] prerender rotate failed: %d (keep unrotated)", (int)st]);
-        return (CVPixelBufferRef)CVPixelBufferRetain(input);
+    // 阶段2: 镜像(CPU 行反转)
+    if (!needMirror) return work;  // CF_RETURNS_RETAINED
+    if (workIsWritable) {
+        vcamMirrorRowsInPlace(work);
+        return work;
     }
-    return CVPixelBufferRetain(dst);  // 返回额外引用, 池仍持有自己的
+    // mirror-only: 复制到自有 buffer 再反转(不动解码器 buffer)
+    if (!_prerenderMirrorBuffer || _prerenderMirrorW != inW || _prerenderMirrorH != inH ||
+        _prerenderMirrorFmt != fmt) {
+        if (_prerenderMirrorBuffer) CVPixelBufferRelease(_prerenderMirrorBuffer);
+        _prerenderMirrorBuffer = NULL;
+        CVPixelBufferRef mb = NULL;
+        if (CVPixelBufferCreate(kCFAllocatorDefault, inW, inH, fmt, NULL, &mb) == noErr && mb) {
+            _prerenderMirrorBuffer = mb;  // 池持有
+            _prerenderMirrorW = inW;
+            _prerenderMirrorH = inH;
+            _prerenderMirrorFmt = fmt;
+        }
+    }
+    if (_prerenderMirrorBuffer &&
+        vcamCopyPlanes(work, _prerenderMirrorBuffer)) {
+        vcamMirrorRowsInPlace(_prerenderMirrorBuffer);
+        CVPixelBufferRelease(work);
+        return CVPixelBufferRetain(_prerenderMirrorBuffer);
+    }
+    // 复制失败(罕见): 返回未镜像帧, 不崩溃
+    return work;
 }
 
 // 预渲染用: 同尺寸格式转换(如 BGRA -> 420f), VT 主路径 + CoreImage 回退

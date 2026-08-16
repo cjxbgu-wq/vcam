@@ -418,7 +418,11 @@ static void vcam_player_log(NSString *msg) {
 }
 
 - (void)resetReaderForLoop {
-    vcam_player_log(@"[vcam] Looping video from beginning");
+    // 限流(2026-08-16): 每 12 次循环记 1 条(5s 视频 ~1 分钟 1 条, disk writes 限额保护)
+    static int loopLogCounter = 0;
+    if (loopLogCounter++ % 12 == 0) {
+        vcam_player_log(@"[vcam] Looping video from beginning");
+    }
 
     // 显式释放旧 reader/output 后再新建(2026-08-15): 避免新旧 reader 并存瞬间
     // 对同一 asset 双重持有/派发通知, 加重 CommonURLAsset* 队列负担(watchdog 根因)
