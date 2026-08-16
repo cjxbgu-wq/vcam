@@ -150,6 +150,15 @@ static void vcam_core_log(NSString *msg) {
 // CPU 闭环降载(2026-08-16): 进程 CPU 接近 daemon 50% 红线时置 YES ——
 // 解码/预渲染节拍降为 1/3(替换内容 ~10fps 更新, 连续无感), 冻结帧走 staging 复用
 @property (nonatomic, assign) BOOL lowPowerDecode;
+// 多流显示同步(2026-08-16 照片模式叠影修复): 照片模式预览流+照片缩放流同时活跃,
+// 各流 render 时刻不同且缓存 key 不同(尺寸/格式各异), 仅量化代数不够 —— 窗口内
+// 不同流仍会从 live buffer 取到不同时间的帧, App 融合两流 → 两个画面叠影。
+// 快照方案: 每 1/视频fps 窗口推进时 retain 锁定当前 _liveYUVPixelBuffer 为
+// syncDisplayFrame, 窗口内所有流统一渲染该快照 + 同一 gen → 内容强制一致。
+// 快照生命周期 ≤1 帧 < 预渲染 3-slot 旋转池复用周期(3 帧), 不会被覆写
+@property (nonatomic, assign) CVPixelBufferRef syncDisplayFrame;
+@property (nonatomic, assign) uint64_t syncDisplayGen;
+@property (nonatomic, assign) CFAbsoluteTime lastGenAdvanceTime;
 @end
 
 @implementation VCamCore
@@ -288,12 +297,28 @@ static void vcam_core_log(NSString *msg) {
         [self->_videoPlayer startDecodingThread]; // 空转线程恢复解码标志
     }
 
-    // 1. 取预渲染缓存(YUV 主源, 等价千面 [player copyCurrentFrame]) + 帧代数
-    // (提前到 CPU 降载块之前获取: 冻结机制需要读写 gen)
+    // 1. 显示快照 + 帧代数(2026-08-16 照片模式叠影修复):
+    // 每 1/视频fps 窗口推进一次, 推进时 retain 锁定当前 live 帧为快照;
+    // 窗口内所有流(预览/照片缩放/录像)统一渲染同一快照 buffer + 同一 gen →
+    // 内容强制一致, App 融合多流显示不再出现两个时间点的画面叠影。
+    // 快照由本属性 retain, 预渲染替换 live 不影响内容(旋转 slot 池 3 帧复用周期 > 快照 1 帧寿命)
     [_processLock lock];
-    CVPixelBufferRef yuv = _liveYUVPixelBuffer;
+    {
+        uint64_t liveGen = _liveFrameGen;
+        CFAbsoluteTime nowQ = CFAbsoluteTimeGetCurrent();
+        double vfps = MAX(_videoPlayer.effectiveFps, 1.0);
+        BOOL windowElapsed = (nowQ - self->_lastGenAdvanceTime) >= (1.0 / vfps);
+        if (_liveYUVPixelBuffer &&
+            (liveGen != self->_syncDisplayGen) && (liveGen < self->_syncDisplayGen || windowElapsed)) {
+            if (self->_syncDisplayFrame) CVPixelBufferRelease(self->_syncDisplayFrame);
+            self->_syncDisplayFrame = CVPixelBufferRetain(_liveYUVPixelBuffer);
+            self->_syncDisplayGen = liveGen;
+            self->_lastGenAdvanceTime = nowQ;
+        }
+    }
+    CVPixelBufferRef yuv = self->_syncDisplayFrame;
     if (yuv) CVPixelBufferRetain(yuv);
-    uint64_t gen = _liveFrameGen;
+    uint64_t gen = self->_syncDisplayGen;
     [_processLock unlock];
     // 帧代数经 writeFrame:toPixelBuffer:token: 参数传递(不写 gpuProcessor 全局属性,
     // 多 hook 线程并发 render 时全局赋值会互相覆盖导致 staging 误用别帧内容)
@@ -448,6 +473,13 @@ static void vcam_core_log(NSString *msg) {
 - (void)clearReplacementFrame {
     [self stopPrerenderThread];
     [_processLock lock];
+    // 显示同步快照清理(2026-08-16 叠影修复配套)
+    if (_syncDisplayFrame) {
+        CVPixelBufferRelease(_syncDisplayFrame);
+        _syncDisplayFrame = NULL;
+    }
+    _syncDisplayGen = 0;
+    _lastGenAdvanceTime = 0;
     if (_liveBGRAPixelBuffer) {
         CVPixelBufferRelease(_liveBGRAPixelBuffer);
         _liveBGRAPixelBuffer = NULL;
