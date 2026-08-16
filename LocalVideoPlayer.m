@@ -516,9 +516,11 @@ static size_t vcam_decode_max_edge(void) {
 
     _decodeThread = [[NSThread alloc] initWithTarget:self selector:@selector(decodeLoop) object:nil];
     _decodeThread.name = @"vcam.decoder";
-    // Utility 优先级(2026-08-15): mediaserverd 内我们的负载必须让位系统服务 RPC,
-    // 否则 AURemoteIO RPCTimeout → mediaserverd 被杀 → 全部相机黑屏(死循环重启)
-    _decodeThread.qualityOfService = NSQualityOfServiceUtility;
+    // Default 优先级(2026-08-16 卡顿修复): Utility 下解码线程被相机多流 render/系统
+    // RPC 饿死, 跟不上源帧率 → 帧队列断供 → 预渲染重复帧 → 替换画面卡顿掉帧。
+    // 升 Default 与服务线程同级竞争(8-15 降 Utility 时 render 还是全局锁串行的大负载,
+    // 现在 per-stream 并行+微型流跳过+空闲门控后我们负载已大降, Default 安全)
+    _decodeThread.qualityOfService = NSQualityOfServiceDefault;
     [_decodeThread start];
     vcam_player_log(@"[vcam] Decoding thread started (persistent)");
 }

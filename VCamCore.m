@@ -104,11 +104,10 @@ static void vcam_core_log(NSString *msg) {
     self = [super init];
     if (self) {
         _prerenderQueue = dispatch_queue_create("com.vcam.processing", DISPATCH_QUEUE_SERIAL);
-        // 预渲染 Utility 优先级(2026-08-15): App 多流场景我们的解码+预渲染+多流渲染
-        // 吃满 mediaserverd → AURemoteIO/服务 RPC 超时 → 系统杀 mediaserverd(黑屏死循环)。
-        // 系统服务请求永远优先, 我们的线程全面让位( Utility 空载仍够 24fps, 忙时降帧但不死)
-        dispatch_set_target_queue(_prerenderQueue,
-                                  dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+        // 预渲染 Default 优先级(2026-08-16 卡顿修复): Utility 下预渲染被饿死 → 旋转转换
+        // 跟不上解码 → _liveYUV 长时间不更新 → render 反复写旧帧 → 卡顿观感。
+        // (8-15 降 Utility 时 render 是全局锁串行大负载; 现在 per-stream 并行 + 微型流
+        //  跳过 + 相机空闲门控后我们负载已大降, Default 与服务同级竞争安全)
         _processingQueue = dispatch_queue_create("com.vcam.processing.bg", DISPATCH_QUEUE_SERIAL);
         _processLock = [[NSLock alloc] init];
         _renderLock = [[NSLock alloc] init];

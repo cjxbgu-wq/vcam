@@ -93,6 +93,11 @@ static void vcam_gpu_log(NSString *msg) {
 @property (nonatomic, assign) OSType adaptiveRotateCacheFmt;
 // 旋转结果帧代数: 同一帧(token)多流渲染时只 rotate 一次, 后续流直接复用
 @property (nonatomic, assign) uint64_t adaptiveRotatedGen;
+// 流 key LRU 顺序(2026-08-16 黑屏修复): per-key 池(session+staging 12MB 级 buffer)
+// 无上限增长 —— App 切前后摄/分辨率/多流组合变化时 key 只增不减, 内存缓慢累积 →
+// mediaserverd 内存超限被杀 → 相机黑屏(重进恢复=重启清零, 再累积再黑, 周期循环)。
+// 超 kVcamMaxStreamKeys 淘汰最久未用 key(释放 session+staging), 熔断标记保留
+@property (nonatomic, strong) NSMutableArray<NSString *> *streamKeyOrder;
 
 // 私有 API 函数指针
 @property (nonatomic, assign) VTPixelRotationSessionCreateFunc createRotationSession;
@@ -156,6 +161,7 @@ static void vcam_gpu_log(NSString *msg) {
         _rotationRenderLock = [[NSLock alloc] init];
         _twoStepKeyLockPool = [[NSMutableDictionary alloc] init];
         _adaptiveRotatedGen = 0;
+        _streamKeyOrder = [NSMutableArray array];
 
         // 软件渲染 CIContext（mediaserverd 没有 GPU 上下文）
         @try {
@@ -389,6 +395,8 @@ static void vcam_gpu_log(NSString *msg) {
         if (existing) {
             return (__bridge CVPixelBufferPoolRef)existing;
         }
+        // 新建池纳入流 key LRU(与 session/staging 同一上限管理, 防尺寸种类累积)
+        [self touchStreamKeyLRU:key];
 
         // 创建新池（关键约束：不能用 kCVPixelBufferIOSurfacePropertiesKey）
         NSDictionary *poolAttributes = @{
@@ -1032,6 +1040,7 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
     size_t srcH = CVPixelBufferGetHeight(src);
 
     NSString *poolKey = [NSString stringWithFormat:@"%zu_%zu_%u", dstW, dstH, (unsigned)dstFormat];
+    [self touchStreamKeyLRU:poolKey];
 
     BOOL isPrivate = !(dstFormat == kCVPixelFormatType_32BGRA ||
                        (dstFormat & 0xffffffef) == '420f');
@@ -1062,6 +1071,69 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
         return NO;
     }
     return YES;
+}
+
+// 流 key LRU(2026-08-16 黑屏修复): 每次流访问把 key 移到 MRU 尾部,
+// 超 kVcamMaxStreamKeys 淘汰最旧 key 的全部池资源(session/staging/token/锁)。
+// 防切前后摄/换分辨率场景 key 无限累积 → mediaserverd 内存超限被杀(黑屏循环)。
+// 熔断标记(twoStepDisabledPool)保留: 熔断语义是永久的, 淘汰后重试已确认
+// 不支持的组合会复发 wakeups 风暴。持锁中的 NSLock 淘汰安全: 持有线程栈上
+// 有强引用, unlock 释放后才可能 dealloc
+static const NSUInteger kVcamMaxStreamKeys = 6;
+
+- (void)touchStreamKeyLRU:(NSString *)key {
+    if (!key) return;
+    @synchronized(self) {
+        NSUInteger idx = [_streamKeyOrder indexOfObject:key];
+        if (idx != NSNotFound) {
+            [_streamKeyOrder removeObjectAtIndex:idx];
+        }
+        [_streamKeyOrder addObject:key];
+
+        while (_streamKeyOrder.count > kVcamMaxStreamKeys) {
+            NSString *old = _streamKeyOrder.firstObject;
+            [_streamKeyOrder removeObjectAtIndex:0];
+            if (!old) break;
+
+            void (*invalidateSession)(VTPixelTransferSessionRef) =
+                (void (*)(VTPixelTransferSessionRef))dlsym(RTLD_DEFAULT, "VTPixelTransferSessionInvalidate");
+
+            // one-step session + 锁
+            NSValue *osv = _oneStepSessionPool[old];
+            if (osv) {
+                VTPixelTransferSessionRef s = (VTPixelTransferSessionRef)[osv pointerValue];
+                if (s && invalidateSession) invalidateSession(s);
+                [_oneStepSessionPool removeObjectForKey:old];
+            }
+            [_oneStepKeyLockPool removeObjectForKey:old];
+
+            // two-step session(大头是 staging: 12MP 流级 BGRA ~12-48MB/条)
+            NSValue *tsv = _twoStepSessionPool[old];
+            if (tsv) {
+                VTPixelTransferSessionRef s = (VTPixelTransferSessionRef)[tsv pointerValue];
+                if (s && invalidateSession) invalidateSession(s);
+                [_twoStepSessionPool removeObjectForKey:old];
+            }
+            NSValue *stv = _twoStepStagingPool[old];
+            if (stv) {
+                CVPixelBufferRef b = (CVPixelBufferRef)[stv pointerValue];
+                if (b) CVPixelBufferRelease(b);
+                [_twoStepStagingPool removeObjectForKey:old];
+            }
+            [_twoStepTokenPool removeObjectForKey:old];
+            [_twoStepFailCountPool removeObjectForKey:old];
+            [_twoStepKeyLockPool removeObjectForKey:old];
+            // BGRA 分配池(__bridge 存储, 手动 release; 池内 idle buffer 随之释放)
+            id poolObj = _bgraBufferPoolMap[old];
+            if (poolObj) {
+                CVPixelBufferPoolRelease((__bridge CVPixelBufferPoolRef)poolObj);
+                [_bgraBufferPoolMap removeObjectForKey:old];
+            }
+            // twoStepDisabledPool 故意不清(熔断永久)
+
+            vcam_gpu_log([NSString stringWithFormat:@"[vcam] LRU evict stream key %@ (pool now %lu)", old, (unsigned long)_streamKeyOrder.count]);
+        }
+    }
 }
 
 // 两步法主体(调用方已持 per-key 锁)
