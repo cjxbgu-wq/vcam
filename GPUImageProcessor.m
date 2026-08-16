@@ -1305,9 +1305,15 @@ static const NSUInteger kVcamMaxStreamKeys = 6;
                 cropRect = CGRectMake(ext.origin.x, ext.origin.y + (srcH - ch) / 2, srcW, ch);
             }
             CIImage *cropped = [img imageByCroppingToRect:cropRect];
-            CGAffineTransform scaleT = CGAffineTransformMakeScale(
-                dstW / cropRect.size.width, dstH / cropRect.size.height);
-            out = [cropped imageByApplyingTransform:scaleT];
+            // 原点归零(2026-08-16 照片模式叠影根因修复): 裁剪后 CIImage extent 原点
+            // 非 (0,0)(裁左右时 x0>0), 仅缩放会使渲染内容整体偏移 S*x0 → 画面右移,
+            // 左侧条带永不写入(残留旧内容) → "两个视频叠加+右偏"伪影。
+            // 复合矩阵 p' = S*(p - origin): 先平移到原点再缩放
+            CGFloat sx = dstW / cropRect.size.width;
+            CGFloat sy = dstH / cropRect.size.height;
+            CGAffineTransform fillT = CGAffineTransformMake(
+                sx, 0, 0, sy, -sx * cropRect.origin.x, -sy * cropRect.origin.y);
+            out = [cropped imageByApplyingTransform:fillT];
             if (!out) return NO;
 
             if (token != 0) {
