@@ -371,19 +371,19 @@ static void vcam_core_log(NSString *msg) {
             lastCpuCheck = nowT;
             self.lowPowerDecode = lowPower;  // 解码/预渲染同步降速
         }
-        // 按流尺寸的内容更新节流(2026-08-16 吞吐量治理, 常开取代 lowPower-only 冻结):
-        // 物理约束: 多流全速替换像素吞吐 22GB/30s >> daemon CPU 配额(telemetry 实测
-        // CPU 51-157% 持续, mediaserverd 照片场景 30s 内被杀 3 次 = 拍照黑屏崩溃)。
-        // 相机流 30-60fps 但视频内容仅 24fps —— 按内容节拍更新, 窗口内重复 render
-        // 传旧 token → VT 两步法跳过 stage1 昂贵缩放, 只付 ~1.5ms stage2 blit。
-        // 窗口按像素分级: ≥10MP(拍照编码流) 1fps / ≥3MP(照片模式取景器) 12fps /
-        // 其他(常规预览) 24fps(=视频内容率, 无感); lowPower 时统一收紧 15fps
+        // 按流尺寸的内容更新节流(2026-08-16 吞吐量治理 v2, 修 12fps 卡顿):
+        // 物理约束: 多流全速替换像素吞吐 22GB/30s >> daemon CPU 配额(实测 CPU 51-157%,
+        // mediaserverd 照片场景 30s 被杀 3 次 = 拍照黑屏崩溃)。
+        // v1 教训: 把照片取景器(2304x1650=3.8MP)节流到 12fps → 用户盯着看的主画面
+        // 内容只有 12fps = 肉眼明显卡顿。取景器就是可见流, 不能低于视频内容率!
+        // v2 原则: 内容率 = 视频原生帧率(24fps), 可见流按内容率节流(35fps 相机流
+        // 跳过 ~1/3 重复帧, 只付 ~1.5ms blit, 视觉零差异); 仅不可见的拍照编码流
+        // (≥10MP, 产物是静态照片)放宽到 1fps; lowPower 紧急档 15fps
         {
             static NSMutableDictionary<NSString *, NSDictionary *> *freezeState = nil;
             if (!freezeState) freezeState = [NSMutableDictionary dictionary];
             uint64_t px = (uint64_t)targetW * targetH;
             double window = px > 10000000ull ? 1.0
-                          : px > 3000000ull ? 0.083
                           : (lowPower ? 0.066 : 0.042);
             NSString *fk = [NSString stringWithFormat:@"%zu_%zu_%u", targetW, targetH, (unsigned)origFormat];
             @synchronized(freezeState) {
