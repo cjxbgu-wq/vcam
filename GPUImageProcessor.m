@@ -357,6 +357,9 @@ static void vcam_gpu_log(NSString *msg) {
     VTPixelTransferSessionRef s = NULL;
     if (VTPixelTransferSessionCreate(kCFAllocatorDefault, &s) == noErr && s) {
         VTSessionSetProperty(s, CFSTR("ScalingMode"), CFSTR("Trim"));
+        // RealTime 硬件加速提示(2026-08-16 延迟修复): VT 择优硬件路径(相机管线内
+        // GPU/ANE 可用), 降低 -8f0 照片流等纯 CPU 转换的 CPU 占用; 失败自动回退软件
+        VTSessionSetProperty(s, CFSTR("RealTime"), kCFBooleanTrue);
         _twoStepSessionPool[key] = [NSValue valueWithPointer:s];
         return s;
     }
@@ -1055,6 +1058,7 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
         VTPixelTransferSessionRef s = NULL;
         if (VTPixelTransferSessionCreate(kCFAllocatorDefault, &s) == noErr && s) {
             VTSessionSetProperty(s, CFSTR("ScalingMode"), CFSTR("Trim"));
+            VTSessionSetProperty(s, CFSTR("RealTime"), kCFBooleanTrue);  // 硬件路径提示
             _oneStepSessionPool[key] = [NSValue valueWithPointer:s];
             return s;
         }
