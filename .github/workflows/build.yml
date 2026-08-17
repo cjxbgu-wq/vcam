@@ -85,7 +85,11 @@ jobs:
           chmod 0755 "debroot/var/jb/usr/lib/TweakInject/VCamPlus.dylib"
           chmod 0644 "debroot/var/jb/usr/lib/TweakInject/VCamPlus.plist" 2>/dev/null || true
 
-          fakeroot dpkg-deb -Zzstd -b debroot VCamPlus.deb
+          # gzip 打包(供 postprocess 用标准库处理), 再剥离目录条目
+          # (2026-08-18 设备实证: /var/jb 是 patchloader 的符号链接,
+          #  目录条目触发 dpkg overwrite 冲突, 装不上)
+          fakeroot dpkg-deb -Zgzip -b debroot VCamPlus.deb
+          python3 postprocess_deb.py VCamPlus.deb VCamPlus.deb
           cp VCamPlus.deb artifact/
 
           echo "=== deb package ==="
