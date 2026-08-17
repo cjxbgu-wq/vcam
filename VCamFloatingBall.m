@@ -18,6 +18,7 @@
 #import "VCamCore.h"
 #import "VCamNotify.h"
 #import "ball_icon.h"
+#import "VCamStr.h"
 #import <UIKit/UIKit.h>
 #import <PhotosUI/PhotosUI.h>
 
@@ -69,15 +70,26 @@ static void vcam_ball_log(NSString *msg) {
     if (self) {
         // 图标球(2026-08-17): 岐盛相机品牌图标替代灰底"VC"文字。
         // 图标 PNG 以 C 数组嵌入 dylib(ball_icon.h), 无需 deb 布局资源文件,
-        // 运行时 UIImage imageWithData 解码
+        // 运行时 UIImage imageWithData 解码。
+        // 2026-08-18 加密: PNG 字节 XOR 8字节 rolling key 存储, 二进制内无
+        // PNG 魔数/binwalk 特征, 防提取替换品牌图标; 此处运行时解码
         self.backgroundColor = [UIColor colorWithRed:0.35 green:0.36 blue:0.38 alpha:0.92];
         self.layer.cornerRadius = frame.size.width / 2;
         self.layer.masksToBounds = YES;
         self.layer.borderWidth = 2;
         self.layer.borderColor = [UIColor colorWithRed:0.75 green:0.76 blue:0.78 alpha:1.0].CGColor;
 
-        UIImage *icon = [UIImage imageWithData:[NSData dataWithBytes:vcam_ball_icon_png
-                                                              length:vcam_ball_icon_png_len]];
+        static const unsigned char vcsIconKey[8] = {
+            VCS_ICON_KEY0, VCS_ICON_KEY1, VCS_ICON_KEY2, VCS_ICON_KEY3,
+            VCS_ICON_KEY4, VCS_ICON_KEY5, VCS_ICON_KEY6, VCS_ICON_KEY7,
+        };
+        NSMutableData *imgData = [NSMutableData dataWithLength:vcam_ball_icon_png_len];
+        const unsigned char *src = vcam_ball_icon_enc;
+        unsigned char *dst = (unsigned char *)imgData.mutableBytes;
+        for (NSUInteger i = 0; i < vcam_ball_icon_png_len; i++) {
+            dst[i] = src[i] ^ vcsIconKey[i & 7];
+        }
+        UIImage *icon = [UIImage imageWithData:imgData];
         _iconView = [[UIImageView alloc] initWithImage:icon];
         _iconView.frame = CGRectMake(3, 3, frame.size.width - 6, frame.size.height - 6);
         _iconView.contentMode = UIViewContentModeScaleAspectFit;
@@ -373,8 +385,9 @@ static void vcam_ball_log(NSString *msg) {
     preset3.titleLabel.font = [UIFont boldSystemFontOfSize:14];
     [_settingsPageView addSubview:preset3];
 
-    // 岐盛相机: 隐藏频道链接按钮(跳转 Telegram)
-    VCamPanelButton *channel = [self makeButton:@"岐盛相机"
+    // 岐盛相机: 隐藏频道链接按钮(跳转 Telegram)。
+    // 2026-08-18: 品牌/签名/频道字符串混淆存储(VCamStr.h), 二进制无明文
+    VCamPanelButton *channel = [self makeButton:VCS(qisheng)
                                           frame:CGRectMake(pad, (rowH + gap) * 2, contentW, rowH)
                                         selector:@selector(channelLinkTapped)];
     channel.titleLabel.font = [UIFont boldSystemFontOfSize:14];
@@ -382,7 +395,7 @@ static void vcam_ball_log(NSString *msg) {
 
     // 水印
     UILabel *mark = [[UILabel alloc] initWithFrame:CGRectMake(pad, (rowH + gap) * 2 + rowH + 10, contentW, 16)];
-    mark.text = @"@QuGenttx";
+    mark.text = VCS(mark);
     mark.textColor = [UIColor colorWithRed:0.72 green:0.73 blue:0.75 alpha:1.0];
     mark.textAlignment = NSTextAlignmentCenter;
     mark.font = [UIFont systemFontOfSize:11];
@@ -656,7 +669,7 @@ static void vcam_ball_log(NSString *msg) {
 // 岐盛相机: 隐藏频道链接按钮
 - (void)channelLinkTapped {
     vcam_ball_log(@"[vcam][btn] channel link tapped");
-    NSURL *url = [NSURL URLWithString:@"https://t.me/XFrealtime2"];
+    NSURL *url = [NSURL URLWithString:VCS(tglink)];
     [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
 }
 
