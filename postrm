@@ -1,9 +1,16 @@
 #!/bin/bash
-# VCamPlus 卸载后处理: respring 卸载 tweak(dylib 已被删除, 只需重启加载器)
-# 升级场景(prerm remove + 立即 unpack 新版)不重启, 由新版 postinst 统一 respring
-
-if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
-    ( sleep 2; /usr/bin/killall -9 SpringBoard 2>/dev/null; ) >/dev/null 2>&1 &
-fi
+# VCamPlus 卸载后处理(2026-08-18 重写: 不做任何 respring)
+#
+# 事故复盘: 旧版在 postrm 里 sleep 2 后 killall -9 SpringBoard —— 但 postrm 运行时
+# dpkg 事务尚未收尾(status 数据库还没写完), respring 连带杀掉 Sileo/apt 进程,
+# dpkg status 写入被中断 → ellekit 启动校验读到损坏的包记录 →
+# "Ellekit files are corrupted for unknown reasons. Please try reinstalling
+# the ellekit package" 且所有 App 闪退(设备实证, 只能重装越狱恢复)。
+#
+# 正确做法: 卸载后不 respring ——
+#   - Sileo 卸载: dpkg 完全退出后由 Sileo 自己 respring(时机安全)
+#   - dpkg -r 直装: dylib 文件已删, 当前进程内旧副本无害, 下次自然重启生效;
+#     如需立即生效手动 respring 即可
+# 升级场景(prerm remove + 立即 unpack 新版)同样不重启, 由新版 postinst 统一处理
 
 exit 0
