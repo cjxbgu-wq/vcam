@@ -1,8 +1,8 @@
 Package: com.vcam.plus
-Name: VCamPlus
-Version: 1.0.0
+Name: VCamPlus 相机替换
+Version: 1.1.0
 Architecture: iphoneos-arm64e
-Description: VCam camera replacement tweak
+Description: 全局相机视频替换(底层 mediaserverd hook): 悬浮球控制, 装完即用
 Maintainer: vcam
 Author: vcam
 Section: Tweaks

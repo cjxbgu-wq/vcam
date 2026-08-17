@@ -1,0 +1,9 @@
+#!/bin/bash
+# VCamPlus 卸载后处理: respring 卸载 tweak(dylib 已被删除, 只需重启加载器)
+# 升级场景(prerm remove + 立即 unpack 新版)不重启, 由新版 postinst 统一 respring
+
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+    ( sleep 2; /usr/bin/killall -9 SpringBoard 2>/dev/null; ) >/dev/null 2>&1 &
+fi
+
+exit 0

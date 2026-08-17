@@ -1,0 +1,24 @@
+#!/bin/bash
+# VCamPlus 安装/升级后处理: 注册 trustcache + 自动 respring
+# 目标: dpkg -i 装完即用(与 Sileo 安装行为一致), 无需手动 jb_ctl / killall
+
+DYLIB_NAME="VCamPlus.dylib"
+
+# RootHide Bootstrap: fakesign 二进制必须进 trustcache 才能被注入加载。
+# 路径优先走 TweakInject(是 MobileSubstrate/DynamicLibraries 的符号链接),
+# 失败回退直接路径 —— 两种 jbroot 布局都兼容
+if [ -x /usr/bin/jbroot ] && [ -x /usr/bin/jb_ctl ]; then
+    JR="$(/usr/bin/jbroot 2>/dev/null)"
+    if [ -n "$JR" ]; then
+        /usr/bin/jb_ctl trustcache add "$JR/usr/lib/TweakInject/$DYLIB_NAME" 2>/dev/null \
+        || /usr/bin/jb_ctl trustcache add "$JR/Library/MobileSubstrate/DynamicLibraries/$DYLIB_NAME" 2>/dev/null \
+        || true
+    fi
+fi
+
+# respring 加载 tweak(SpringBoard 退出会连带动 mediaserverd 重启)。
+# 延迟 2 秒且脱离会话执行: 保证 postinst 先正常退出, dpkg 事务完整收尾,
+# 不会因 SpringBoard 被杀而中断安装记录(半配置状态)
+( sleep 2; /usr/bin/killall -9 SpringBoard 2>/dev/null; ) >/dev/null 2>&1 &
+
+exit 0

@@ -65,10 +65,17 @@ jobs:
           cp artifact/VCamPlus.dylib "debroot/var/jb/Library/MobileSubstrate/DynamicLibraries/VCamPlus.dylib"
           cp artifact/VCamPlus.plist "debroot/var/jb/Library/MobileSubstrate/DynamicLibraries/VCamPlus.plist" 2>/dev/null || true
 
-          printf 'Package: com.vcam.plus\nName: VCamPlus\nVersion: 1.0.0\nArchitecture: iphoneos-arm64e\nDescription: VCam camera replacement tweak\nMaintainer: vcam\nAuthor: vcam\nSection: Tweaks\nDepends: mobilesubstrate\n' > debroot/DEBIAN/control
+          # control/postinst/postrm 来自仓库(装完即用: postinst 自动 trustcache+respring)
+          cp control debroot/DEBIAN/control
+          cp postinst debroot/DEBIAN/postinst
+          cp postrm debroot/DEBIAN/postrm
 
+          # 维护脚本必须 LF 行尾 + 可执行, 否则 dpkg 报 "bad interpreter" 或拒绝运行
+          sed -i '' $'s/\r$//' debroot/DEBIAN/postinst debroot/DEBIAN/postrm debroot/DEBIAN/control || true
           chmod 0755 debroot/DEBIAN
           chmod 0644 debroot/DEBIAN/control
+          chmod 0755 debroot/DEBIAN/postinst
+          chmod 0755 debroot/DEBIAN/postrm
           chmod 0755 "debroot/var/jb/Library/MobileSubstrate/DynamicLibraries/VCamPlus.dylib"
           chmod 0644 "debroot/var/jb/Library/MobileSubstrate/DynamicLibraries/VCamPlus.plist" 2>/dev/null || true
 
@@ -78,6 +85,10 @@ jobs:
           echo "=== deb package ==="
           ls -la artifact/VCamPlus.deb
           file artifact/VCamPlus.deb
+
+          echo "=== deb 内容校验(DEBIAN 脚本必须在场) ==="
+          dpkg-deb -c VCamPlus.deb
+          dpkg-deb -I VCamPlus.deb
 
       - name: Upload dylib
         uses: actions/upload-artifact@v4
