@@ -1388,23 +1388,27 @@ static const NSUInteger kVcamMaxStreamKeys = 6;
     }
 
     // staging: 目标尺寸中转 buffer(每流独立, 池持有引用)。
-    // 格式跟随目标(2026-08-16 被杀循环修复): YUV 目标用同格式 YUV staging ——
-    // stage1 = src→staging(YUV→YUV 缩放转换一次完成, 成本≈原一步直转, range 保持),
-    // stage2 = 同格式同尺寸 blit(~1.5ms)。
-    // 之前统一 BGRA staging 时 420f 目标的 stage2 是 BGRA→YUV 色彩空间转换(~4ms),
-    // 非冻结帧总成本 12-14ms 比一步直转高 40%, 三流并发瞬间爆表 → mediaserverd
-    // 5-6s 一次被杀循环(telemetry: fp 反复回落 3MB, prerender 反复 #1 重启)。
-    // BGRA/私有格式目标保持 BGRA staging(私有从 BGRA 转成功率高, 已实测验证)。
+    // 同格式 staging 全面化(2026-08-17 卡顿根治): 探针实测 |8v0 流 BGRA staging 的
+    // stage2(BGRA→|8v0 色彩转换) 12.3ms × 24fps = 单流 30% CPU, 加上另一条私有流
+    // 合计 ~50%, 总 CPU 在 46% 冻结线上下震荡(59↔43) → 内容 24↔20fps 反复切换 =
+    // 用户看到的持续卡顿。修: staging 一律先用目标自身格式(私有格式
+    // CVPixelBufferCreate 通常可行, VT 可写, 我们不做 CPU 访问) → stage2 退化为
+    // 同格式 blit(~1.5ms), 省 ~26% CPU, 冻结不再触发。
+    // 回退: 创建失败或 stage1 转换失败(该 src→私有组合 VT 不支持 -12905) →
+    // 重建 BGRA staging 走旧路径, 每流只回退一次(记入 fmt 选择)
     OSType dstFmt = CVPixelBufferGetPixelFormatType(dst);
-    OSType stagingFmt = ((dstFmt & 0xffffffef) == '420f') ? dstFmt : kCVPixelFormatType_32BGRA;
     CVPixelBufferRef staging = NULL;
     NSValue *sv = _twoStepStagingPool[poolKey];
     if (sv) staging = (CVPixelBufferRef)[sv pointerValue];
     if (!staging) {
-        staging = [self createBufferWithWidth:dstW height:dstH format:stagingFmt];
+        staging = [self createBufferWithWidth:dstW height:dstH format:dstFmt];
+        if (!staging) {
+            staging = [self createBufferWithWidth:dstW height:dstH format:kCVPixelFormatType_32BGRA];
+        }
         if (!staging) return NO;
         _twoStepStagingPool[poolKey] = [NSValue valueWithPointer:staging];  // 所有权归池
-        vcam_gpu_log([NSString stringWithFormat:@"[vcam] 2step staging created for stream %@ fmt=%@", poolKey, [self stringForFormat:stagingFmt]]);
+        vcam_gpu_log([NSString stringWithFormat:@"[vcam] 2step staging created for stream %@ fmt=%@", poolKey,
+                      [self stringForFormat:CVPixelBufferGetPixelFormatType(staging)]]);
     }
 
     // 缩放复用: 同一源帧(token 未变)同流已缩放 → 跳过步骤1
@@ -1412,12 +1416,25 @@ static const NSUInteger kVcamMaxStreamKeys = 6;
     BOOL stagingFresh = (token != 0 && cachedTok && [cachedTok unsignedLongLongValue] == token);
     CFAbsoluteTime tS1 = 0, tS2 = 0;
     if (!stagingFresh) {
-        // 步骤1: 缩放到目标尺寸 BGRA(per-key session, Trim crop fill)
+        // 步骤1: src → staging 缩放+格式转换(per-key session, Trim crop fill)
         VTPixelTransferSessionRef s1 = [self twoStepSessionForKey:poolKey];
         if (!s1) return NO;
         tS1 = CFAbsoluteTimeGetCurrent();
         OSStatus st1 = VTPixelTransferSessionTransferImage(s1, src, staging);
         [self noteStageTiming:poolKey stage:1 ms:(CFAbsoluteTimeGetCurrent() - tS1) * 1000.0];
+        if (st1 != noErr &&
+            CVPixelBufferGetPixelFormatType(staging) != kCVPixelFormatType_32BGRA) {
+            // 同格式 staging 的组合 VT 不支持 → 每流一次性回退 BGRA staging 重试
+            vcam_gpu_log([NSString stringWithFormat:@"[vcam] same-fmt staging rejected (%d), fallback BGRA for %@",
+                          (int)st1, poolKey]);
+            CVPixelBufferRelease(staging);
+            staging = [self createBufferWithWidth:dstW height:dstH format:kCVPixelFormatType_32BGRA];
+            if (!staging) return NO;
+            _twoStepStagingPool[poolKey] = [NSValue valueWithPointer:staging];
+            tS1 = CFAbsoluteTimeGetCurrent();
+            st1 = VTPixelTransferSessionTransferImage(s1, src, staging);
+            [self noteStageTiming:poolKey stage:1 ms:(CFAbsoluteTimeGetCurrent() - tS1) * 1000.0];
+        }
         if (st1 != noErr) {
             vcam_gpu_log([NSString stringWithFormat:@"[vcam] 2step stage1 failed: %d key=%@", (int)st1, poolKey]);
             return NO;
