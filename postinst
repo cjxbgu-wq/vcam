@@ -12,13 +12,12 @@ if ! dpkg -s ellekit >/dev/null 2>&1; then
 fi
 
 # RootHide Bootstrap: fakesign 二进制必须进 trustcache 才能被注入加载。
-# 命令名修复(2026-08-17 "不替换"根因): RootHide Bootstrap 的工具是 jbctl(无下划线,
-# /usr/bin/jbctl -> ../../basebin/jbctl), 之前误写 jb_ctl 导致 [ -x ] 检查失败、
-# trustcache 注册被静默跳过 → dylib 不被 AMFI 信任 → mediaserverd 拒载 → 相机不替换。
-# 路径优先走 TweakInject(是 MobileSubstrate/DynamicLibraries 的符号链接),
-# 失败回退直接路径 —— 两种 jbroot 布局都兼容。
-# 防御(2026-08-17 设备事故教训): jbroot 在用户态损坏时可能返回空或 "/",
-# 尾斜杠也会污染路径拼接 —— 校验+规范化后再用, 异常时跳过
+# 命令名修复(2026-08-17): 工具是 jbctl(无下划线, /usr/bin/jbctl -> ../../basebin/jbctl)。
+# 路径修复(2026-08-17 装完不替换根因): jbctl 是 basebin 工具, 只认物理路径
+# (实测 /var/jb/... 报 "path does not exist", 必须用 jbroot 输出的物理路径);
+# 且注册必须在 respring 前完成 —— 未注册就 respring 会触发 ellekit 自愈
+# 移除"不受信" dylib 并弹 "Ellekit files are corrupted"(设备实证)。
+# deb 布局已改为 usr/lib/TweakInject(ellekit 唯一扫描目录), 与此路径一致。
 JBCTL=""
 for cand in /usr/bin/jbctl "$(command -v jbctl 2>/dev/null)"; do
     [ -n "$cand" ] && [ -x "$cand" ] && JBCTL="$cand" && break
@@ -27,9 +26,12 @@ if [ -x /usr/bin/jbroot ] && [ -n "$JBCTL" ]; then
     JR="$(/usr/bin/jbroot 2>/dev/null)"
     JR="${JR%/}"
     if [ -n "$JR" ] && [ "$JR" != "/" ] && [ -d "$JR" ]; then
-        "$JBCTL" trustcache add "$JR/usr/lib/TweakInject/$DYLIB_NAME" 2>/dev/null \
-        || "$JBCTL" trustcache add "$JR/Library/MobileSubstrate/DynamicLibraries/$DYLIB_NAME" 2>/dev/null \
-        || true
+        if [ -f "$JR/usr/lib/TweakInject/$DYLIB_NAME" ]; then
+            "$JBCTL" trustcache add "$JR/usr/lib/TweakInject/$DYLIB_NAME" >/dev/null 2>&1 || true
+        fi
+        # 旧布局残留兼容(DynamicLibraries 物理副本, 升级场景首帧前仍在)
+        [ -f "$JR/Library/MobileSubstrate/DynamicLibraries/$DYLIB_NAME" ] && \
+            "$JBCTL" trustcache add "$JR/Library/MobileSubstrate/DynamicLibraries/$DYLIB_NAME" >/dev/null 2>&1 || true
     fi
 fi
 

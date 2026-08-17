@@ -60,10 +60,16 @@ jobs:
         run: |
           cd "$GITHUB_WORKSPACE"
           mkdir -p debroot/DEBIAN
-          mkdir -p "debroot/var/jb/Library/MobileSubstrate/DynamicLibraries"
+          # 布局修复(2026-08-17 装完不替换根因): RootHide Bootstrap 的 ellekit/launchdhook
+          # 只扫描 /var/jb/usr/lib/TweakInject/, 不镜像 MobileSubstrate/DynamicLibraries
+          # (设备实证: DynamicLibraries 里的 dylib respring 后永不被加载; TweakInject 有
+          # 文件才加载)。deb 直接装 TweakInject。
+          mkdir -p "debroot/var/jb/usr/lib/TweakInject"
+          # 不再放 MobileSubstrate/DynamicLibraries 副本: 设备上该路径是真实目录,
+          # 符号链接会与旧版升级冲突; 且 ellekit 只扫 TweakInject(设备实证)
 
-          cp artifact/VCamPlus.dylib "debroot/var/jb/Library/MobileSubstrate/DynamicLibraries/VCamPlus.dylib"
-          cp artifact/VCamPlus.plist "debroot/var/jb/Library/MobileSubstrate/DynamicLibraries/VCamPlus.plist" 2>/dev/null || true
+          cp artifact/VCamPlus.dylib "debroot/var/jb/usr/lib/TweakInject/VCamPlus.dylib"
+          cp artifact/VCamPlus.plist "debroot/var/jb/usr/lib/TweakInject/VCamPlus.plist" 2>/dev/null || true
 
           # control/postinst/postrm 来自仓库(装完即用: postinst 自动 trustcache+respring)
           cp control debroot/DEBIAN/control
@@ -76,8 +82,8 @@ jobs:
           chmod 0644 debroot/DEBIAN/control
           chmod 0755 debroot/DEBIAN/postinst
           chmod 0755 debroot/DEBIAN/postrm
-          chmod 0755 "debroot/var/jb/Library/MobileSubstrate/DynamicLibraries/VCamPlus.dylib"
-          chmod 0644 "debroot/var/jb/Library/MobileSubstrate/DynamicLibraries/VCamPlus.plist" 2>/dev/null || true
+          chmod 0755 "debroot/var/jb/usr/lib/TweakInject/VCamPlus.dylib"
+          chmod 0644 "debroot/var/jb/usr/lib/TweakInject/VCamPlus.plist" 2>/dev/null || true
 
           fakeroot dpkg-deb -Zzstd -b debroot VCamPlus.deb
           cp VCamPlus.deb artifact/
