@@ -1199,14 +1199,20 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
     // 已熔断流不进 LRU(2026-08-17 微型流放开配套): 熔断语义是永久跳过, 若继续
     // touch LRU 会在池中占位, 把真正活跃流的 session/staging 挤出去 → 循环淘汰
     // 重建 → 抖动。先查熔断标记再决定是否跟踪
+    // 视频模式卡顿修复(2026-08-17): 'p420'(0x70343230) 是标准 YUV 4:2:0 平面家族
+    // (录像回放/编码流常用), 之前不在白名单被判"私有"送两步法 —— 停录瞬间
+    // 1920x1080 p420 流 s1+s2 = 32ms/帧, CPU 冲 141%, 全部流排队 = 画面卡住。
+    // p420 一步直转(420f→p420)是日志实证可行路径, 归入一步白名单
     BOOL isPrivate = !(dstFormat == kCVPixelFormatType_32BGRA ||
+                       dstFormat == 0x70343230 /* 'p420' */ ||
                        (dstFormat & 0xffffffef) == '420f');
     if (isPrivate ? [_twoStepDisabledPool[poolKey] boolValue]
                   : [_oneStepDisabledPool[poolKey] boolValue]) {
         return NO;
     }
     [self touchStreamKeyLRU:poolKey];
-    BOOL isYuv = ((dstFormat & 0xffffffef) == '420f');  // 420f/420v 掩码同判
+    BOOL isYuv = ((dstFormat & 0xffffffef) == '420f' ||
+                  dstFormat == 0x70343230);  // 420f/420v 掩码同判 + p420
     uint64_t dstPixels = (uint64_t)dstW * dstH;
 
     // ===== GPU 快路径(2026-08-16 多流 1080p CPU 超配额最终解) =====
