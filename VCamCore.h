@@ -70,7 +70,11 @@
 + (instancetype)sharedInstance;
 
 #pragma mark - 核心方法（hook 函数调用）
+// pts: 相机帧 PTS 秒(CMSampleBufferGetPresentationTimeStamp)。>0 时用于相机帧
+// 边界判定(同一相机帧的 emit/scaler/encoder 共享同一 PTS → 共享同一快照);
+// 0 = 未知, 内部回退时间窗判定
 - (void)renderReplacementToPixelBuffer:(CVPixelBufferRef)pixelBuffer;
+- (void)renderReplacementToPixelBuffer:(CVPixelBufferRef)pixelBuffer pts:(double)pts;
 - (BOOL)hasReplacementFrame;
 - (void)clearReplacementFrame;
 - (void)cacheLastRenderedFrame:(CVPixelBufferRef)buffer width:(size_t)width height:(size_t)height;

@@ -133,6 +133,8 @@ static void vcam_core_log(NSString *msg) {
 // (≥16ms)。加 5ms 窗口区分两者。
 @property (nonatomic, assign) CVPixelBufferRef dedupLastBuffer;
 @property (nonatomic, assign) CFAbsoluteTime dedupLastTime;
+// 快照最近一次推进时的相机帧 PTS(2026-08-17 卡顿修复): 相机帧边界判定
+@property (nonatomic, assign) double lastAdvancePts;
 
 // ===== 性能优化(2026-08-15) =====
 // 进程标记: 只有 mediaserverd 真正解码/预渲染; SpringBoard 的 VCamCore 只做状态记录,
@@ -266,6 +268,10 @@ static void vcam_core_log(NSString *msg) {
 #pragma mark - 核心方法
 
 - (void)renderReplacementToPixelBuffer:(CVPixelBufferRef)pixelBuffer {
+    [self renderReplacementToPixelBuffer:pixelBuffer pts:0];
+}
+
+- (void)renderReplacementToPixelBuffer:(CVPixelBufferRef)pixelBuffer pts:(double)pts {
     if (!pixelBuffer || !_enabled) return;
 
     // 同帧去重(对齐千面 0xaed4-0xaee8): 管线同一物理 buffer 连续经过多个消费者时,
@@ -307,13 +313,28 @@ static void vcam_core_log(NSString *msg) {
         uint64_t liveGen = _liveFrameGen;
         CFAbsoluteTime nowQ = CFAbsoluteTimeGetCurrent();
         double vfps = MAX(_videoPlayer.effectiveFps, 1.0);
-        BOOL windowElapsed = (nowQ - self->_lastGenAdvanceTime) >= (1.0 / vfps);
+        // 相机帧边界驱动(2026-08-17 卡顿修复): 旧 1/vfps 时间窗在 30fps 相机流上
+        // 被相机帧粒度采样 —— 33.3ms < 41.7ms 不推进, 66.7ms 才推进, 每次跨 2 个
+        // 视频帧 → 内容实际 15fps 且隔帧跳 = "停-停-跳"节奏(肉眼可见卡顿)。
+        // 改用相机帧 PTS 判定边界: 同一相机帧(emit/scaler/encoder 同帧共享 PTS)
+        // 只有首个消费者可推进一次, 同帧其余消费者必然共享同一快照 —— 多流
+        // 内容一致性(照片叠影防护)与旧整窗等价; 新相机帧到来即取最新 live:
+        // 24fps 内容在 30/60fps 流上呈标准 pulldown 节奏(每帧 1~2 槽位),
+        // 不丢帧不冻结。live 更新本身 ≤ 视频帧率, 天然限速无需时间窗。
+        // PTS 不可用(0, 旧调用方)回退旧时间窗
+        BOOL boundary;
+        if (pts > 0) {
+            boundary = (pts != self->_lastAdvancePts);
+        } else {
+            boundary = (nowQ - self->_lastGenAdvanceTime) >= (1.0 / vfps);
+        }
         if (_liveYUVPixelBuffer &&
-            (liveGen != self->_syncDisplayGen) && (liveGen < self->_syncDisplayGen || windowElapsed)) {
+            (liveGen != self->_syncDisplayGen) && (liveGen < self->_syncDisplayGen || boundary)) {
             if (self->_syncDisplayFrame) CVPixelBufferRelease(self->_syncDisplayFrame);
             self->_syncDisplayFrame = CVPixelBufferRetain(_liveYUVPixelBuffer);
             self->_syncDisplayGen = liveGen;
             self->_lastGenAdvanceTime = nowQ;
+            self->_lastAdvancePts = pts;
         }
     }
     CVPixelBufferRef yuv = self->_syncDisplayFrame;
@@ -376,20 +397,24 @@ static void vcam_core_log(NSString *msg) {
             lastCpuCheck = nowT;
             self.lowPowerDecode = lowPower;  // 解码/预渲染同步降速
         }
-        // 按流尺寸的内容更新节流(2026-08-16 吞吐量治理 v2, 修 12fps 卡顿):
+        // 按流尺寸的内容更新节流(2026-08-16 吞吐量治理 v2):
         // 物理约束: 多流全速替换像素吞吐 22GB/30s >> daemon CPU 配额(实测 CPU 51-157%,
         // mediaserverd 照片场景 30s 被杀 3 次 = 拍照黑屏崩溃)。
         // v1 教训: 把照片取景器(2304x1650=3.8MP)节流到 12fps → 用户盯着看的主画面
         // 内容只有 12fps = 肉眼明显卡顿。取景器就是可见流, 不能低于视频内容率!
-        // v2 原则: 内容率 = 视频原生帧率(24fps), 可见流按内容率节流(35fps 相机流
-        // 跳过 ~1/3 重复帧, 只付 ~1.5ms blit, 视觉零差异); 仅不可见的拍照编码流
-        // (≥10MP, 产物是静态照片)放宽到 1fps; lowPower 紧急档 15fps
+        // 0.042 可见流强制复用窗撤除(2026-08-17 卡顿修复): 与旧快照整窗同源的
+        // 帧粒度采样 bug —— 30fps 流 33.3ms < 42ms 被强制喂旧 token(旧内容),
+        // 66.7ms 才放行 → 私有格式两步法流内容实际 15fps。且它本质冗余:
+        // 同 gen 重复渲染时 staging token 比较已自动跳过 stage1, CCW90 缓存按
+        // gen 自动复用 —— 新内容到达即渲染, 旧内容自动跳过, 无需时间窗。
+        // 保留: 仅不可见的拍照编码流(≥10MP, 产物是静态照片, 12MP VT 转换昂贵)
+        // 放宽到 1fps; lowPower 紧急档 20fps
         {
             static NSMutableDictionary<NSString *, NSDictionary *> *freezeState = nil;
             if (!freezeState) freezeState = [NSMutableDictionary dictionary];
             uint64_t px = (uint64_t)targetW * targetH;
             double window = px > 10000000ull ? 1.0
-                          : (lowPower ? 0.05 : 0.042);
+                          : (lowPower ? 0.05 : 0.0);
             NSString *fk = [NSString stringWithFormat:@"%zu_%zu_%u", targetW, targetH, (unsigned)origFormat];
             @synchronized(freezeState) {
                 NSDictionary *st = freezeState[fk];
@@ -543,6 +568,7 @@ static void vcam_core_log(NSString *msg) {
     _fallbackHeight = 0;
     _dedupLastBuffer = NULL;
     _dedupLastTime = 0;
+    _lastAdvancePts = 0;
     [_renderLock unlock];
     vcam_core_log(@"[vcam] Replacement frame cleared, real camera restored");
 }
@@ -707,8 +733,30 @@ static void vcam_core_log(NSString *msg) {
                     nextTick = CFAbsoluteTimeGetCurrent();  // 已落后(转换耗时超帧间隔), 重置基线
                 }
 
-                // 消费式取帧: 跟随解码节拍, 无积压; 队列空(解码间隙/图片模式)回退当前帧
+                // 消费式取帧 + 短等待(2026-08-17 卡顿修复: 双时钟拍频):
+                // 解码/预渲染是两个独立 24Hz 时钟, 相位漂移使预渲染拍点周期性
+                // 落在解码入队之前 → dequeue 空 → 回退当前帧 = 同一帧重复产出两拍,
+                // 下一拍取到积压帧 = 周期性"重复-紧接"节奏(拍频微卡顿)。
+                // 修: 队列空时短等(≤1/3 帧间隔)让解码先产出; 再 drain-to-latest
+                // 取最新(解码抖动积压 2+ 帧时防止显示滞后累积)。图片模式/暂停
+                // (解码不再产出)等待自然超时走当前帧回退, 行为不变
                 CVPixelBufferRef frame = [strongSelf.videoPlayer.frameQueue dequeuePixelBuffer];
+                if (!frame) {
+                    CFAbsoluteTime waitStart = CFAbsoluteTimeGetCurrent();
+                    double waitBudget = (1.0 / fps) / 3.0;
+                    while (!frame && CFAbsoluteTimeGetCurrent() - waitStart < waitBudget) {
+                        [NSThread sleepForTimeInterval:0.002];
+                        frame = [strongSelf.videoPlayer.frameQueue dequeuePixelBuffer];
+                    }
+                }
+                if (frame) {
+                    CVPixelBufferRef newer = [strongSelf.videoPlayer.frameQueue dequeuePixelBuffer];
+                    while (newer) {
+                        CVPixelBufferRelease(frame);
+                        frame = newer;
+                        newer = [strongSelf.videoPlayer.frameQueue dequeuePixelBuffer];
+                    }
+                }
                 if (!frame) {
                     frame = [strongSelf.videoPlayer copyCurrentFrame];
                 }

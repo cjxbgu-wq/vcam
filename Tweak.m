@@ -265,7 +265,10 @@ static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBuffer
                 return;
             }
             @try {
-                [[VCamCore sharedInstance] renderReplacementToPixelBuffer:pixelBuffer];
+                // 相机帧 PTS 传入(2026-08-17 卡顿修复): 快照推进按相机帧边界判定,
+                // 同一相机帧的 emit/scaler/encoder 共享 PTS → 共享同一快照内容
+                [[VCamCore sharedInstance] renderReplacementToPixelBuffer:pixelBuffer
+                                                                     pts:CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))];
             } @catch (NSException *e) {
                 vcam_tweak_log([NSString stringWithFormat:@"[vcam] emitSampleBuffer hook exception: %@", e]);
             }
@@ -298,7 +301,8 @@ static void hook_BWStillImageScalerNode_renderSampleBuffer(id self, SEL _cmd, CM
                 return;
             }
             @try {
-                [[VCamCore sharedInstance] renderReplacementToPixelBuffer:pixelBuffer];
+                [[VCamCore sharedInstance] renderReplacementToPixelBuffer:pixelBuffer
+                                                                     pts:CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))];
             } @catch (NSException *e) {
                 vcam_tweak_log([NSString stringWithFormat:@"[vcam] ScalerNode hook exception: %@", e]);
             }
@@ -323,7 +327,8 @@ static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self, SEL _cmd, CMSamp
             // 曝光元数据剥离(编码前最后机会)
             vcamStripExposureMeta(sampleBuffer, pixelBuffer);
             @try {
-                [[VCamCore sharedInstance] renderReplacementToPixelBuffer:pixelBuffer];
+                [[VCamCore sharedInstance] renderReplacementToPixelBuffer:pixelBuffer
+                                                                     pts:CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))];
             } @catch (NSException *e) {
                 vcam_tweak_log([NSString stringWithFormat:@"[vcam] PhotoEncoder hook exception: %@", e]);
             }
