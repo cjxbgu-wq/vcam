@@ -86,4 +86,11 @@
 // 按流渲染统计(诊断): 每 30s 窗口输出 "w_h_fmt:次数/总MB" 并清零重计
 - (NSString *)takeStreamStats;
 
+// 空闲内存释放(2026-08-17 偶发全黑优化): 清空 LRU 全部流资源 + 组 staging 池
+// (~45MB+ 组缓冲 + per-key session/staging/cache)。熔断标记保留(语义永久)。
+// mediaserverd inactive jetsam 硬限 75MB, 渲染期 footprint 120-480MB ——
+// 相机长时间空闲时 footprint 不降会被杀 → 用户下次开相机黑屏 2-3s。
+// 恢复渲染时惰性重建(首帧多付一次 session/staging 创建, ~10-20ms 一次性)
+- (void)releaseIdleMemory;
+
 @end

@@ -923,6 +923,24 @@ static void vcam_core_log(NSString *msg) {
             vcam_core_log(@"[vcam] camera idle >2s, pipeline paused (decode+prerender)");
         }
 
+        // 深度空闲内存释放(2026-08-17 偶发全黑优化): 空闲暂停后再等 10s(排除
+        // 快速开关相机场景, 避免重建开销), 释放 GPU 池全部流资源(组 staging
+        // ~45MB+ per-key session/staging/cache)。mediaserverd inactive jetsam
+        // 硬限 75MB, 空闲 footprint 120MB+ 会被杀 → 下次开相机黑屏 2-3s。
+        // 恢复渲染时惰性重建(首帧一次性 ~10-20ms)
+        if (strongSelf.isMediaserverdProcess && strongSelf.enabled && strongSelf.pipelineIdle &&
+            strongSelf->_lastRenderActivity > 0 &&
+            (CFAbsoluteTimeGetCurrent() - strongSelf->_lastRenderActivity) > 12.0) {
+            static CFAbsoluteTime lastIdleRelease = 0;
+            CFAbsoluteTime nowIdle = CFAbsoluteTimeGetCurrent();
+            // 释放一次后不再重复(资源已空); render 心跳恢复后再空闲才会重新进入
+            if (nowIdle - lastIdleRelease > 30.0) {
+                lastIdleRelease = nowIdle;
+                [strongSelf->_gpuProcessor releaseIdleMemory];
+                vcam_core_log(@"[vcam] camera idle >12s, GPU stream pools released (jetsam guard)");
+            }
+        }
+
         // 资源探针(2026-08-16 黑屏取证 v2): 每 30s 一行内存/CPU%/按流渲染统计
         // 修复(2026-08-16): takeStreamStats 是"取出并清零"语义, 之前每 0.15s 轮询调用
         // → 统计被高频清零, telemetry 里只剩最后 0.15s 的数据(9 vs 实际 1376)。

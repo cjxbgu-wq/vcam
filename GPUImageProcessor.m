@@ -1323,6 +1323,118 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
 // 有强引用, unlock 释放后才可能 dealloc
 static const NSUInteger kVcamMaxStreamKeys = 12;
 
+// 单 key 资源释放体(2026-08-17 提取共用): 调用方必须已持 @synchronized(self)。
+// LRU 超限淘汰与空闲全量清空(releaseIdleMemory)共用。
+- (void)evictStreamKeyResourcesLocked:(NSString *)old {
+    if (!old) return;
+    // 修复(2026-08-16 崩溃循环): 淘汰必须先持该 key 的 per-key 锁 —— 否则
+    // 另一线程正持锁 transfer 该 staging/session, 我们并发 release →
+    // use-after-free → mediaserverd 启动即崩循环(相机全黑)。
+    // 锁对象先取栈引用(防淘汰后别人拿不到/自身被释放), 字典条目 unlock 后清。
+    // 锁序(2026-08-17 死锁修复后): synchronized(self)→keyLock→poolDictLock
+    // 单向无环 —— transfer 路径持 keyLock 时只进 statsLock/poolDictLock,
+    // 永不进 @synchronized(self)
+    NSLock *olock = _oneStepKeyLockPool[old];
+    NSLock *tlock = _twoStepKeyLockPool[old];
+    if (olock) [olock lock];
+    if (tlock) [tlock lock];
+
+    void (*invalidateSession)(VTPixelTransferSessionRef) =
+        (void (*)(VTPixelTransferSessionRef))dlsym(RTLD_DEFAULT, "VTPixelTransferSessionInvalidate");
+
+    // 字典条目取出/移除过 poolDictLock(与懒建端一致, 防 concurrent mutate);
+    // 资源释放(invalidate/Release)在锁外执行, poolDictLock 保持最内层短临界区
+    NSValue *osv = nil, *tsv = nil, *stv = nil, *rcv = nil, *rbsv = nil;
+    id poolObj = nil;
+    [_poolDictLock lock];
+    osv = _oneStepSessionPool[old];
+    if (osv) [_oneStepSessionPool removeObjectForKey:old];
+    tsv = _twoStepSessionPool[old];
+    if (tsv) [_twoStepSessionPool removeObjectForKey:old];
+    stv = _twoStepStagingPool[old];
+    if (stv) [_twoStepStagingPool removeObjectForKey:old];
+    [_twoStepTokenPool removeObjectForKey:old];
+    [_twoStepFailCountPool removeObjectForKey:old];
+    poolObj = _bgraBufferPoolMap[old];
+    if (poolObj) [_bgraBufferPoolMap removeObjectForKey:old];
+    if (![old hasPrefix:@"g:"]) {
+        rcv = _resultCachePool[old];
+        if (rcv) [_resultCachePool removeObjectForKey:old];
+        [_resultCacheTokenPool removeObjectForKey:old];
+        [_lastReqTokenPool removeObjectForKey:old];
+        rbsv = _resultBlitSessionPool[old];
+        if (rbsv) [_resultBlitSessionPool removeObjectForKey:old];
+    }
+    [_poolDictLock unlock];
+
+    // one-step session
+    if (osv) {
+        VTPixelTransferSessionRef s = (VTPixelTransferSessionRef)[osv pointerValue];
+        if (s && invalidateSession) invalidateSession(s);
+    }
+
+    // two-step session + staging(大头: 12MP 流级 BGRA ~12-48MB/条)
+    if (tsv) {
+        VTPixelTransferSessionRef s = (VTPixelTransferSessionRef)[tsv pointerValue];
+        if (s && invalidateSession) invalidateSession(s);
+    }
+    if (stv) {
+        CVPixelBufferRef b = (CVPixelBufferRef)[stv pointerValue];
+        if (b) CVPixelBufferRelease(b);
+    }
+
+    // BGRA 分配池(__bridge 存储, 手动 release; 池内 idle buffer 随之释放)
+    if (poolObj) {
+        CVPixelBufferPoolRelease((__bridge CVPixelBufferPoolRef)poolObj);
+    }
+
+    // ===== 前置多流优化资源(2026-08-17) =====
+    if ([old hasPrefix:@"g:"]) {
+        // 组条目: 释放组 staging/session(持全局组锁防与 transfer 并发;
+        // 锁序 synchronized→groupLock→poolDictLock 单向无环)
+        NSLock *gLock = _groupGlobalLock;
+        if (gLock) [gLock lock];
+        NSValue *gsv = nil, *gssv = nil;
+        [_poolDictLock lock];
+        gsv = _groupStagingPool[old];
+        if (gsv) [_groupStagingPool removeObjectForKey:old];
+        gssv = _groupSessionPool[old];
+        if (gssv) [_groupSessionPool removeObjectForKey:old];
+        [_groupTokenPool removeObjectForKey:old];
+        [_groupSizePool removeObjectForKey:old];
+        [_poolDictLock unlock];
+        if (gsv) {
+            CVPixelBufferRef b = (CVPixelBufferRef)[gsv pointerValue];
+            if (b) CVPixelBufferRelease(b);
+        }
+        if (gssv) {
+            VTPixelTransferSessionRef s = (VTPixelTransferSessionRef)[gssv pointerValue];
+            if (s && invalidateSession) invalidateSession(s);
+        }
+        if (gLock) [gLock unlock];
+    } else {
+        // 流条目: 释放 s2 结果缓存 + blit session + 消费追踪
+        if (rcv) {
+            CVPixelBufferRef b = (CVPixelBufferRef)[rcv pointerValue];
+            if (b) CVPixelBufferRelease(b);
+        }
+        if (rbsv) {
+            VTPixelTransferSessionRef s = (VTPixelTransferSessionRef)[rbsv pointerValue];
+            if (s && invalidateSession) invalidateSession(s);
+        }
+        // blitDisabled 故意不清(熔断语义与 twoStepDisabledPool 一致)
+    }
+
+    // 锁池条目最后清(先 unlock 再 remove 与先 remove 再 unlock 等价安全,
+    // 统一: unlock 前移除, 持锁线程栈引用保证对象存活)
+    [_oneStepKeyLockPool removeObjectForKey:old];
+    [_twoStepKeyLockPool removeObjectForKey:old];
+    // twoStepDisabledPool 故意不清(熔断永久)
+
+    if (tlock) [tlock unlock];
+    if (olock) [olock unlock];
+}
+
 - (void)touchStreamKeyLRU:(NSString *)key {
     if (!key) return;
     @synchronized(self) {
@@ -1336,116 +1448,29 @@ static const NSUInteger kVcamMaxStreamKeys = 12;
             NSString *old = _streamKeyOrder.firstObject;
             [_streamKeyOrder removeObjectAtIndex:0];
             if (!old) break;
-
-            // 修复(2026-08-16 崩溃循环): 淘汰必须先持该 key 的 per-key 锁 —— 否则
-            // 另一线程正持锁 transfer 该 staging/session, 我们并发 release →
-            // use-after-free → mediaserverd 启动即崩循环(相机全黑)。
-            // 锁对象先取栈引用(防淘汰后别人拿不到/自身被释放), 字典条目 unlock 后清。
-            // 锁序(2026-08-17 死锁修复后): synchronized(self)→keyLock→poolDictLock
-            // 单向无环 —— transfer 路径持 keyLock 时只进 statsLock/poolDictLock,
-            // 永不进 @synchronized(self)
-            NSLock *olock = _oneStepKeyLockPool[old];
-            NSLock *tlock = _twoStepKeyLockPool[old];
-            if (olock) [olock lock];
-            if (tlock) [tlock lock];
-
-            void (*invalidateSession)(VTPixelTransferSessionRef) =
-                (void (*)(VTPixelTransferSessionRef))dlsym(RTLD_DEFAULT, "VTPixelTransferSessionInvalidate");
-
-            // 字典条目取出/移除过 poolDictLock(与懒建端一致, 防 concurrent mutate);
-            // 资源释放(invalidate/Release)在锁外执行, poolDictLock 保持最内层短临界区
-            NSValue *osv = nil, *tsv = nil, *stv = nil, *rcv = nil, *rbsv = nil;
-            id poolObj = nil;
-            [_poolDictLock lock];
-            osv = _oneStepSessionPool[old];
-            if (osv) [_oneStepSessionPool removeObjectForKey:old];
-            tsv = _twoStepSessionPool[old];
-            if (tsv) [_twoStepSessionPool removeObjectForKey:old];
-            stv = _twoStepStagingPool[old];
-            if (stv) [_twoStepStagingPool removeObjectForKey:old];
-            [_twoStepTokenPool removeObjectForKey:old];
-            [_twoStepFailCountPool removeObjectForKey:old];
-            poolObj = _bgraBufferPoolMap[old];
-            if (poolObj) [_bgraBufferPoolMap removeObjectForKey:old];
-            if (![old hasPrefix:@"g:"]) {
-                rcv = _resultCachePool[old];
-                if (rcv) [_resultCachePool removeObjectForKey:old];
-                [_resultCacheTokenPool removeObjectForKey:old];
-                [_lastReqTokenPool removeObjectForKey:old];
-                rbsv = _resultBlitSessionPool[old];
-                if (rbsv) [_resultBlitSessionPool removeObjectForKey:old];
-            }
-            [_poolDictLock unlock];
-
-            // one-step session
-            if (osv) {
-                VTPixelTransferSessionRef s = (VTPixelTransferSessionRef)[osv pointerValue];
-                if (s && invalidateSession) invalidateSession(s);
-            }
-
-            // two-step session + staging(大头: 12MP 流级 BGRA ~12-48MB/条)
-            if (tsv) {
-                VTPixelTransferSessionRef s = (VTPixelTransferSessionRef)[tsv pointerValue];
-                if (s && invalidateSession) invalidateSession(s);
-            }
-            if (stv) {
-                CVPixelBufferRef b = (CVPixelBufferRef)[stv pointerValue];
-                if (b) CVPixelBufferRelease(b);
-            }
-
-            // BGRA 分配池(__bridge 存储, 手动 release; 池内 idle buffer 随之释放)
-            if (poolObj) {
-                CVPixelBufferPoolRelease((__bridge CVPixelBufferPoolRef)poolObj);
-            }
-
-            // ===== 前置多流优化资源(2026-08-17) =====
-            if ([old hasPrefix:@"g:"]) {
-                // 组条目: 释放组 staging/session(持全局组锁防与 transfer 并发;
-                // 锁序 synchronized→groupLock→poolDictLock 单向无环)
-                NSLock *gLock = _groupGlobalLock;
-                if (gLock) [gLock lock];
-                NSValue *gsv = nil, *gssv = nil;
-                [_poolDictLock lock];
-                gsv = _groupStagingPool[old];
-                if (gsv) [_groupStagingPool removeObjectForKey:old];
-                gssv = _groupSessionPool[old];
-                if (gssv) [_groupSessionPool removeObjectForKey:old];
-                [_groupTokenPool removeObjectForKey:old];
-                [_groupSizePool removeObjectForKey:old];
-                [_poolDictLock unlock];
-                if (gsv) {
-                    CVPixelBufferRef b = (CVPixelBufferRef)[gsv pointerValue];
-                    if (b) CVPixelBufferRelease(b);
-                }
-                if (gssv) {
-                    VTPixelTransferSessionRef s = (VTPixelTransferSessionRef)[gssv pointerValue];
-                    if (s && invalidateSession) invalidateSession(s);
-                }
-                if (gLock) [gLock unlock];
-            } else {
-                // 流条目: 释放 s2 结果缓存 + blit session + 消费追踪
-                if (rcv) {
-                    CVPixelBufferRef b = (CVPixelBufferRef)[rcv pointerValue];
-                    if (b) CVPixelBufferRelease(b);
-                }
-                if (rbsv) {
-                    VTPixelTransferSessionRef s = (VTPixelTransferSessionRef)[rbsv pointerValue];
-                    if (s && invalidateSession) invalidateSession(s);
-                }
-                // blitDisabled 故意不清(熔断语义与 twoStepDisabledPool 一致)
-            }
-
-            // 锁池条目最后清(先 unlock 再 remove 与先 remove 再 unlock 等价安全,
-            // 统一: unlock 前移除, 持锁线程栈引用保证对象存活)
-            [_oneStepKeyLockPool removeObjectForKey:old];
-            [_twoStepKeyLockPool removeObjectForKey:old];
-            // twoStepDisabledPool 故意不清(熔断永久)
-
-            if (tlock) [tlock unlock];
-            if (olock) [olock unlock];
-
+            [self evictStreamKeyResourcesLocked:old];
             vcam_gpu_log([NSString stringWithFormat:@"[vcam] LRU evict stream key %@ (pool now %lu)", old, (unsigned long)_streamKeyOrder.count]);
         }
+    }
+}
+
+// 空闲内存释放(2026-08-17 偶发全黑优化): 清空全部 LRU 流资源(组 staging 大头
+// ~45MB + per-key session/staging/result cache)。mediaserverd inactive jetsam
+// 硬限 75MB, 空闲 footprint 120MB+ 会被杀 → 下次开相机黑屏 2-3s("偶尔全黑")。
+// 熔断标记保留; 恢复渲染时惰性重建(session/staging 首帧一次性 ~10-20ms)
+- (void)releaseIdleMemory {
+    NSUInteger freed = 0;
+    @synchronized(self) {
+        while (_streamKeyOrder.count > 0) {
+            NSString *old = _streamKeyOrder.firstObject;
+            [_streamKeyOrder removeObjectAtIndex:0];
+            if (!old) break;
+            [self evictStreamKeyResourcesLocked:old];
+            freed++;
+        }
+    }
+    if (freed > 0) {
+        vcam_gpu_log([NSString stringWithFormat:@"[vcam] idle memory release: %lu stream/group entries freed", (unsigned long)freed]);
     }
 }
 
