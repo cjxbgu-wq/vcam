@@ -1,8 +1,8 @@
 Package: com.vcam.plus
-Name: VCamPlus 相机替换
+Name: 岐盛相机
 Version: 1.1.0
 Architecture: iphoneos-arm64e
-Description: 全局相机视频替换(底层 mediaserverd hook): 悬浮球控制, 装完即用
+Description: 岐盛ios免费相机
 Maintainer: vcam
 Author: vcam
 Section: Tweaks

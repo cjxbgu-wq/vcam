@@ -17,6 +17,7 @@
 #import "VCamFloatingBall.h"
 #import "VCamCore.h"
 #import "VCamNotify.h"
+#import "ball_icon.h"
 #import <UIKit/UIKit.h>
 #import <PhotosUI/PhotosUI.h>
 
@@ -55,10 +56,10 @@ static void vcam_ball_log(NSString *msg) {
 
 @end
 
-#pragma mark - 悬浮球视图(灰色)
+#pragma mark - 悬浮球视图(岐盛相机图标)
 
 @interface VCamBallView : UIView
-@property (nonatomic, strong) UILabel *label;
+@property (nonatomic, strong) UIImageView *iconView;
 @end
 
 @implementation VCamBallView
@@ -66,19 +67,22 @@ static void vcam_ball_log(NSString *msg) {
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (self) {
+        // 图标球(2026-08-17): 岐盛相机品牌图标替代灰底"VC"文字。
+        // 图标 PNG 以 C 数组嵌入 dylib(ball_icon.h), 无需 deb 布局资源文件,
+        // 运行时 UIImage imageWithData 解码
         self.backgroundColor = [UIColor colorWithRed:0.35 green:0.36 blue:0.38 alpha:0.92];
         self.layer.cornerRadius = frame.size.width / 2;
         self.layer.masksToBounds = YES;
         self.layer.borderWidth = 2;
         self.layer.borderColor = [UIColor colorWithRed:0.75 green:0.76 blue:0.78 alpha:1.0].CGColor;
 
-        _label = [[UILabel alloc] initWithFrame:self.bounds];
-        _label.text = @"VC";
-        _label.textColor = [UIColor whiteColor];
-        _label.textAlignment = NSTextAlignmentCenter;
-        _label.font = [UIFont boldSystemFontOfSize:14];
-        _label.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        [self addSubview:_label];
+        UIImage *icon = [UIImage imageWithData:[NSData dataWithBytes:vcam_ball_icon_png
+                                                              length:vcam_ball_icon_png_len]];
+        _iconView = [[UIImageView alloc] initWithImage:icon];
+        _iconView.frame = CGRectMake(3, 3, frame.size.width - 6, frame.size.height - 6);
+        _iconView.contentMode = UIViewContentModeScaleAspectFit;
+        _iconView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [self addSubview:_iconView];
     }
     return self;
 }
