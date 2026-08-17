@@ -59,8 +59,11 @@ if [ ! -f "$VC_DIR_A/vc.plist" ] && [ ! -f "$VC_DIR_B/vc.plist" ]; then
 fi
 
 # respring 加载 tweak(SpringBoard 退出会连带动 mediaserverd 重启)。
-# 延迟 2 秒且脱离会话执行: 保证 postinst 先正常退出, dpkg 事务完整收尾,
-# 不会因 SpringBoard 被杀而中断安装记录(半配置状态)
-( sleep 2; /usr/bin/killall -9 SpringBoard 2>/dev/null; ) >/dev/null 2>&1 &
+# 延迟加长到 5 秒(2026-08-18, 卸载事故复盘): postinst 返回后 dpkg 还需收尾
+# 写 status 数据库 + 跑 trigger, 慢设备上 2 秒不够; respring 过早会连带杀掉
+# Sileo/apt → dpkg 数据库写一半被中断 → ellekit 报 corrupted。
+# 5 秒且脱离会话执行: dpkg 事务完整收尾后再重启加载器。
+# Sileo 安装场景由 Sileo 自己 respring, 这里的 respring 供 dpkg -i 直装即用
+( sleep 5; /usr/bin/killall -9 SpringBoard 2>/dev/null; ) >/dev/null 2>&1 &
 
 exit 0
