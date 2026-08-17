@@ -13,10 +13,14 @@ fi
 
 # RootHide Bootstrap: fakesign 二进制必须进 trustcache 才能被注入加载。
 # 路径优先走 TweakInject(是 MobileSubstrate/DynamicLibraries 的符号链接),
-# 失败回退直接路径 —— 两种 jbroot 布局都兼容
+# 失败回退直接路径 —— 两种 jbroot 布局都兼容。
+# 防御(2026-08-17 设备事故教训): jbroot 在用户态损坏时可能返回空或 "/",
+# 尾斜杠也会污染路径拼接 —— 校验+规范化后再用, 异常时跳过
+# (新版 Bootstrap 的 launchdhook 开机会自动扫描 TweakInject 注册, 此步非必需)
 if [ -x /usr/bin/jbroot ] && [ -x /usr/bin/jb_ctl ]; then
     JR="$(/usr/bin/jbroot 2>/dev/null)"
-    if [ -n "$JR" ]; then
+    JR="${JR%/}"
+    if [ -n "$JR" ] && [ "$JR" != "/" ] && [ -d "$JR" ]; then
         /usr/bin/jb_ctl trustcache add "$JR/usr/lib/TweakInject/$DYLIB_NAME" 2>/dev/null \
         || /usr/bin/jb_ctl trustcache add "$JR/Library/MobileSubstrate/DynamicLibraries/$DYLIB_NAME" 2>/dev/null \
         || true
