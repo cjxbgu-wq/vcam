@@ -158,7 +158,14 @@ static void vcam_gpu_log(NSString *msg) {
 @property (nonatomic, assign) int prerenderRotateSlot;
 // 镜像专用 buffer(mirror-only 场景: 无旋转时需先复制到自有 buffer 再原地行反转,
 // 解码器输出的 buffer 不可写)。预渲染线程独占, 按尺寸+格式缓存
-@property (nonatomic, assign) CVPixelBufferRef prerenderMirrorBuffer;
+// 闪烁修复(2026-08-17): 单 buffer 复用撕裂 —— 产出的帧进 _liveYUVPixelBuffer 后
+// render 线程仍在读取转换, 而预渲染下一拍已开始 copy+反转同一块内存 → 半新半旧
+// 画面交替("闪烁切割")。对齐旋转池改 3 槽轮转: live缓存+fallback+in-flight transfer
+// 最多同时持有 2 帧旧输出, 写入槽永远不被任何读者持有
+@property (nonatomic, assign) CVPixelBufferRef prerenderMirrorPool0;
+@property (nonatomic, assign) CVPixelBufferRef prerenderMirrorPool1;
+@property (nonatomic, assign) CVPixelBufferRef prerenderMirrorPool2;
+@property (nonatomic, assign) int prerenderMirrorSlot;
 @property (nonatomic, assign) size_t prerenderMirrorW;
 @property (nonatomic, assign) size_t prerenderMirrorH;
 @property (nonatomic, assign) OSType prerenderMirrorFmt;
@@ -364,10 +371,9 @@ static void vcam_gpu_log(NSString *msg) {
         if (b) CVPixelBufferRelease(b);
         [self setPrerenderRotateBuffer:NULL atSlot:i];
     }
-    if (_prerenderMirrorBuffer) {
-        CVPixelBufferRelease(_prerenderMirrorBuffer);
-        _prerenderMirrorBuffer = NULL;
-    }
+    if (_prerenderMirrorPool0) { CVPixelBufferRelease(_prerenderMirrorPool0); _prerenderMirrorPool0 = NULL; }
+    if (_prerenderMirrorPool1) { CVPixelBufferRelease(_prerenderMirrorPool1); _prerenderMirrorPool1 = NULL; }
+    if (_prerenderMirrorPool2) { CVPixelBufferRelease(_prerenderMirrorPool2); _prerenderMirrorPool2 = NULL; }
     // 释放所有缓冲池
     for (id key in _bgraBufferPoolMap) {
         CVPixelBufferPoolRef pool = (__bridge CVPixelBufferPoolRef)_bgraBufferPoolMap[key];
@@ -906,23 +912,32 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
         return work;
     }
     // mirror-only: 复制到自有 buffer 再反转(不动解码器 buffer)
-    if (!_prerenderMirrorBuffer || _prerenderMirrorW != inW || _prerenderMirrorH != inH ||
+    // 闪烁修复(2026-08-17): 3 槽轮转(原单 buffer 会被 render 线程并发读取撕裂)
+    int mslot = _prerenderMirrorSlot;
+    _prerenderMirrorSlot = (mslot + 1) % 3;
+    CVPixelBufferRef mb = NULL;
+    if (mslot == 0) mb = _prerenderMirrorPool0;
+    else if (mslot == 1) mb = _prerenderMirrorPool1;
+    else mb = _prerenderMirrorPool2;
+    if (!mb || _prerenderMirrorW != inW || _prerenderMirrorH != inH ||
         _prerenderMirrorFmt != fmt) {
-        if (_prerenderMirrorBuffer) CVPixelBufferRelease(_prerenderMirrorBuffer);
-        _prerenderMirrorBuffer = NULL;
-        CVPixelBufferRef mb = NULL;
-        if (CVPixelBufferCreate(kCFAllocatorDefault, inW, inH, fmt, NULL, &mb) == noErr && mb) {
-            _prerenderMirrorBuffer = mb;  // 池持有
+        if (mb) CVPixelBufferRelease(mb);
+        mb = NULL;
+        CVPixelBufferRef created = NULL;
+        if (CVPixelBufferCreate(kCFAllocatorDefault, inW, inH, fmt, NULL, &created) == noErr && created) {
+            mb = created;  // 槽持有
             _prerenderMirrorW = inW;
             _prerenderMirrorH = inH;
             _prerenderMirrorFmt = fmt;
         }
+        if (mslot == 0) _prerenderMirrorPool0 = mb;
+        else if (mslot == 1) _prerenderMirrorPool1 = mb;
+        else _prerenderMirrorPool2 = mb;
     }
-    if (_prerenderMirrorBuffer &&
-        vcamCopyPlanes(work, _prerenderMirrorBuffer)) {
-        vcamMirrorRowsInPlace(_prerenderMirrorBuffer);
+    if (mb && vcamCopyPlanes(work, mb)) {
+        vcamMirrorRowsInPlace(mb);
         CVPixelBufferRelease(work);
-        return CVPixelBufferRetain(_prerenderMirrorBuffer);
+        return CVPixelBufferRetain(mb);
     }
     // 复制失败(罕见): 返回未镜像帧, 不崩溃
     return work;
