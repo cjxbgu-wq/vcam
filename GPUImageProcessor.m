@@ -149,6 +149,10 @@ static void vcam_gpu_log(NSString *msg) {
 // 每流 stage 耗时统计(2026-08-16 CPU 归因探针): key -> @{s1: [totalMs,count], s2:...}
 // takeStreamStats 周期输出平均 ms, 定位 58-64% CPU 具体烧在哪个流哪一步
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSMutableDictionary<NSString *, NSNumber *> *> *stageTimingPool;
+// 一步直转熔断(2026-08-17 统一路径配套): 连续失败 2 次的流永久跳过(保真实相机)
+// —— 替代两步法时代的 twoStepDisabledPool 职责('18f0' wakeups 风暴教训)
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *oneStepFailPool;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *oneStepDisabledPool;
 
 // 缓冲池字典（key="w_h", value=CVPixelBufferPoolRef）—— 每个尺寸独立池，避免频繁重建
 @property (nonatomic, strong) NSMutableDictionary *bgraBufferPoolMap;
@@ -187,6 +191,8 @@ static void vcam_gpu_log(NSString *msg) {
         _gpuImgTokenPool = [NSMutableDictionary dictionary];
         _gpuImgOutPool = [NSMutableDictionary dictionary];
         _stageTimingPool = [NSMutableDictionary dictionary];
+        _oneStepFailPool = [NSMutableDictionary dictionary];
+        _oneStepDisabledPool = [NSMutableDictionary dictionary];
 
         // 软件渲染 CIContext（回退用）
         @try {
@@ -1095,12 +1101,9 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
     uint64_t dstPixels = (uint64_t)dstW * dstH;
 
     // ===== GPU 快路径(2026-08-16 多流 1080p CPU 超配额最终解) =====
-    // 标准格式(BGRA/420f/420v)且 Metal 可用 → GPU CIContext 一次 crop-fill 渲染
-    // 直写相机帧(缩放+格式转换全在 GPU, CPU 只剩 ~1ms 命令提交)。多流 1080p 场景
-    // 纯 CPU VT 总 CPU 85-175%(配额 50%)冻结也压不住 → 被杀循环; GPU 路径把
-    // render 端成本从 ~40% 降到 ~5%。失败自动回退下方 VT 路径(保底不黑屏)。
+    // 已禁用(CI/MTL 在 mediaserverd 实测 CPU fallback 6.4ms/帧, 见 init 注释)
     if (_metalAvailable && (dstFormat == kCVPixelFormatType_32BGRA || isYuv)) {
-        NSLock *glock = [self oneStepLockForKey:poolKey];  // 复用 per-key 锁池
+        NSLock *glock = [self oneStepLockForKey:poolKey];
         [glock lock];
         BOOL gok = [self gpuCropFillRender:src toPixelBuffer:dst key:poolKey token:token];
         [glock unlock];
@@ -1108,46 +1111,47 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
             [self noteStreamRender:poolKey pixels:dstPixels];
             return YES;
         }
-        // GPU 失败(罕见): 落回 VT 路径
     }
 
-    // 420f/420v 预览流也走两步法(2026-08-16 卡顿根因修复): 实测 1080p 420f 一步
-    // 直转每帧 ~8-10ms × 30fps ≈ 25-30% CPU, 三流场景冲 53% 超红线 → 冻结触发
-    // (内容 10fps, 用户观感"播放一会儿非常卡顿")甚至 mediaserverd 被杀。
-    // 纳入 staging 后冻结帧只做 stage2(BGRA→420 同尺寸转换 ~2ms)。
-    // 例外: ≥10MP 大帧(拍照流 4032x3024=12MP)保持一步直转 —— 拍照编码流走 BGRA
-    // 中转曾致照片过曝(full-range 语义丢失), 且低频流冻结无收益;
-    // 预览/录像流(1080p=2MP, 2112x1188=2.5MP, 4K=8.3MP)全部 <10MP 走两步。
-    // BGRA 目标同理(同尺寸 blit 冻结后 ~1-2ms)。私有格式统一两步(含 sameSize)。
-    if (isPrivate || dstFormat == kCVPixelFormatType_32BGRA ||
-        (isYuv && dstPixels < 10000000ull)) {
-        NSLock *keyLock = [self twoStepLockForKey:poolKey];
-        [keyLock lock];
-        BOOL ok = [self twoStepTransferLocked:src toPixelBuffer:dst key:poolKey token:token];
-        [keyLock unlock];
-        if (ok) [self noteStreamRender:poolKey pixels:(uint64_t)dstW * dstH];
-        return ok;
-    }
-
-    // 一步 transfer per-stream: 每条流独立 session+锁, 全流并行。
-    // 顺序必须是 先取锁对象→lock→再取 session: 若先取 session 后 lock,
-    // LRU 淘汰线程可在窗口内 invalidate 该 session(淘汰持同一把锁) → use-after-free。
-    // lock 后再查: 被淘汰的 key 此刻查不到 session → 本帧 NO(保留相机帧), 下帧重建
+    // ===== 一步直转统一路径(2026-08-17 架构回归, 千面验证过的极简方案) =====
+    // 两步法判死: 探针实测 |8v0 流 stage1(5.7)+stage2(12.1)=17.8ms/帧, 且内容率
+    // 已对齐渲染率(24≈24.5fps) → "重复帧跳过 stage1"根本不发生, 两步法纯付
+    // 中转税(+50% CPU)。同格式 staging 又被 VT 全面拒绝(-12905, 所有私有格式)。
+    // 一步 420f→任意格式 VT 实测可行(write 日志: →p420 ok / →-8f0 ok / →|8v0 ok),
+    // 单次转换 ~7-12ms 无中转。per-stream session+锁并行, 连续失败 2 次熔断
+    // (跳过该流保真实相机, 防 wakeups 风暴 —— '18f0' 分析流教训)。
+    // token 不再参与转换路径(仅 CCW90 旋转缓存用), 全帧直转。
     NSLock *lock = [self oneStepLockForKey:poolKey];
     if (!lock) return NO;
     [lock lock];
+
+    // 熔断检查(锁内, 与失败计数同 key)
+    if ([_oneStepDisabledPool[poolKey] boolValue]) {
+        [lock unlock];
+        return NO;
+    }
+
+    // 顺序: 先锁后取 session —— LRU 淘汰持同一把锁, 避免窗口期 use-after-free
     VTPixelTransferSessionRef session = [self oneStepSessionForKey:poolKey];
     if (!session) {
         [lock unlock];
         return NO;
     }
+    CFAbsoluteTime tOp = CFAbsoluteTimeGetCurrent();
     OSStatus status = VTPixelTransferSessionTransferImage(session, src, dst);
+    [self noteStageTiming:poolKey stage:2 ms:(CFAbsoluteTimeGetCurrent() - tOp) * 1000.0];
     [lock unlock];
+
     if (status != noErr) {
-        vcam_gpu_log([NSString stringWithFormat:@"[vcam] VT transfer failed: %d, %@ -> %@",
-                      (int)status,
-                      [self stringForFormat:CVPixelBufferGetPixelFormatType(src)],
-                      [self stringForFormat:dstFormat]]);
+        @synchronized(self) {
+            NSInteger fails = [_oneStepFailPool[poolKey] integerValue] + 1;
+            _oneStepFailPool[poolKey] = @(fails);
+            if (fails >= 2) {
+                _oneStepDisabledPool[poolKey] = @YES;
+                vcam_gpu_log([NSString stringWithFormat:@"[vcam] one-step CIRCUIT-BROKEN stream %@ (err %d, keep camera)",
+                              poolKey, (int)status]);
+            }
+        }
         return NO;
     }
     [self noteStreamRender:poolKey pixels:(uint64_t)dstW * dstH];

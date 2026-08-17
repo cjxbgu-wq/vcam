@@ -338,9 +338,11 @@ static void vcam_core_log(NSString *msg) {
     // 12s 内 3 次横跳 = 用户观感"非常卡顿"的直接来源。修: 负差分丢弃(不更新基线,
     // 本次不判退); EMA 平滑抗单次毛刺。
     // 滞回时间窗: 进入后 ≥5s 不许退出, 退出后 ≥8s 不许再进 —— 防高频振荡
-        // 退出阈值 48%(2026-08-16 卡死修复): 守护进程配额 50%/180s 均值, 38% 太苛刻
-        // —— 冻结期间 render 写入成本不变, CPU 常驻 58-64% 永远达不到 38% →
-        // 内容永久锁死 15fps = 用户看到的持续卡顿。48% 保留 2% 安全边距
+        // 紧急档重构(2026-08-17 横跳根治): 旧 46/48 阈值在正常运行区(实测 45-58%)
+        // 内部横跳 → 内容 24↔20fps 反复切换 = 卡顿本身。教训: 系统配额是
+        // 180s 均值 50%, 短时 45-58% 峰值完全安全(telemetry 实测无 kill,
+        // renders 持续累积)。降载只在真失控(>80%, 如多流突发+解码堆积)时介入,
+        // <60% 退出 —— 正常使用永不触发, 内容恒定 24fps。
         {
             static CFAbsoluteTime lastCpuCheck = 0;
             static CFAbsoluteTime lastCpuSample = 0;
@@ -358,14 +360,14 @@ static void vcam_core_log(NSString *msg) {
                     emaPct = emaInit ? (emaPct * 0.6 + pct * 0.4) : pct;
                     emaInit = YES;
                     BOOL minHoldOk = (nowT - lastModeSwitch) > (lowPower ? 5.0 : 8.0);
-                    if (emaPct > 46.0 && !lowPower && minHoldOk) {
+                    if (emaPct > 80.0 && !lowPower && minHoldOk) {
                         lowPower = YES;
                         lastModeSwitch = nowT;
-                        vcam_core_log([NSString stringWithFormat:@"[vcam] CPU %.0f%% (ema) >46%%, freeze ON", emaPct]);
-                    } else if (emaPct < 48.0 && lowPower && minHoldOk) {
+                        vcam_core_log([NSString stringWithFormat:@"[vcam] CPU %.0f%% (ema) >80%%, EMERGENCY throttle ON", emaPct]);
+                    } else if (emaPct < 60.0 && lowPower && minHoldOk) {
                         lowPower = NO;
                         lastModeSwitch = nowT;
-                        vcam_core_log([NSString stringWithFormat:@"[vcam] CPU %.0f%% (ema) <48%%, freeze OFF", emaPct]);
+                        vcam_core_log([NSString stringWithFormat:@"[vcam] CPU %.0f%% (ema) <60%%, throttle OFF", emaPct]);
                     }
                 }
             // 负差分(线程快照抖动): 只推进时间基线, 不更新 CPU 基线(下轮重算), 不判退
