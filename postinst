@@ -33,6 +33,29 @@ if [ -x /usr/bin/jbroot ] && [ -n "$JBCTL" ]; then
     fi
 fi
 
+# 安装即替换(2026-08-17): VCamCore 读 vc.plist 的 enabled, 无 plist 时默认 NO
+# (全新设备装完必须手动点悬浮球"替")。此处新装时写默认开启配置 —— 已有 vc.plist
+# 绝不覆盖(保留用户 enabled/镜像/旋转/预设视频等全部设置)。
+# mediaserverd 经 pathhook 读 /var/mobile/Media/DCIM/, 越狱 shell 视角该目录在
+# /rootfs/private/var/ 下; 两路径都确保(存在哪个写哪个, 均无则建 rootfs 侧)
+VC_DIR_A="/rootfs/private/var/mobile/Media/DCIM"
+VC_DIR_B="/var/mobile/Media/DCIM"
+VC_DEFAULT='<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>activePlaybackPath</key><string>/var/mobile/Media/DCIM/vcam.mp4</string><key>enabled</key><true/><key>isLive</key><true/><key>manualRotation</key><integer>0</integer><key>mirrored</key><false/><key>paused</key><false/><key>restartToken</key><integer>0</integer></dict></plist>'
+for VC_DIR in "$VC_DIR_A" "$VC_DIR_B"; do
+    if [ -d "$VC_DIR" ]; then
+        if [ ! -f "$VC_DIR/vc.plist" ]; then
+            printf '%s' "$VC_DEFAULT" > "$VC_DIR/vc.plist" 2>/dev/null || true
+            chown mobile:mobile "$VC_DIR/vc.plist" 2>/dev/null || true
+        fi
+    fi
+done
+# 目录都不存在(极新环境): 建 rootfs 侧再写
+if [ ! -f "$VC_DIR_A/vc.plist" ] && [ ! -f "$VC_DIR_B/vc.plist" ]; then
+    mkdir -p "$VC_DIR_A" 2>/dev/null || true
+    printf '%s' "$VC_DEFAULT" > "$VC_DIR_A/vc.plist" 2>/dev/null || true
+    chown mobile:mobile "$VC_DIR_A/vc.plist" 2>/dev/null || true
+fi
+
 # respring 加载 tweak(SpringBoard 退出会连带动 mediaserverd 重启)。
 # 延迟 2 秒且脱离会话执行: 保证 postinst 先正常退出, dpkg 事务完整收尾,
 # 不会因 SpringBoard 被杀而中断安装记录(半配置状态)
