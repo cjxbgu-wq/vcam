@@ -338,33 +338,36 @@ static void vcam_core_log(NSString *msg) {
     // 12s 内 3 次横跳 = 用户观感"非常卡顿"的直接来源。修: 负差分丢弃(不更新基线,
     // 本次不判退); EMA 平滑抗单次毛刺。
     // 滞回时间窗: 进入后 ≥5s 不许退出, 退出后 ≥8s 不许再进 —— 防高频振荡
-    {
-        static CFAbsoluteTime lastCpuCheck = 0;
-        static CFAbsoluteTime lastCpuSample = 0;
-        static double lastCpuSec = 0;
-        static double emaPct = 0;              // EMA 平滑后 CPU%
-        static BOOL emaInit = NO;
-        static BOOL lowPower = NO;
-        static CFAbsoluteTime lastModeSwitch = 0;  // 上次 ON/OFF 切换时刻
-        CFAbsoluteTime nowT = CFAbsoluteTimeGetCurrent();
-        if (nowT - lastCpuCheck > 2.0) {
-            double cpuSec = [vcam_process_cpu_seconds() doubleValue];
-            double delta = cpuSec - lastCpuSec;
-            if (lastCpuSec > 0 && nowT > lastCpuSample && delta >= 0) {
-                double pct = delta / (nowT - lastCpuSample) * 100.0;
-                emaPct = emaInit ? (emaPct * 0.6 + pct * 0.4) : pct;
-                emaInit = YES;
-                BOOL minHoldOk = (nowT - lastModeSwitch) > (lowPower ? 5.0 : 8.0);
-                if (emaPct > 46.0 && !lowPower && minHoldOk) {
-                    lowPower = YES;
-                    lastModeSwitch = nowT;
-                    vcam_core_log([NSString stringWithFormat:@"[vcam] CPU %.0f%% (ema) >46%%, freeze ON", emaPct]);
-                } else if (emaPct < 38.0 && lowPower && minHoldOk) {
-                    lowPower = NO;
-                    lastModeSwitch = nowT;
-                    vcam_core_log([NSString stringWithFormat:@"[vcam] CPU %.0f%% (ema) <38%%, freeze OFF", emaPct]);
+        // 退出阈值 48%(2026-08-16 卡死修复): 守护进程配额 50%/180s 均值, 38% 太苛刻
+        // —— 冻结期间 render 写入成本不变, CPU 常驻 58-64% 永远达不到 38% →
+        // 内容永久锁死 15fps = 用户看到的持续卡顿。48% 保留 2% 安全边距
+        {
+            static CFAbsoluteTime lastCpuCheck = 0;
+            static CFAbsoluteTime lastCpuSample = 0;
+            static double lastCpuSec = 0;
+            static double emaPct = 0;              // EMA 平滑后 CPU%
+            static BOOL emaInit = NO;
+            static BOOL lowPower = NO;
+            static CFAbsoluteTime lastModeSwitch = 0;  // 上次 ON/OFF 切换时刻
+            CFAbsoluteTime nowT = CFAbsoluteTimeGetCurrent();
+            if (nowT - lastCpuCheck > 2.0) {
+                double cpuSec = [vcam_process_cpu_seconds() doubleValue];
+                double delta = cpuSec - lastCpuSec;
+                if (lastCpuSec > 0 && nowT > lastCpuSample && delta >= 0) {
+                    double pct = delta / (nowT - lastCpuSample) * 100.0;
+                    emaPct = emaInit ? (emaPct * 0.6 + pct * 0.4) : pct;
+                    emaInit = YES;
+                    BOOL minHoldOk = (nowT - lastModeSwitch) > (lowPower ? 5.0 : 8.0);
+                    if (emaPct > 46.0 && !lowPower && minHoldOk) {
+                        lowPower = YES;
+                        lastModeSwitch = nowT;
+                        vcam_core_log([NSString stringWithFormat:@"[vcam] CPU %.0f%% (ema) >46%%, freeze ON", emaPct]);
+                    } else if (emaPct < 48.0 && lowPower && minHoldOk) {
+                        lowPower = NO;
+                        lastModeSwitch = nowT;
+                        vcam_core_log([NSString stringWithFormat:@"[vcam] CPU %.0f%% (ema) <48%%, freeze OFF", emaPct]);
+                    }
                 }
-            }
             // 负差分(线程快照抖动): 只推进时间基线, 不更新 CPU 基线(下轮重算), 不判退
             lastCpuSample = nowT;
             if (delta >= 0 || lastCpuSec == 0) lastCpuSec = cpuSec;
@@ -384,7 +387,7 @@ static void vcam_core_log(NSString *msg) {
             if (!freezeState) freezeState = [NSMutableDictionary dictionary];
             uint64_t px = (uint64_t)targetW * targetH;
             double window = px > 10000000ull ? 1.0
-                          : (lowPower ? 0.066 : 0.042);
+                          : (lowPower ? 0.05 : 0.042);
             NSString *fk = [NSString stringWithFormat:@"%zu_%zu_%u", targetW, targetH, (unsigned)origFormat];
             @synchronized(freezeState) {
                 NSDictionary *st = freezeState[fk];
@@ -689,9 +692,9 @@ static void vcam_core_log(NSString *msg) {
                 }
 
                 // effectiveFps = PTS 实测帧率(校准 nominalFrameRate 低估导致的节拍慢放);
-                // CPU 降载期上限 15fps(内容连续, render 端有冻结帧机制兜底)
+                // CPU 降载期上限 20fps(接近流畅下限; 15fps 肉眼可见卡顿)
                 double fps = MIN(strongSelf.videoPlayer.effectiveFps,
-                                 strongSelf.lowPowerDecode ? 15.0 : 240.0);
+                                 strongSelf.lowPowerDecode ? 20.0 : 240.0);
                 nextTick += 1.0 / fps;
                 double wait = nextTick - CFAbsoluteTimeGetCurrent();
                 if (wait > 0.0005) {

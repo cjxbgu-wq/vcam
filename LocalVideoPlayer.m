@@ -163,12 +163,12 @@ static void vcam_player_log(NSString *msg) {
     return 30.0;
 }
 
-// 解码分辨率上限(2026-08-16 CPU 配额被杀修复, 默认 720):
+// 解码分辨率上限(2026-08-16 CPU 配额被杀修复, 默认 540):
 // kCVPixelBufferWidth/HeightKey 直接指定解码输出尺寸, AVAssetReader 底层走 VT
 // 缩放解码 —— SW 解码+预渲染旋转的 CPU 随像素数线性下降。
 // mediaserverd CPU 配额实测: 扫码场景 CPU 67% ~110s 被杀, 必须 总量 <50%。
-// decodeMaxEdge 720(1244x1660 → 540x720): 解码+旋转 ~20%→~9%, 预览 720p
-// 视觉差异小(替换视频本身是压缩视频)。vc.plist "decodeMaxEdge": 0=不限制
+// decodeMaxEdge 540: 解码+旋转+各流 stage1 缩放源像素全降 ~44%, 预览 1080p 屏
+// 上视觉差异小(替换视频本身是压缩视频)。vc.plist "decodeMaxEdge": 0=不限制
 static size_t vcam_decode_max_edge(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -176,11 +176,11 @@ static size_t vcam_decode_max_edge(void) {
             NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Media/DCIM/vc.plist"];
             if (d && d[@"decodeMaxEdge"]) {
                 NSInteger v = [d[@"decodeMaxEdge"] integerValue];
-                cached = (int)(v >= 0 ? v : 720);
+                cached = (int)(v >= 0 ? v : 540);
             } else {
-                cached = 720;
+                cached = 540;
             }
-        } @catch (NSException *e) { cached = 720; }
+        } @catch (NSException *e) { cached = 540; }
     }
     return (size_t)cached;
 }
@@ -583,8 +583,8 @@ static size_t vcam_decode_max_edge(void) {
                     _frameCount++;
                     // 按视频帧率绝对节拍输出(参考逆向: 按时间戳输出帧)
                     // effectiveFps = PTS 实测(校准 nominalFrameRate 低估导致的慢放卡顿)
-                    // CPU 降载期上限 ~15fps(内容连续; render 冻结帧兜底)
-                    double effFps = MIN([self effectiveFps], _lowPowerDecode ? 15.0 : 240.0);
+                    // CPU 降载期上限 ~20fps(接近流畅下限; render 冻结帧兜底)
+                    double effFps = MIN([self effectiveFps], _lowPowerDecode ? 20.0 : 240.0);
                     double frameInterval = 1.0 / effFps;
                     nextTick += frameInterval;
                     double wait = nextTick - CFAbsoluteTimeGetCurrent();

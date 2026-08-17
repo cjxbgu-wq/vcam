@@ -146,6 +146,9 @@ static void vcam_gpu_log(NSString *msg) {
 // (调用方已持该 key 的 per-key 锁, 池字典自身用 @synchronized 保护)
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *gpuImgTokenPool;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, CIImage *> *gpuImgOutPool;
+// 每流 stage 耗时统计(2026-08-16 CPU 归因探针): key -> @{s1: [totalMs,count], s2:...}
+// takeStreamStats 周期输出平均 ms, 定位 58-64% CPU 具体烧在哪个流哪一步
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSMutableDictionary<NSString *, NSNumber *> *> *stageTimingPool;
 
 // 缓冲池字典（key="w_h", value=CVPixelBufferPoolRef）—— 每个尺寸独立池，避免频繁重建
 @property (nonatomic, strong) NSMutableDictionary *bgraBufferPoolMap;
@@ -183,6 +186,7 @@ static void vcam_gpu_log(NSString *msg) {
         _streamPixelStats = [NSMutableDictionary dictionary];
         _gpuImgTokenPool = [NSMutableDictionary dictionary];
         _gpuImgOutPool = [NSMutableDictionary dictionary];
+        _stageTimingPool = [NSMutableDictionary dictionary];
 
         // 软件渲染 CIContext（回退用）
         @try {
@@ -1158,6 +1162,22 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
     }
 }
 
+// 每流 stage 耗时累计(诊断): stage 1=缩放 2=格式转换
+- (void)noteStageTiming:(NSString *)key stage:(int)stage ms:(double)ms {
+    @synchronized(self) {
+        NSString *sk = [NSString stringWithFormat:@"s%d", stage];
+        NSMutableDictionary *d = _stageTimingPool[key];
+        if (!d) {
+            d = [NSMutableDictionary dictionary];
+            _stageTimingPool[key] = d;
+        }
+        double total = [d[sk] doubleValue] + ms;  // 打包 [count.total] 双数值见下
+        NSInteger cnt = [d[[NSString stringWithFormat:@"%@c", sk]] integerValue] + 1;
+        d[sk] = @(total);
+        d[[NSString stringWithFormat:@"%@c", sk]] = @(cnt);
+    }
+}
+
 // 流 key LRU(2026-08-16 黑屏修复): 每次流访问把 key 移到 MRU 尾部,
 // 超 kVcamMaxStreamKeys 淘汰最旧 key 的全部池资源(session/staging/token/锁)。
 // 防切前后摄/换分辨率场景 key 无限累积 → mediaserverd 内存超限被杀(黑屏循环)。
@@ -1246,6 +1266,7 @@ static const NSUInteger kVcamMaxStreamKeys = 6;
 }
 
 // 按流渲染统计(诊断, 30s 窗口): takeStreamStats 输出并清零
+// 2026-08-16: 附带每流 stage1/stage2 平均耗时(ms) —— CPU 归因探针
 - (NSString *)takeStreamStats {
     @synchronized(self) {
         if (_streamRenderStats.count == 0) return @"";
@@ -1253,10 +1274,15 @@ static const NSUInteger kVcamMaxStreamKeys = 6;
         for (NSString *k in _streamRenderStats) {
             NSUInteger cnt = [_streamRenderStats[k] unsignedIntegerValue];
             uint64_t mb = ([_streamPixelStats[k] unsignedLongLongValue] * 4ull) >> 20;  // BGRA 4B/px
-            [parts addObject:[NSString stringWithFormat:@"%@:%lu/%lluMB", k, (unsigned long)cnt, mb]];
+            // stage 均值: s1=缩放(内容帧才跑) s2=格式转换(每相机帧都跑)
+            NSDictionary *tm = _stageTimingPool[k];
+            double s1Avg = (tm && [tm[@"s1c"] integerValue] > 0) ? ([tm[@"s1"] doubleValue] / [tm[@"s1c"] integerValue]) : -1;
+            double s2Avg = (tm && [tm[@"s2c"] integerValue] > 0) ? ([tm[@"s2"] doubleValue] / [tm[@"s2c"] integerValue]) : -1;
+            [parts addObject:[NSString stringWithFormat:@"%@:%lu/%lluMB(%.1f,%.1fms)", k, (unsigned long)cnt, mb, s1Avg, s2Avg]];
         }
         [_streamRenderStats removeAllObjects];
         [_streamPixelStats removeAllObjects];
+        [_stageTimingPool removeAllObjects];
         return [parts componentsJoinedByString:@" "];
     }
 }
@@ -1384,11 +1410,14 @@ static const NSUInteger kVcamMaxStreamKeys = 6;
     // 缩放复用: 同一源帧(token 未变)同流已缩放 → 跳过步骤1
     NSNumber *cachedTok = _twoStepTokenPool[poolKey];
     BOOL stagingFresh = (token != 0 && cachedTok && [cachedTok unsignedLongLongValue] == token);
+    CFAbsoluteTime tS1 = 0, tS2 = 0;
     if (!stagingFresh) {
         // 步骤1: 缩放到目标尺寸 BGRA(per-key session, Trim crop fill)
         VTPixelTransferSessionRef s1 = [self twoStepSessionForKey:poolKey];
         if (!s1) return NO;
+        tS1 = CFAbsoluteTimeGetCurrent();
         OSStatus st1 = VTPixelTransferSessionTransferImage(s1, src, staging);
+        [self noteStageTiming:poolKey stage:1 ms:(CFAbsoluteTimeGetCurrent() - tS1) * 1000.0];
         if (st1 != noErr) {
             vcam_gpu_log([NSString stringWithFormat:@"[vcam] 2step stage1 failed: %d key=%@", (int)st1, poolKey]);
             return NO;
@@ -1400,7 +1429,9 @@ static const NSUInteger kVcamMaxStreamKeys = 6;
     // 失败处理: 计数 + 熔断(不做高频 session 重建 —— 328x184 '18f0' 分析流场景
     // 曾每秒 rebuild 8 次 → wakeups 风暴 → mediaserverd 被杀死循环)
     VTPixelTransferSessionRef s2 = [self twoStepSessionForKey:poolKey];
+    tS2 = CFAbsoluteTimeGetCurrent();
     OSStatus st2 = s2 ? VTPixelTransferSessionTransferImage(s2, staging, dst) : -1;
+    [self noteStageTiming:poolKey stage:2 ms:(CFAbsoluteTimeGetCurrent() - tS2) * 1000.0];
     if (st2 != noErr) {
         NSInteger fails = [_twoStepFailCountPool[poolKey] integerValue] + 1;
         _twoStepFailCountPool[poolKey] = @(fails);
