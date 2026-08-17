@@ -83,6 +83,33 @@ static void vcam_gpu_log(NSString *msg) {
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSLock *> *oneStepKeyLockPool;   // key -> lock
 @property (nonatomic, strong) NSLock *rotationRenderLock;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSLock *> *twoStepKeyLockPool;
+
+// ===== 前置多流卡顿优化(2026-08-17 实测数据驱动) =====
+// 实测(微信/抖音等 App 前置): 4-5 条流并发, 3 条私有格式全走两步法 →
+// CPU 65-86% 两次触发紧急降载 → 内容 24↔20fps 摆动 = 前置卡顿(后置仅 2 流 30-40% 无此问题)。
+// 两个成本炸弹:
+//   1) 2304x1650 照片流渲染率 94fps(30s 2825 帧): 同一相机帧过 emit/scaler/encoder
+//      三节点, buffer 不同去重失效 → 同 token 重复全价转换 3 次(s2 5.7ms x3)
+//   2) 2112x1584 流 s1=8.7-12.9ms 无复用(渲染率 26fps ≈ 内容率 24fps, 几乎每帧新 token)
+// 修复:
+//   A) 组 staging: 同比例家族(量化 0.1%)的私有格式流共享一个最大尺寸 BGRA
+//      中转, s1(缩放)每帧每组只付一次, 各流 s2 从组 staging 直转/缩转
+//   B) s2 结果缓存: 同 key 同 token 第二次消费起, 全价转换进自有缓存 buffer,
+//      后续消费 VT 同格式 blit(~1-2ms)复用 —— 三消费链只付一次全价
+//      (私有→私有 blit 未实证, 失败一次即熔断该 key 回直转, 无风暴风险)
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSValue *> *groupStagingPool;   // "g:1333" -> BGRA buffer
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *groupTokenPool;    // 组内容帧代数
+@property (nonatomic, strong) NSLock *groupGlobalLock;   // 全局组锁: 组资源(staging/session/token)读写互斥。
+// 不用 per-ratio 组锁的原因: 懒建锁对象自身有并发竞态(两线程各建一把锁互相不见),
+// 且 LRU 淘汰持组锁与 @synchronized 的锁序复杂化。组数极少(1-2 个比例家族),
+// s1 每帧每组仅一次(~24 次/s), 全局锁竞争可忽略
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSValue *> *groupSessionPool;   // 组 s1 session
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *groupSizePool;     // 组 staging 像素量(取组内最大)
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSValue *> *resultCachePool;    // 流 key -> 私有格式结果缓存
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSValue *> *resultBlitSessionPool; // 流 key -> 专用 blit session(私有→私有, 与全价 session 隔离防 pipeline 反复切换)
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *resultCacheTokenPool; // 缓存内容帧代数
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *lastReqTokenPool;  // 上次请求 token(检测重复消费)
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *resultBlitDisabledPool; // blit 熔断
 @property (nonatomic, assign) VTPixelRotationSessionRef pixelRotationSession;
 // render 路径专用旋转 session（非线程安全: 预渲染线程与 render 线程并发用同一 session 会崩溃）
 @property (nonatomic, assign) VTPixelRotationSessionRef renderRotationSession;
@@ -193,6 +220,16 @@ static void vcam_gpu_log(NSString *msg) {
         _stageTimingPool = [NSMutableDictionary dictionary];
         _oneStepFailPool = [NSMutableDictionary dictionary];
         _oneStepDisabledPool = [NSMutableDictionary dictionary];
+        _groupStagingPool = [[NSMutableDictionary alloc] init];
+        _groupTokenPool = [[NSMutableDictionary alloc] init];
+        _groupGlobalLock = [[NSLock alloc] init];
+        _groupSessionPool = [[NSMutableDictionary alloc] init];
+        _groupSizePool = [[NSMutableDictionary alloc] init];
+        _resultCachePool = [[NSMutableDictionary alloc] init];
+        _resultBlitSessionPool = [[NSMutableDictionary alloc] init];
+        _resultCacheTokenPool = [[NSMutableDictionary alloc] init];
+        _lastReqTokenPool = [[NSMutableDictionary alloc] init];
+        _resultBlitDisabledPool = [[NSMutableDictionary dictionary] init];
 
         // 软件渲染 CIContext（回退用）
         @try {
@@ -266,6 +303,32 @@ static void vcam_gpu_log(NSString *msg) {
         [_twoStepSessionPool removeAllObjects];
         [_twoStepStagingPool removeAllObjects];
         [_twoStepTokenPool removeAllObjects];
+        // 组 staging 池 + s2 结果缓存池(前置多流优化配套)
+        {
+            for (NSString *k in _groupSessionPool.allKeys) {
+                NSValue *sv = _groupSessionPool[k];
+                VTPixelTransferSessionRef s = (VTPixelTransferSessionRef)[sv pointerValue];
+                if (s && invalidate) invalidate(s);
+            }
+            for (NSValue *v in _groupStagingPool.allValues) {
+                CVPixelBufferRef b = (CVPixelBufferRef)[v pointerValue];
+                if (b) CVPixelBufferRelease(b);
+            }
+            [_groupSessionPool removeAllObjects];
+            [_groupStagingPool removeAllObjects];
+            [_groupTokenPool removeAllObjects];
+            for (NSValue *v in _resultCachePool.allValues) {
+                CVPixelBufferRef b = (CVPixelBufferRef)[v pointerValue];
+                if (b) CVPixelBufferRelease(b);
+            }
+            [_resultCachePool removeAllObjects];
+            [_resultCacheTokenPool removeAllObjects];
+            for (NSValue *v in _resultBlitSessionPool.allValues) {
+                VTPixelTransferSessionRef s = (VTPixelTransferSessionRef)[v pointerValue];
+                if (s && invalidate) invalidate(s);
+            }
+            [_resultBlitSessionPool removeAllObjects];
+        }
         // 一步 transfer per-stream session 池
         for (NSValue *v in _oneStepSessionPool.allValues) {
             VTPixelTransferSessionRef s = (VTPixelTransferSessionRef)[v pointerValue];
@@ -1132,6 +1195,13 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
     // 两步法 CPU 高(17.8ms/帧)但卡顿根因(46/48 横跳)已由 80/60 紧急档根治,
     // 高成本只落在私有流上且不再触发任何机制切换 → 稳定不闪烁。
     if (isPrivate) {
+        // 组 key LRU touch 必须在 per-key 锁外(@synchronized 与 keyLock 锁序单向:
+        // 淘汰路径 synchronized→keyLock, transfer 路径禁止 keyLock→synchronized)
+        if (token != 0) {
+            NSString *rk = [NSString stringWithFormat:@"g:%d",
+                            (int)llround((double)dstH * 1000.0 / (double)dstW)];
+            [self touchStreamKeyLRU:rk];
+        }
         NSLock *keyLock = [self twoStepLockForKey:poolKey];
         [keyLock lock];
         BOOL ok = [self twoStepTransferLocked:src toPixelBuffer:dst key:poolKey token:token];
@@ -1269,6 +1339,46 @@ static const NSUInteger kVcamMaxStreamKeys = 12;
                 [_bgraBufferPoolMap removeObjectForKey:old];
             }
 
+            // ===== 前置多流优化资源(2026-08-17) =====
+            if ([old hasPrefix:@"g:"]) {
+                // 组条目: 释放组 staging/session(持全局组锁防与 transfer 并发;
+                // 锁序 synchronized→groupLock 与 transfer 的 keyLock→groupLock 单向无环)
+                NSLock *gLock = _groupGlobalLock;
+                if (gLock) [gLock lock];
+                NSValue *gsv = _groupStagingPool[old];
+                if (gsv) {
+                    CVPixelBufferRef b = (CVPixelBufferRef)[gsv pointerValue];
+                    if (b) CVPixelBufferRelease(b);
+                    [_groupStagingPool removeObjectForKey:old];
+                }
+                NSValue *gssv = _groupSessionPool[old];
+                if (gssv) {
+                    VTPixelTransferSessionRef s = (VTPixelTransferSessionRef)[gssv pointerValue];
+                    if (s && invalidateSession) invalidateSession(s);
+                    [_groupSessionPool removeObjectForKey:old];
+                }
+                [_groupTokenPool removeObjectForKey:old];
+                [_groupSizePool removeObjectForKey:old];
+                if (gLock) [gLock unlock];
+            } else {
+                // 流条目: 释放 s2 结果缓存 + blit session + 消费追踪
+                NSValue *rcv = _resultCachePool[old];
+                if (rcv) {
+                    CVPixelBufferRef b = (CVPixelBufferRef)[rcv pointerValue];
+                    if (b) CVPixelBufferRelease(b);
+                    [_resultCachePool removeObjectForKey:old];
+                }
+                [_resultCacheTokenPool removeObjectForKey:old];
+                [_lastReqTokenPool removeObjectForKey:old];
+                NSValue *rbsv = _resultBlitSessionPool[old];
+                if (rbsv) {
+                    VTPixelTransferSessionRef s = (VTPixelTransferSessionRef)[rbsv pointerValue];
+                    if (s && invalidateSession) invalidateSession(s);
+                    [_resultBlitSessionPool removeObjectForKey:old];
+                }
+                // blitDisabled 故意不清(熔断语义与 twoStepDisabledPool 一致)
+            }
+
             // 锁池条目最后清(先 unlock 再 remove 与先 remove 再 unlock 等价安全,
             // 统一: unlock 前移除, 持锁线程栈引用保证对象存活)
             [_oneStepKeyLockPool removeObjectForKey:old];
@@ -1400,8 +1510,199 @@ static const NSUInteger kVcamMaxStreamKeys = 12;
     }
 }
 
-// 两步法主体(调用方已持 per-key 锁)
+// 两步法主体(调用方已持 per-key 锁) —— 组共享 + 结果缓存快速路径, 失败回退 legacy
 - (BOOL)twoStepTransferLocked:(CVPixelBufferRef)src toPixelBuffer:(CVPixelBufferRef)dst
+                          key:(NSString *)poolKey token:(uint64_t)token {
+    // 失败熔断: 该流组合 VT 不支持 → 放弃替换保真实相机(与 legacy 一致)
+    if ([_twoStepDisabledPool[poolKey] boolValue]) {
+        return NO;
+    }
+    // token=0(懒 BGRA 回退调用): 无帧代数语义, 组/token 复用判定失效, 直接走 legacy
+    if (token == 0 || !src || !dst) {
+        return [self legacyTwoStepTransferLocked:src toPixelBuffer:dst key:poolKey token:token];
+    }
+
+    size_t dstW = CVPixelBufferGetWidth(dst);
+    size_t dstH = CVPixelBufferGetHeight(dst);
+    if (!dstW || !dstH) return NO;
+
+    // ===== B1: s2 结果缓存快路径(同 token 第 2+ 次消费, ~1-2ms blit) =====
+    // 实测 2304x1650 照片流 94fps: 同一相机帧过 emit/scaler/encoder 三节点,
+    // buffer 不同指针去重失效 → 同 token 全价转换 x3。缓存建立后第 2+ 次
+    // 消费只付 VT 同格式 blit。
+    if (![_resultBlitDisabledPool[poolKey] boolValue]) {
+        NSValue *cv = _resultCachePool[poolKey];
+        CVPixelBufferRef cacheBuf = cv ? (CVPixelBufferRef)[cv pointerValue] : NULL;
+        NSNumber *ct = _resultCacheTokenPool[poolKey];
+        if (cacheBuf && ct && [ct unsignedLongLongValue] == token) {
+            VTPixelTransferSessionRef blitS = [self resultBlitSessionForKey:poolKey];
+            if (blitS) {
+                CFAbsoluteTime tB = CFAbsoluteTimeGetCurrent();
+                OSStatus stB = VTPixelTransferSessionTransferImage(blitS, cacheBuf, dst);
+                double msB = (CFAbsoluteTimeGetCurrent() - tB) * 1000.0;
+                [self noteStageTiming:poolKey stage:2 ms:msB];
+                if (stB == noErr) return YES;
+                // 私有→私有 blit 该组合 VT 不支持: 熔断缓存路径(该 key 永远全价), 无风暴
+                _resultBlitDisabledPool[poolKey] = @YES;
+                CVPixelBufferRelease(cacheBuf);
+                [_resultCachePool removeObjectForKey:poolKey];
+                [_resultCacheTokenPool removeObjectForKey:poolKey];
+                vcam_gpu_log([NSString stringWithFormat:@"[vcam] result-cache blit rejected (%d), disabled for %@", (int)stB, poolKey]);
+            }
+        }
+    }
+
+    // ===== A: 组 staging(同比例家族共享, s1 每帧每组只付一次) =====
+    // 实测 2112x1584 流 s1 8.7-12.9ms 几乎每帧全价(渲染率≈内容率, per-key token
+    // 复用率为零); 而它与 1440x1080 流比例同为 4:3 —— 两条流各自 s1 是纯重复劳动。
+    // 比例量化 0.1% 分组(组内 Trim 构图一致), 组 staging 取组内最大尺寸 BGRA,
+    // s1 由每帧首个到达的流垫付, 其余流 s2 直接从组 staging 缩转。
+    // ratioKey 由调用方(transferPixelBuffer, per-key 锁外)算好传入 —— 组 key 的
+    // LRU touch 含 @synchronized, 锁序禁止(synchronized→keyLock 单向)。
+    NSString *ratioKey = [NSString stringWithFormat:@"g:%d",
+                          (int)llround((double)dstH * 1000.0 / (double)dstW)];
+
+    NSLock *gLock = _groupGlobalLock;
+    [gLock lock];
+
+    CVPixelBufferRef groupStaging = NULL;
+    {
+        NSValue *gv = _groupStagingPool[ratioKey];
+        if (gv) groupStaging = (CVPixelBufferRef)[gv pointerValue];
+        uint64_t needPx = (uint64_t)dstW * dstH;
+        uint64_t havePx = [_groupSizePool[ratioKey] unsignedLongLongValue];
+        if (!groupStaging || needPx > havePx) {
+            // 组内出现更大流: 重建组 staging(内容代数清零, 下次 s1 重付)
+            CVPixelBufferRef bigger = [self createBufferWithWidth:dstW height:dstH
+                                                           format:kCVPixelFormatType_32BGRA];
+            if (bigger) {
+                if (groupStaging) CVPixelBufferRelease(groupStaging);
+                groupStaging = bigger;
+                _groupStagingPool[ratioKey] = [NSValue valueWithPointer:groupStaging];
+                _groupSizePool[ratioKey] = @(needPx);
+                _groupTokenPool[ratioKey] = @0;
+                vcam_gpu_log([NSString stringWithFormat:@"[vcam] group staging %@ built %zux%zu", ratioKey, dstW, dstH]);
+            }
+            // 创建失败: 保留旧组 staging(尺寸不足时 s2 走缩小, 仍正确), 无旧则回退 legacy
+        }
+    }
+
+    CVPixelBufferRef effectiveStaging = NULL;
+    BOOL groupOk = NO;
+    if (groupStaging) {
+        NSNumber *gt = _groupTokenPool[ratioKey];
+        if (!gt || [gt unsignedLongLongValue] != token) {
+            VTPixelTransferSessionRef gSession = [self groupSessionForKey:ratioKey];
+            if (gSession) {
+                CFAbsoluteTime t1 = CFAbsoluteTimeGetCurrent();
+                OSStatus st1 = VTPixelTransferSessionTransferImage(gSession, src, groupStaging);
+                [self noteStageTiming:poolKey stage:1 ms:(CFAbsoluteTimeGetCurrent() - t1) * 1000.0];
+                if (st1 == noErr) {
+                    _groupTokenPool[ratioKey] = @(token);
+                    groupOk = YES;
+                } else {
+                    // 组 s1 失败(src→BGRA 组合异常): 本帧回退 legacy, 不熔断组(下帧重试)
+                    vcam_gpu_log([NSString stringWithFormat:@"[vcam] group s1 failed (%d) %@, fallback legacy", (int)st1, ratioKey]);
+                }
+            }
+        } else {
+            groupOk = YES;  // 组内容新鲜(本帧已被同组其他流垫付), s1 免单
+        }
+        if (groupOk) {
+            effectiveStaging = CVPixelBufferRetain(groupStaging);  // 栈引用, 防 LRU 并发释放
+        }
+    }
+    [gLock unlock];
+
+    if (!effectiveStaging) {
+        return [self legacyTwoStepTransferLocked:src toPixelBuffer:dst key:poolKey token:token];
+    }
+
+    // ===== B2/s2: 组staging → dst(私有格式) =====
+    // 缓存模式自适应: 首次"同 token 二次消费"(lastReq==token)证明该流是多消费链,
+    // 激活缓存 —— 此后每个新 token 首次消费即建缓存(全价+blit), 后续消费 blit 复用。
+    // 单消费流(每帧 token 唯一)永不激活, 零额外成本。
+    VTPixelTransferSessionRef s2 = [self twoStepSessionForKey:poolKey];
+    if (!s2) {
+        CVPixelBufferRelease(effectiveStaging);
+        return [self legacyTwoStepTransferLocked:src toPixelBuffer:dst key:poolKey token:token];
+    }
+
+    NSNumber *lastReq = _lastReqTokenPool[poolKey];
+    BOOL repeatConsume = (lastReq && [lastReq unsignedLongLongValue] == token);
+
+    if (repeatConsume && ![_resultBlitDisabledPool[poolKey] boolValue] && !_resultCachePool[poolKey]) {
+        // 激活缓存: 全价转换进自有 buffer, 再 blit 到 dst
+        CVPixelBufferRef cacheBuf = [self createBufferWithWidth:dstW height:dstH
+                                                         format:CVPixelBufferGetPixelFormatType(dst)];
+        if (cacheBuf) {
+            CFAbsoluteTime t2 = CFAbsoluteTimeGetCurrent();
+            OSStatus st2a = VTPixelTransferSessionTransferImage(s2, effectiveStaging, cacheBuf);
+            double ms2 = (CFAbsoluteTimeGetCurrent() - t2) * 1000.0;
+            [self noteStageTiming:poolKey stage:2 ms:ms2];
+            if (st2a == noErr) {
+                VTPixelTransferSessionRef blitS = [self resultBlitSessionForKey:poolKey];
+                OSStatus st2b = blitS ? VTPixelTransferSessionTransferImage(blitS, cacheBuf, dst) : -1;
+                if (st2b == noErr) {
+                    _resultCachePool[poolKey] = [NSValue valueWithPointer:cacheBuf];  // 所有权归池
+                    _resultCacheTokenPool[poolKey] = @(token);
+                    _lastReqTokenPool[poolKey] = @(token);
+                    CVPixelBufferRelease(effectiveStaging);
+                    return YES;
+                }
+                // blit 不支持: 熔断缓存路径
+                _resultBlitDisabledPool[poolKey] = @YES;
+                CVPixelBufferRelease(cacheBuf);
+                vcam_gpu_log([NSString stringWithFormat:@"[vcam] result-cache blit(build) rejected (%d), disabled for %@", (int)st2b, poolKey]);
+            } else {
+                CVPixelBufferRelease(cacheBuf);
+            }
+        } else {
+            _resultBlitDisabledPool[poolKey] = @YES;  // 私有格式 buffer 创建失败, 不再尝试
+        }
+    }
+
+    // 直转(首次消费 / 缓存路径不可用)
+    CFAbsoluteTime t2 = CFAbsoluteTimeGetCurrent();
+    OSStatus st2 = VTPixelTransferSessionTransferImage(s2, effectiveStaging, dst);
+    [self noteStageTiming:poolKey stage:2 ms:(CFAbsoluteTimeGetCurrent() - t2) * 1000.0];
+    _lastReqTokenPool[poolKey] = @(token);
+    CVPixelBufferRelease(effectiveStaging);
+    if (st2 == noErr) return YES;
+
+    // s2 失败: 回退 legacy(其内部带失败计数+熔断, 语义不变)
+    return [self legacyTwoStepTransferLocked:src toPixelBuffer:dst key:poolKey token:token];
+}
+
+// 组 s1 session(懒建, Trim; 组内 src→组staging 组合固定, pipeline 稳定)
+- (VTPixelTransferSessionRef)groupSessionForKey:(NSString *)ratioKey {
+    NSValue *v = _groupSessionPool[ratioKey];
+    if (v) return (VTPixelTransferSessionRef)[v pointerValue];
+    VTPixelTransferSessionRef s = NULL;
+    if (VTPixelTransferSessionCreate(kCFAllocatorDefault, &s) == noErr && s) {
+        VTSessionSetProperty(s, CFSTR("ScalingMode"), CFSTR("Trim"));
+        VTSessionSetProperty(s, CFSTR("RealTime"), kCFBooleanTrue);
+        _groupSessionPool[ratioKey] = [NSValue valueWithPointer:s];
+        return s;
+    }
+    return NULL;
+}
+
+// 结果缓存专用 blit session(私有→私有, 与全价 s2 session 隔离, 防 pipeline 反复切换)
+- (VTPixelTransferSessionRef)resultBlitSessionForKey:(NSString *)key {
+    NSValue *v = _resultBlitSessionPool[key];
+    if (v) return (VTPixelTransferSessionRef)[v pointerValue];
+    VTPixelTransferSessionRef s = NULL;
+    if (VTPixelTransferSessionCreate(kCFAllocatorDefault, &s) == noErr && s) {
+        _resultBlitSessionPool[key] = [NSValue valueWithPointer:s];
+        return s;
+    }
+    return NULL;
+}
+
+// legacy 两步法(2026-08-17 前的路径): per-key staging + 同格式→BGRA 回退 + 熔断计数。
+// 作为组路径/缓存路径的回退保留 —— 任何新路径失败都不能闪回真实相机(闪烁教训)
+- (BOOL)legacyTwoStepTransferLocked:(CVPixelBufferRef)src toPixelBuffer:(CVPixelBufferRef)dst
                           key:(NSString *)poolKey token:(uint64_t)token {
     size_t dstW = CVPixelBufferGetWidth(dst);
     size_t dstH = CVPixelBufferGetHeight(dst);
