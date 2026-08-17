@@ -1113,14 +1113,28 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
         }
     }
 
-    // ===== 一步直转统一路径(2026-08-17 架构回归, 千面验证过的极简方案) =====
-    // 两步法判死: 探针实测 |8v0 流 stage1(5.7)+stage2(12.1)=17.8ms/帧, 且内容率
-    // 已对齐渲染率(24≈24.5fps) → "重复帧跳过 stage1"根本不发生, 两步法纯付
-    // 中转税(+50% CPU)。同格式 staging 又被 VT 全面拒绝(-12905, 所有私有格式)。
-    // 一步 420f→任意格式 VT 实测可行(write 日志: →p420 ok / →-8f0 ok / →|8v0 ok),
-    // 单次转换 ~7-12ms 无中转。per-stream session+锁并行, 连续失败 2 次熔断
-    // (跳过该流保真实相机, 防 wakeups 风暴 —— '18f0' 分析流教训)。
-    // token 不再参与转换路径(仅 CCW90 旋转缓存用), 全帧直转。
+    // ===== 混合路径(2026-08-17 闪烁修复: 按目标格式分流) =====
+    // 教训: "统一一步直转"是过头改革 —— 420f→私有格式(|8v0/-8f0/xv0)一步被 VT
+    // 拒绝(-12905, 这正是两步法当初存在的原因), 失败帧保留真实相机画面 →
+    // 与成功帧交替显示 = 用户看到的"替换/原画面闪烁"。
+    // 420f→p420 一步直转是日志实证的可行特例(标准 YUV 家族内互转)。
+    // 正确分流:
+    //   私有格式目标 → 两步法(BGRA staging, 实测唯一可行: 昨天 stage2 12.1ms
+    //     成功日志 = BGRA→|8v0 可行; 420f 直转被拒)
+    //   标准格式(BGRA/420f/420v/p420) → 一步直转(便宜 ~0.5-7ms 且实证成功)
+    // 两步法 CPU 高(17.8ms/帧)但卡顿根因(46/48 横跳)已由 80/60 紧急档根治,
+    // 高成本只落在私有流上且不再触发任何机制切换 → 稳定不闪烁。
+    if (isPrivate) {
+        NSLock *keyLock = [self twoStepLockForKey:poolKey];
+        [keyLock lock];
+        BOOL ok = [self twoStepTransferLocked:src toPixelBuffer:dst key:poolKey token:token];
+        [keyLock unlock];
+        if (ok) [self noteStreamRender:poolKey pixels:(uint64_t)dstW * dstH];
+        return ok;
+    }
+
+    // 标准格式一步直转: per-stream session+锁并行, 连续失败 2 次熔断
+    // (跳过该流保真实相机, 防 wakeups 风暴 —— '18f0' 分析流教训)
     NSLock *lock = [self oneStepLockForKey:poolKey];
     if (!lock) return NO;
     [lock lock];
