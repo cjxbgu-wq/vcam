@@ -6,4 +6,4 @@ Description: 岐盛ios免费相机
 Maintainer: vcam
 Author: vcam
 Section: Tweaks
-Depends: mobilesubstrate
+Depends: mobilesubstrate, ellekit

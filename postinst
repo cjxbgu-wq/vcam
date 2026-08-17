@@ -4,6 +4,13 @@
 
 DYLIB_NAME="VCamPlus.dylib"
 
+# 依赖兜底(2026-08-17): dpkg -i 不解析 Depends(Sileo/apt 才解析排队),
+# ellekit 缺失时从已配置源自动补装 —— 与 Sileo 安装行为对齐。
+# 失败静默(源不可达等): tweak 的 hook 是自包含实现, 无 ellekit 也可工作
+if ! dpkg -s ellekit >/dev/null 2>&1; then
+    apt-get install -y ellekit >/dev/null 2>&1 || true
+fi
+
 # RootHide Bootstrap: fakesign 二进制必须进 trustcache 才能被注入加载。
 # 路径优先走 TweakInject(是 MobileSubstrate/DynamicLibraries 的符号链接),
 # 失败回退直接路径 —— 两种 jbroot 布局都兼容
