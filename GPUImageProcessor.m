@@ -1093,10 +1093,17 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
     size_t srcH = CVPixelBufferGetHeight(src);
 
     NSString *poolKey = [NSString stringWithFormat:@"%zu_%zu_%u", dstW, dstH, (unsigned)dstFormat];
-    [self touchStreamKeyLRU:poolKey];
 
+    // 已熔断流不进 LRU(2026-08-17 微型流放开配套): 熔断语义是永久跳过, 若继续
+    // touch LRU 会在池中占位, 把真正活跃流的 session/staging 挤出去 → 循环淘汰
+    // 重建 → 抖动。先查熔断标记再决定是否跟踪
     BOOL isPrivate = !(dstFormat == kCVPixelFormatType_32BGRA ||
                        (dstFormat & 0xffffffef) == '420f');
+    if (isPrivate ? [_twoStepDisabledPool[poolKey] boolValue]
+                  : [_oneStepDisabledPool[poolKey] boolValue]) {
+        return NO;
+    }
+    [self touchStreamKeyLRU:poolKey];
     BOOL isYuv = ((dstFormat & 0xffffffef) == '420f');  // 420f/420v 掩码同判
     uint64_t dstPixels = (uint64_t)dstW * dstH;
 
@@ -1202,7 +1209,7 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
 // 熔断标记(twoStepDisabledPool)保留: 熔断语义是永久的, 淘汰后重试已确认
 // 不支持的组合会复发 wakeups 风暴。持锁中的 NSLock 淘汰安全: 持有线程栈上
 // 有强引用, unlock 释放后才可能 dealloc
-static const NSUInteger kVcamMaxStreamKeys = 6;
+static const NSUInteger kVcamMaxStreamKeys = 12;
 
 - (void)touchStreamKeyLRU:(NSString *)key {
     if (!key) return;
@@ -1454,7 +1461,24 @@ static const NSUInteger kVcamMaxStreamKeys = 6;
             [self noteStageTiming:poolKey stage:1 ms:(CFAbsoluteTimeGetCurrent() - tS1) * 1000.0];
         }
         if (st1 != noErr) {
-            vcam_gpu_log([NSString stringWithFormat:@"[vcam] 2step stage1 failed: %d key=%@", (int)st1, poolKey]);
+            // stage1 失败也计数熔断(2026-08-17 微型流放开配套): 同格式与 BGRA
+            // 两种 staging 都失败 = 该 src→dst 组合 VT 确认不支持。不计数的话
+            // 不支持的微型流(如 328x184 '18f0')会每帧白付 2 次 VT 失败调用
+            NSInteger fails = [_twoStepFailCountPool[poolKey] integerValue] + 1;
+            _twoStepFailCountPool[poolKey] = @(fails);
+            if (fails >= 2) {
+                _twoStepDisabledPool[poolKey] = @YES;
+                [self invalidateTwoStepSessionForKey:poolKey];
+                NSValue *stv = _twoStepStagingPool[poolKey];
+                if (stv) {
+                    CVPixelBufferRef b = (CVPixelBufferRef)[stv pointerValue];
+                    if (b) CVPixelBufferRelease(b);
+                    [_twoStepStagingPool removeObjectForKey:poolKey];
+                }
+                vcam_gpu_log([NSString stringWithFormat:@"[vcam] 2step stage1 CIRCUIT-BROKEN for stream %@ (err %d, keep camera)", poolKey, (int)st1]);
+            } else {
+                vcam_gpu_log([NSString stringWithFormat:@"[vcam] 2step stage1 failed: %d key=%@ (fail %ld)", (int)st1, poolKey, (long)fails]);
+            }
             return NO;
         }
         _twoStepTokenPool[poolKey] = @(token);

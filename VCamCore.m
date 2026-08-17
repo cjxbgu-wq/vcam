@@ -126,7 +126,13 @@ static void vcam_core_log(NSString *msg) {
 @property (nonatomic, assign) size_t fallbackHeight;
 // 同帧去重(对齐千面 _0x78/_0x70): 管线同一物理 buffer 连续经过多个消费者,
 // 第一次已改写, 后续直接跳过(不 retain, 仅指针比较)
+// 时间窗(2026-08-17 闪烁根治): 相机管线 IOSurface 池只有 3~6 个 buffer 循环
+// 轮转, 帧 N 用 buffer A 替换后帧 N+2 又轮到同一地址 → 裸指针比较误判"已替换"
+// 跳过 → 真实相机画面上屏 → 与替换帧稳定交替 = 用户看到的"替换/原画面闪烁"。
+// 千面 0xaed4 判定的是"同一帧时间窗内多消费者"(间隔 <1ms), 不是跨帧轮转
+// (≥16ms)。加 5ms 窗口区分两者。
 @property (nonatomic, assign) CVPixelBufferRef dedupLastBuffer;
+@property (nonatomic, assign) CFAbsoluteTime dedupLastTime;
 
 // ===== 性能优化(2026-08-15) =====
 // 进程标记: 只有 mediaserverd 真正解码/预渲染; SpringBoard 的 VCamCore 只做状态记录,
@@ -263,30 +269,24 @@ static void vcam_core_log(NSString *msg) {
     if (!pixelBuffer || !_enabled) return;
 
     // 同帧去重(对齐千面 0xaed4-0xaee8): 管线同一物理 buffer 连续经过多个消费者时,
-    // 第一次已就地改写, 后续消费者拿到的已是假帧数据, 直接跳过节省开销
-    if (_dedupLastBuffer == pixelBuffer) return;
+    // 第一次已就地改写, 后续消费者拿到的已是假帧数据, 直接跳过节省开销。
+    // 必须带 5ms 时间窗: 相机管线 buffer 池循环复用(3~6 个), 跨帧轮转回同一
+    // 地址(≥16ms 后)是"新相机帧", 跳过 = 真实画面上屏 → 与替换帧交替闪烁
+    if (_dedupLastBuffer == pixelBuffer &&
+        CFAbsoluteTimeGetCurrent() - _dedupLastTime < 0.005) return;
 
     OSType origFormat = CVPixelBufferGetPixelFormatType(pixelBuffer);
     size_t targetW = CVPixelBufferGetWidth(pixelBuffer);
     size_t targetH = CVPixelBufferGetHeight(pixelBuffer);
 
-    // 微型流跳过(2026-08-15, mediaserverd 存活关键): App 相机带人脸/场景分析小流
-    // (如 328x184 '18f0'), 替换它无视觉意义但每帧 VT 转换挤占 mediaserverd →
-    // AURemoteIO RPC 超时 → mediaserverd 被杀死循环。可见预览流(≥720p)不受影响
-    if (targetW * targetH < 640 * 480) {
-        // 跳过诊断(每 key 一次, 2026-08-16 跳动取证): 若用户报告"替换/真实画面
-        // 交替跳动", 该日志可确认是否有可见微型流(如抖音美颜链小流被送上屏)被跳过
-        static NSMutableSet *seenTinyStreams = nil;
-        if (!seenTinyStreams) seenTinyStreams = [NSMutableSet set];
-        NSString *tinyKey = [NSString stringWithFormat:@"%zu_%zu_%u", targetW, targetH, (unsigned)origFormat];
-        @synchronized(seenTinyStreams) {
-            if (![seenTinyStreams containsObject:tinyKey]) {
-                [seenTinyStreams addObject:tinyKey];
-                vcam_core_log([NSString stringWithFormat:@"[vcam] tiny stream skipped: %@ (flashes if visible)", tinyKey]);
-            }
-        }
-        return;
-    }
+    // 微型流也替换(2026-08-17 闪烁根治): 撤掉旧 <640x480 硬跳过 —— 扫码/网页/
+    // 社交 App 常用低分辨率档(如 480x360 Medium)做**可见**预览, 被跳过的流永远
+    // 显示真实相机; App 在高流(替换)与低流(跳过)间切换显示 = "替换/原画面闪烁",
+    // 且扫码页整个不被替换(用户实证反馈)。
+    // 旧担忧('18f0' 328x184 分析流 wakeups 风暴)已被两级熔断根治: stage1 失败
+    // 回退 BGRA 重试一次, stage1/stage2 连续失败 2 次永久熔断该流(不再有
+    // "失败→重建 session→再失败"循环)。微型流像素量小(≤0.2MP), 替换成本可忽略;
+    // CPU 兜底由 80/60 紧急档闭环降载负责。
 
     // 相机活跃心跳 + 空闲即时唤醒(2026-08-16 发热优化): 走到这里 = 有真实可见相机流,
     // 刷新心跳; 若管线处于空闲暂停态(相机关闭过)则同步恢复解码(常驻线程只翻标志, 零延迟),
@@ -486,6 +486,7 @@ static void vcam_core_log(NSString *msg) {
         _fallbackHeight = targetH;
         [_renderLock unlock];
         _dedupLastBuffer = pixelBuffer;
+        _dedupLastTime = CFAbsoluteTimeGetCurrent();
     } else if (diagThisFrame) {
         vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d FAILED write fmt=0x%x, keep camera", vcamRenderCount, (unsigned)origFormat]);
     }
@@ -541,6 +542,7 @@ static void vcam_core_log(NSString *msg) {
     _fallbackWidth = 0;
     _fallbackHeight = 0;
     _dedupLastBuffer = NULL;
+    _dedupLastTime = 0;
     [_renderLock unlock];
     vcam_core_log(@"[vcam] Replacement frame cleared, real camera restored");
 }
