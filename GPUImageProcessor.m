@@ -149,27 +149,16 @@ static void vcam_gpu_log(NSString *msg) {
 @property (nonatomic, assign) CFStringRef rotation180Value;
 @property (nonatomic, assign) CFStringRef flipHorizontalKey;
 
-// 预渲染旋转输出 3 槽轮转 buffer(仅预渲染线程访问):
+// 预渲染几何输出 3 槽轮转 buffer(仅预渲染线程访问, 旋转与 mirror-only 镜像共用):
 // 旋转若每帧 CVPixelBufferCreate ~3MB(1080p 420f) = 30fps 下 90MB/s 分配释放,
 // malloc 压力 + 内存碎片 → 卡顿/不稳。live 缓存 + render fallback + in-flight
-// transfer 最多同时持有 2 帧旧输出, 3 槽轮转保证写入槽不被任何读者持有
+// transfer 最多同时持有 2 帧旧输出, 3 槽轮转保证写入槽不被任何读者持有。
+// 独立镜像池已删(2026-08-18 砍常驻内存): mirror-only 借本槽 copy+原地反转,
+// 省 3 帧常驻(720p 420f ~4MB / BGRA ~11MB), 对齐千面 footprint 水平
 @property (nonatomic, assign) CVPixelBufferRef prerenderRotatePool0;
 @property (nonatomic, assign) CVPixelBufferRef prerenderRotatePool1;
 @property (nonatomic, assign) CVPixelBufferRef prerenderRotatePool2;
 @property (nonatomic, assign) int prerenderRotateSlot;
-// 镜像专用 buffer(mirror-only 场景: 无旋转时需先复制到自有 buffer 再原地行反转,
-// 解码器输出的 buffer 不可写)。预渲染线程独占, 按尺寸+格式缓存
-// 闪烁修复(2026-08-17): 单 buffer 复用撕裂 —— 产出的帧进 _liveYUVPixelBuffer 后
-// render 线程仍在读取转换, 而预渲染下一拍已开始 copy+反转同一块内存 → 半新半旧
-// 画面交替("闪烁切割")。对齐旋转池改 3 槽轮转: live缓存+fallback+in-flight transfer
-// 最多同时持有 2 帧旧输出, 写入槽永远不被任何读者持有
-@property (nonatomic, assign) CVPixelBufferRef prerenderMirrorPool0;
-@property (nonatomic, assign) CVPixelBufferRef prerenderMirrorPool1;
-@property (nonatomic, assign) CVPixelBufferRef prerenderMirrorPool2;
-@property (nonatomic, assign) int prerenderMirrorSlot;
-@property (nonatomic, assign) size_t prerenderMirrorW;
-@property (nonatomic, assign) size_t prerenderMirrorH;
-@property (nonatomic, assign) OSType prerenderMirrorFmt;
 
 // CIContext（软件渲染，mediaserverd 没有 GPU 上下文）
 // 两个独立 CIContext: 预渲染线程用 preprocessContext, render 线程回退用 renderContext（CIContext 非线程安全）
@@ -372,9 +361,6 @@ static void vcam_gpu_log(NSString *msg) {
         if (b) CVPixelBufferRelease(b);
         [self setPrerenderRotateBuffer:NULL atSlot:i];
     }
-    if (_prerenderMirrorPool0) { CVPixelBufferRelease(_prerenderMirrorPool0); _prerenderMirrorPool0 = NULL; }
-    if (_prerenderMirrorPool1) { CVPixelBufferRelease(_prerenderMirrorPool1); _prerenderMirrorPool1 = NULL; }
-    if (_prerenderMirrorPool2) { CVPixelBufferRelease(_prerenderMirrorPool2); _prerenderMirrorPool2 = NULL; }
     // 释放所有缓冲池
     for (id key in _bgraBufferPoolMap) {
         CVPixelBufferPoolRef pool = (__bridge CVPixelBufferPoolRef)_bgraBufferPoolMap[key];
@@ -881,7 +867,10 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
             if (cst != noErr || !dst) {
                 [self setPrerenderRotateBuffer:NULL atSlot:slot];
             } else {
-                [self setPrerenderRotateBuffer:CVPixelBufferRetain(dst) atSlot:slot];
+                // 所有权转移给池(2026-08-18 泄漏修复): 旧代码 Retain(dst) 使 create 的
+                // 名义引用永不释放 → 每次尺寸重建(转按钮/前后摄切换)泄漏一整帧 buffer,
+                // idle releaseHeavyBuffersForIdle 时槽 buffer 也因多 1 引用不真正释放
+                [self setPrerenderRotateBuffer:dst atSlot:slot];
             }
         }
         if (dst) {
@@ -912,28 +901,25 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
         vcamMirrorRowsInPlace(work);
         return work;
     }
-    // mirror-only: 复制到自有 buffer 再反转(不动解码器 buffer)
-    // 闪烁修复(2026-08-17): 3 槽轮转(原单 buffer 会被 render 线程并发读取撕裂)
-    int mslot = _prerenderMirrorSlot;
-    _prerenderMirrorSlot = (mslot + 1) % 3;
-    CVPixelBufferRef mb = NULL;
-    if (mslot == 0) mb = _prerenderMirrorPool0;
-    else if (mslot == 1) mb = _prerenderMirrorPool1;
-    else mb = _prerenderMirrorPool2;
-    if (!mb || _prerenderMirrorW != inW || _prerenderMirrorH != inH ||
-        _prerenderMirrorFmt != fmt) {
+    // mirror-only: 复制到几何槽再反转(不动解码器 buffer)
+    // 闪烁防护(2026-08-17): 3 槽轮转(单 buffer 会被 render 线程并发读取撕裂)。
+    // 独立镜像池已删(2026-08-18 砍常驻内存): 与旋转共用几何 3 槽 ——
+    // live缓存+fallback+in-flight transfer 最多持有 2 帧旧输出, 写入槽永不被读者持有。
+    // mirror-only 时槽尺寸=源尺寸(inW×inH), 用户切换旋转模式时按需重建一次
+    int mslot = _prerenderRotateSlot;
+    _prerenderRotateSlot = (mslot + 1) % 3;
+    CVPixelBufferRef mb = [self prerenderRotateBufferAtSlot:mslot];
+    if (!mb || CVPixelBufferGetWidth(mb) != inW || CVPixelBufferGetHeight(mb) != inH ||
+        CVPixelBufferGetPixelFormatType(mb) != fmt) {
         if (mb) CVPixelBufferRelease(mb);
         mb = NULL;
         CVPixelBufferRef created = NULL;
         if (CVPixelBufferCreate(kCFAllocatorDefault, inW, inH, fmt, NULL, &created) == noErr && created) {
-            mb = created;  // 槽持有
-            _prerenderMirrorW = inW;
-            _prerenderMirrorH = inH;
-            _prerenderMirrorFmt = fmt;
+            [self setPrerenderRotateBuffer:created atSlot:mslot];  // 所有权转移给池
+            mb = created;
+        } else {
+            [self setPrerenderRotateBuffer:NULL atSlot:mslot];
         }
-        if (mslot == 0) _prerenderMirrorPool0 = mb;
-        else if (mslot == 1) _prerenderMirrorPool1 = mb;
-        else _prerenderMirrorPool2 = mb;
     }
     if (mb && vcamCopyPlanes(work, mb)) {
         vcamMirrorRowsInPlace(mb);
@@ -1328,7 +1314,9 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
 // 熔断标记(twoStepDisabledPool)保留: 熔断语义是永久的, 淘汰后重试已确认
 // 不支持的组合会复发 wakeups 风暴。持锁中的 NSLock 淘汰安全: 持有线程栈上
 // 有强引用, unlock 释放后才可能 dealloc
-static const NSUInteger kVcamMaxStreamKeys = 12;
+// 12→6(2026-08-18 砍常驻内存): 实测活跃可见流 ≤6(预览+照片+录像×前后摄),
+// per-key staging 是常驻大头, 千面无 per-key 池也不黑屏; 超出即最旧淘汰
+static const NSUInteger kVcamMaxStreamKeys = 6;
 
 // 单 key 资源释放体(2026-08-17 提取共用): 调用方必须已持 @synchronized(self)。
 // LRU 超限淘汰与空闲全量清空(releaseIdleMemory)共用。
@@ -1508,9 +1496,6 @@ static const NSUInteger kVcamMaxStreamKeys = 12;
                 released++;
             }
         }
-        if (_prerenderMirrorPool0) { CVPixelBufferRelease(_prerenderMirrorPool0); _prerenderMirrorPool0 = NULL; released++; }
-        if (_prerenderMirrorPool1) { CVPixelBufferRelease(_prerenderMirrorPool1); _prerenderMirrorPool1 = NULL; released++; }
-        if (_prerenderMirrorPool2) { CVPixelBufferRelease(_prerenderMirrorPool2); _prerenderMirrorPool2 = NULL; released++; }
         for (id key in _bgraBufferPoolMap) {
             CVPixelBufferPoolRelease((__bridge CVPixelBufferPoolRef)_bgraBufferPoolMap[key]);
             released++;
