@@ -160,6 +160,10 @@ static void vcam_core_log(NSString *msg) {
 // render 心跳恢复时按 _idleResumePath 异步重载(期间渲染冻结快照帧不黑屏)
 @property (nonatomic, assign) BOOL idleUnloaded;
 @property (nonatomic, copy) NSString *idleResumePath;
+// 恢复保持(2026-08-19 卡顿修复): 恢复重载后 5s 内不许再次 idle 卸载 ——
+// 扫码页帧间歇突发(2-3s 一拨)曾造成 4s 内 4 轮卸载/重载抖动, 每轮重建
+// reader+预填都是 CPU 尖峰且画面反复冻在旧帧
+@property (nonatomic, assign) CFAbsoluteTime lastIdleResumeTime;
 // CPU 闭环降载(2026-08-16): 进程 CPU 接近 daemon 50% 红线时置 YES ——
 // 解码/预渲染节拍降为 1/3(替换内容 ~10fps 更新, 连续无感), 冻结帧走 staging 复用
 @property (nonatomic, assign) BOOL lowPowerDecode;
@@ -313,8 +317,9 @@ static void vcam_core_log(NSString *msg) {
         // 执行会阻塞相机管线 0.5-2s → mediaserverd watchdog 杀进程(设备实证:
         // 恢复重载后 6s 被杀)。冻结帧机制保证加载期间画面连续
         if (self->_idleUnloaded) {
-            self->_idleUnloaded = NO;
-            NSString *resumePath = self->_idleResumePath;
+                self->_idleUnloaded = NO;
+                self->_lastIdleResumeTime = CFAbsoluteTimeGetCurrent();  // 恢复保持窗口起算(2026-08-19)
+                NSString *resumePath = self->_idleResumePath;
             if (resumePath.length > 0) {
                 VCamCore *core = self;
                 dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
@@ -970,7 +975,8 @@ static void vcam_core_log(NSString *msg) {
         // 压回线下; 恢复时冻结快照帧顶住 + 异步重载(~几百 ms)无缝跟上
         if (strongSelf.isMediaserverdProcess && strongSelf.enabled && !strongSelf.pipelineIdle &&
             strongSelf->_lastRenderActivity > 0 &&
-            (CFAbsoluteTimeGetCurrent() - strongSelf->_lastRenderActivity) > 2.0) {
+            (CFAbsoluteTimeGetCurrent() - strongSelf->_lastRenderActivity) > 2.0 &&
+            (CFAbsoluteTimeGetCurrent() - strongSelf->_lastIdleResumeTime) > 5.0) {  // 恢复保持(2026-08-19): 恢复重载后 5s 内不重复卸载
             strongSelf->_pipelineIdle = YES;
             [strongSelf->_videoPlayer stopDecodingThread];
             strongSelf->_idleResumePath = [strongSelf->_videoPlayer currentVideoPath];
@@ -1099,6 +1105,7 @@ static void vcam_core_log(NSString *msg) {
         if (restartToken != lastRestartToken) {
             if (lastRestartToken >= 0 && strongSelf.enabled && strongSelf.videoPlayer.currentVideoPath.length > 0) {
                 vcam_core_log(@"[vcam] restart token bumped, replay from beginning");
+                [strongSelf.videoPlayer resetPlaybackPosition];  // 清续播位置, 真从头播(2026-08-19)
                 // 异步重载(同步加载阻塞轮询线程 → watchdog 崩溃)
                 NSString *replayPath = [strongSelf.videoPlayer.currentVideoPath copy];
                 __weak typeof(strongSelf) wSelf = strongSelf;
