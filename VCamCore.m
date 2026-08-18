@@ -169,6 +169,8 @@ static void vcam_core_log(NSString *msg) {
 // (≥16ms)。加 5ms 窗口区分两者。
 @property (nonatomic, assign) CVPixelBufferRef dedupLastBuffer;
 @property (nonatomic, assign) CFAbsoluteTime dedupLastTime;
+// 去重 v2(2026-08-19 IOFence 死锁根治): 最近一次渲染的相机帧 PTS(与指针联合判定)
+@property (nonatomic, assign) double dedupLastPts;
 // 快照最近一次推进时的相机帧 PTS(2026-08-17 卡顿修复): 相机帧边界判定
 @property (nonatomic, assign) double lastAdvancePts;
 
@@ -318,12 +320,38 @@ static void vcam_core_log(NSString *msg) {
 - (void)renderReplacementToPixelBuffer:(CVPixelBufferRef)pixelBuffer pts:(double)pts {
     if (!pixelBuffer || !_enabled) return;
 
-    // 同帧去重(对齐千面 0xaed4-0xaee8): 管线同一物理 buffer 连续经过多个消费者时,
-    // 第一次已就地改写, 后续消费者拿到的已是假帧数据, 直接跳过节省开销。
-    // 必须带 5ms 时间窗: 相机管线 buffer 池循环复用(3~6 个), 跨帧轮转回同一
-    // 地址(≥16ms 后)是"新相机帧", 跳过 = 真实画面上屏 → 与替换帧交替闪烁
-    if (_dedupLastBuffer == pixelBuffer &&
-        CFAbsoluteTimeGetCurrent() - _dedupLastTime < 0.005) return;
+    // 同帧去重 v2(2026-08-19 IOFence GPU 死锁根治): 指针 + PTS 双重判定, 检查与
+    // 登记同锁原子完成。旧"指针+5ms 窗"两个缺陷(设备实证 00:00:13 gpuEvent
+    // "blocked by IOFence": 3 个同调用栈 GPU 等待者挤在同一 surface 上):
+    //   1) 无锁竞态: emit/scaler/encoder 三个 hook 在不同 Apple 队列线程并发消费
+    //      同一物理相机帧, 双双通过旧检查 → 同一相机 IOSurface 上并发排入多个
+    //      VT GPU 写 + 下游节点同时持 fence → fence 互等死锁 → GPU 固件重启 →
+    //      画面冻结后黑屏(msd 不死, 替/原无效, 只有重开相机/重启恢复)。
+    //   2) 5ms 窗误放行: 慢消费者(>5ms 后到)对已被相机池回收的 surface 补写旧帧,
+    //      与新帧的 ISP/GPU 处理撞车。
+    // PTS 判定: 同一物理帧跨节点(emit/scaler/encoder)PTS 恒等 → 同指针+同 PTS =
+    // 重复消费, 跳过; 池轮转回同指针但 PTS 已新 = 新帧, 渲染; 多流各自 buffer
+    // 同 PTS = 各自渲染(指针不同, 不受影响)。PTS 不可用(=0 旧调用方)回退旧
+    // 指针+5ms 窗。入口即占位登记: 并发第二个消费者必然看到 dup 跳过 ——
+    // 同一 surface 任一时刻至多一个在飞的 VT GPU 写(fence 单向, 无环)。
+    {
+        static NSLock *dedupLock;
+        static dispatch_once_t onceTok;
+        dispatch_once(&onceTok, ^{ dedupLock = [[NSLock alloc] init]; });
+        [dedupLock lock];
+        CFAbsoluteTime nowDedup = CFAbsoluteTimeGetCurrent();
+        BOOL samePtr = (self->_dedupLastBuffer == pixelBuffer);
+        // 同指针 + (同 PTS 或 5ms 内) = 重复消费: PTS 抓慢消费者(同帧跨节点 PTS
+        // 恒等, 无时间上限), 5ms 窗兜底同帧异 PTS 的节点实现; 池轮转新帧 PTS
+        // 必新且距上次 ≥16ms → 两信号都放行, 必渲染
+        BOOL dup = samePtr && ((pts > 0 && self->_dedupLastPts == pts) ||
+                               (nowDedup - self->_dedupLastTime < 0.005));
+        if (pts > 0) self->_dedupLastPts = pts;
+        self->_dedupLastBuffer = pixelBuffer;  // 占位: 并发后来者必 dup
+        self->_dedupLastTime = nowDedup;
+        [dedupLock unlock];
+        if (dup) return;
+    }
 
     OSType origFormat = CVPixelBufferGetPixelFormatType(pixelBuffer);
     size_t targetW = CVPixelBufferGetWidth(pixelBuffer);
@@ -660,6 +688,7 @@ static void vcam_core_log(NSString *msg) {
     _fallbackHeight = 0;
     _dedupLastBuffer = NULL;
     _dedupLastTime = 0;
+    _dedupLastPts = 0;
     _lastAdvancePts = 0;
     [_renderLock unlock];
     vcam_core_log(@"[vcam] Replacement frame cleared, real camera restored");
