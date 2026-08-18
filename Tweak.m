@@ -62,9 +62,13 @@ static BOOL vcam_log_enabled(void) {
     return cached == 1;
 }
 
+// 日志全局限速令牌桶(定义在 VCamCore.m, 全进程共享磁盘写入预算 —— 磁盘配额击杀根治)
+extern BOOL vcam_log_budget_take(void);
+
 static volatile int32_t vcamTweakLogCount = 0;
 static void vcam_tweak_log(NSString *msg) {
     if (!vcam_log_enabled()) return;
+    if (!vcam_log_budget_take()) return;
     int32_t n = __sync_add_and_fetch(&vcamTweakLogCount, 1);
     if (n > 2000) return;  // 限制日志量(still 诊断需要更大预算)
     @try {
@@ -231,6 +235,7 @@ static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBuffer
     }
     // 逆向逻辑: 只替换 mediaType=='vide' 的帧, 过滤音频/元数据(避免无效处理 + 录像流被漏掉)
     if (sampleBuffer) {
+     @autoreleasepool {   // 卡顿保险(2026-08-19): Apple 相机线程可能无 pool, 防 autorelease 积压
         // [self mediaType] 返回 CMMediaType (FourCC uint32), 'vide' = kCMMediaType_Video
         @try {
             SEL mediaTypeSel = sel_registerName("mediaType");
@@ -277,6 +282,7 @@ static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBuffer
                 vcam_tweak_log([NSString stringWithFormat:@"[vcam] emitSampleBuffer hook exception: %@", e]);
             }
         }
+     }  // autoreleasepool
     }
     // 调用原始方法(发射已掉包的 sample buffer)
     if (orig_BWNodeOutput_emitSampleBuffer) {
@@ -288,6 +294,7 @@ static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBuffer
 // 照片缩放 —— 拍照时的照片缩放处理
 static void hook_BWStillImageScalerNode_renderSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input) {
     if (sampleBuffer) {
+     @autoreleasepool {   // 卡顿保险(2026-08-19): Apple 相机线程可能无 pool, 防 autorelease 积压周期性结算停顿
         CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
         if (pixelBuffer) {
             // 到达诊断(替换前): 若此处像素已亮于 emit 时写入值, 增益发生在 emit→scaler 段
@@ -311,6 +318,7 @@ static void hook_BWStillImageScalerNode_renderSampleBuffer(id self, SEL _cmd, CM
                 vcam_tweak_log([NSString stringWithFormat:@"[vcam] ScalerNode hook exception: %@", e]);
             }
         }
+     }  // autoreleasepool
     }
     if (orig_BWStillImageScalerNode_renderSampleBuffer) {
         orig_BWStillImageScalerNode_renderSampleBuffer(self, _cmd, sampleBuffer, input);
@@ -321,6 +329,7 @@ static void hook_BWStillImageScalerNode_renderSampleBuffer(id self, SEL _cmd, CM
 // 照片编码 —— 保存的照片经过这里
 static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sampleBuffer, id input) {
     if (sampleBuffer) {
+     @autoreleasepool {   // 卡顿保险: 同 Hook2
         CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
         if (pixelBuffer) {
             // 到达诊断(替换前): 若此处正常而最终照片过曝, 增益发生在编码器内部(元数据剥离是唯一机会)
@@ -337,6 +346,7 @@ static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self, SEL _cmd, CMSamp
                 vcam_tweak_log([NSString stringWithFormat:@"[vcam] PhotoEncoder hook exception: %@", e]);
             }
         }
+     }  // autoreleasepool
     }
     if (orig_BWPhotoEncoderNode_renderSampleBuffer) {
         orig_BWPhotoEncoderNode_renderSampleBuffer(self, _cmd, sampleBuffer, input);
