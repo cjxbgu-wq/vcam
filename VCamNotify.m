@@ -26,8 +26,12 @@ static BOOL vcam_log_enabled(void) {
     return cached == 1;
 }
 
+// 日志全局限速令牌桶(定义在 VCamCore.m, 全进程共享磁盘写入预算 —— 磁盘配额击杀根治)
+extern BOOL vcam_log_budget_take(void);
+
 static void vcam_notify_log(NSString *msg) {
     if (!vcam_log_enabled()) return;
+    if (!vcam_log_budget_take()) return;
     @try {
         NSString *logPath = @"/tmp/vcam_notify_log.txt";
         NSString *ts = [NSDate date].description;
