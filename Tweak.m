@@ -47,13 +47,17 @@ static void MSHookMessageEx(Class cls, SEL sel, IMP newImp, IMP *origPtr) {
 
 // 文件日志（mediaserverd 中 NSLog 不可见）
 // 日志总开关(2026-08-16, diskwrites 崩溃循环止血): 默认静默, vc.plist "logEnabled=YES" 打开
+// 修复(2026-08-18 日志全静默 bug): 旧版首次读失败(dylib 加载早期 pathhook 未装好,
+// mediaserverd 沙盒读不到 plist → nil)就永久缓存 0 → 整个进程生命周期日志关闭,
+// 黑屏被杀时无法取证。改为: 读不到文件不缓存下次重试 + 双路径兼容。
 static BOOL vcam_log_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         @try {
             NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Media/DCIM/vc.plist"];
-            cached = (d && d[@"logEnabled"]) ? [d[@"logEnabled"] boolValue] : 0;
-        } @catch (NSException *e) { cached = 0; }
+            if (!d) d = [NSDictionary dictionaryWithContentsOfFile:@"/rootfs/private/var/mobile/Media/DCIM/vc.plist"];
+            if (d) cached = d[@"logEnabled"] ? [d[@"logEnabled"] boolValue] : 0;
+        } @catch (NSException *e) {}
     }
     return cached == 1;
 }
