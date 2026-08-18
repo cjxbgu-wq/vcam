@@ -26,8 +26,9 @@ static BOOL vcam_log_enabled(void) {
     if (cached < 0) {
         @try {
             NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Media/DCIM/vc.plist"];
-            cached = (d && d[@"logEnabled"]) ? [d[@"logEnabled"] boolValue] : 0;
-        } @catch (NSException *e) { cached = 0; }
+            if (!d) d = [NSDictionary dictionaryWithContentsOfFile:@"/rootfs/private/var/mobile/Media/DCIM/vc.plist"];
+            if (d) cached = d[@"logEnabled"] ? [d[@"logEnabled"] boolValue] : 0;
+        } @catch (NSException *e) {}
     }
     return cached == 1;
 }
