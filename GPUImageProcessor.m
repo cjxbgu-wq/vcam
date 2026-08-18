@@ -72,10 +72,13 @@ static void vcam_gpu_log(NSString *msg) {
 @property (nonatomic, strong) NSLock *laneLockYUV;         // 420f/420v/p420 车道锁
 @property (nonatomic, strong) NSLock *laneLockPrivate;     // 私有格式两步法车道锁(含 s1)
 @property (nonatomic, assign) VTPixelTransferSessionRef twoStepS1Session;  // 420f→BGRA 专用(与 prerender session 隔离)
-@property (nonatomic, assign) CVPixelBufferRef laneStaging;     // 两步法唯一中转(grow-only, BGRA)
-@property (nonatomic, assign) size_t laneStagingW;
-@property (nonatomic, assign) size_t laneStagingH;
-@property (nonatomic, assign) uint64_t laneLastToken;      // staging 内容帧代数(同帧多消费者 s1 免单)
+// staging 按源尺寸缓存(2026-08-19 交替重建风暴修复): 源帧最多 2 种尺寸
+// (原始 720x538 与 CCW90 旋转后 538x720 并存), 旧 grow-only 单 staging 在两种
+// 尺寸间互相触发重建 → 每帧 12MB 创建/释放风暴 → 相机线程卡死 → msd 被杀
+// (设备实证: 同秒 "Lane staging built" 交替 20 次)。按源尺寸 key 缓存(上限 4),
+// 每尺寸建一次后零重建。key = w*100000+h(NSNumber), token 同步 per-key。
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSValue *> *laneStagingMap;   // srcSizeKey -> buffer
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *laneTokenMap;    // srcSizeKey -> staging 内容 token
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *laneFailCounts;   // 格式 fourcc → 连续失败
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *laneDisabled;     // 格式 fourcc → 熔断标记
 // 私有格式两步法中转: 已迁移到下方 per-key 池(2026-08-15), 旧单例字段移除
@@ -261,10 +264,8 @@ static void vcam_gpu_log(NSString *msg) {
         _laneLockYUV = [[NSLock alloc] init];
         _laneLockPrivate = [[NSLock alloc] init];
         _twoStepS1Session = NULL;
-        _laneStaging = NULL;
-        _laneStagingW = 0;
-        _laneStagingH = 0;
-        _laneLastToken = 0;
+        _laneStagingMap = [NSMutableDictionary dictionary];
+        _laneTokenMap = [NSMutableDictionary dictionary];
         _laneFailCounts = [NSMutableDictionary dictionary];
         _laneDisabled = [NSMutableDictionary dictionary];
 
@@ -326,14 +327,14 @@ static void vcam_gpu_log(NSString *msg) {
         InvalidateFunc invalidate = (InvalidateFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionInvalidate");
         if (invalidate) invalidate(_privateTransferSession);
     }
-    // 千面车道(2026-08-19): s1 会话 + 唯一中转
+    // 千面车道(2026-08-19): s1 会话 + 中转 map
     if (_twoStepS1Session) {
         InvalidateFunc invalidate = (InvalidateFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionInvalidate");
         if (invalidate) invalidate(_twoStepS1Session);
     }
-    if (_laneStaging) {
-        CVPixelBufferRelease(_laneStaging);
-        _laneStaging = NULL;
+    for (NSValue *v in _laneStagingMap.allValues) {
+        CVPixelBufferRef b = (CVPixelBufferRef)[v pointerValue];
+        if (b) CVPixelBufferRelease(b);
     }
     // 释放两步法池(per-key session + staging buffer)
     {
@@ -1255,40 +1256,45 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
                 vcam_gpu_log(@"[vcam] Lane S2(private) session created (Trim)");
             }
         }
-        // staging grow-only: 源是解码输出(尺寸恒定), 通常进程内只建一次;
-        // 换更大分辨率源时原地重建(锁内, 无读者)
-        if (!_laneStaging || _laneStagingW < srcW || _laneStagingH < srcH) {
+        // staging 按源尺寸缓存(2026-08-19 交替重建风暴修复): 源有 2 种尺寸并存
+        // (原始/CCW90 旋转后), 每尺寸一条, 建后零重建; 上限 4 条防极端场景
+        NSNumber *skey = @((long long)srcW * 100000ll + (long long)srcH);
+        CVPixelBufferRef staging = NULL;
+        {
+            NSValue *sv = _laneStagingMap[skey];
+            if (sv) staging = (CVPixelBufferRef)[sv pointerValue];
+        }
+        if (!staging && _laneStagingMap.count < 4) {
             CVPixelBufferRef nb = NULL;
             if (CVPixelBufferCreate(kCFAllocatorDefault, srcW, srcH,
                                     kCVPixelFormatType_32BGRA, NULL, &nb) == noErr && nb) {
-                if (_laneStaging) CVPixelBufferRelease(_laneStaging);
-                _laneStaging = nb;
-                _laneStagingW = srcW;
-                _laneStagingH = srcH;
-                _laneLastToken = 0;  // 内容失效
-                vcam_gpu_log([NSString stringWithFormat:@"[vcam] Lane staging built %zux%zu", srcW, srcH]);
+                staging = nb;  // 所有权归池
+                _laneStagingMap[skey] = [NSValue valueWithPointer:nb];
+                _laneTokenMap[skey] = @0;
+                vcam_gpu_log([NSString stringWithFormat:@"[vcam] Lane staging built %zux%zu (map %lu)", srcW, srcH, (unsigned long)_laneStagingMap.count]);
             }
         }
 
         BOOL ok = NO;
-        if (_twoStepS1Session && _privateTransferSession && _laneStaging) {
+        if (_twoStepS1Session && _privateTransferSession && staging) {
             // s1: token 复用(同帧多消费者/CPU 冻结 token → 跳过缩放只付 s2)
-            if (token != 0 && _laneLastToken == token) {
+            uint64_t stTok = [_laneTokenMap[skey] unsignedLongLongValue];
+            if (token != 0 && stTok == token) {
                 ok = YES;  // staging 内容已是本帧
             } else {
-                OSStatus st1 = VTPixelTransferSessionTransferImage(_twoStepS1Session, src, _laneStaging);
+                OSStatus st1 = VTPixelTransferSessionTransferImage(_twoStepS1Session, src, staging);
                 if (st1 == noErr) {
-                    _laneLastToken = token;  // token=0 也记(下帧若带 token 不匹配自然重付)
+                    _laneTokenMap[skey] = @(token);  // token=0 也记(下帧不匹配自然重付)
                     ok = YES;
                 } else {
-                    _laneLastToken = 0;  // staging 内容不可信
+                    _laneTokenMap[skey] = @0;  // staging 内容不可信
                     vcam_gpu_log([NSString stringWithFormat:@"[vcam] lane s1 failed (%d)", (int)st1]);
                 }
             }
             // s2: BGRA staging → 私有目标(逐流尺寸/格式不同, VT 内部处理)
             if (ok) {
                 CFAbsoluteTime t2 = CFAbsoluteTimeGetCurrent();
-                OSStatus st2 = VTPixelTransferSessionTransferImage(_privateTransferSession, _laneStaging, dst);
+                OSStatus st2 = VTPixelTransferSessionTransferImage(_privateTransferSession, staging, dst);
                 [self noteStageTiming:poolKey stage:2 ms:(CFAbsoluteTimeGetCurrent() - t2) * 1000.0];
                 if (st2 != noErr) ok = NO;
             }
@@ -1566,14 +1572,12 @@ static const NSUInteger kVcamMaxStreamKeys = 6;
     }
     // 千面车道中转释放(2026-08-19): 深度空闲时归还内存, 恢复首帧锁内重建(一次性)
     [_laneLockPrivate lock];
-    if (_laneStaging) {
-        CVPixelBufferRelease(_laneStaging);
-        _laneStaging = NULL;
-        _laneStagingW = 0;
-        _laneStagingH = 0;
-        _laneLastToken = 0;
-        released++;
+    for (NSValue *v in _laneStagingMap.allValues) {
+        CVPixelBufferRef b = (CVPixelBufferRef)[v pointerValue];
+        if (b) { CVPixelBufferRelease(b); released++; }
     }
+    [_laneStagingMap removeAllObjects];
+    [_laneTokenMap removeAllObjects];
     [_laneLockPrivate unlock];
     vcam_gpu_log([NSString stringWithFormat:@"[vcam] idle heavy buffers released: %lu entries (jetsam guard)", (unsigned long)released]);
 }
