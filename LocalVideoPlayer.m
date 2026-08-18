@@ -92,6 +92,8 @@ static void vcam_player_log(NSString *msg) {
 @property (nonatomic, assign) volatile int64_t requestedLoadGen;
 @property (nonatomic, assign) volatile int64_t appliedLoadGen;
 @property (nonatomic, copy) NSString *pendingPath;
+// 空闲卸载请求(2026-08-18): 代数变化时优先于 rebuild —— 解码线程释放媒体管线
+@property (nonatomic, assign) volatile BOOL pendingUnload;
 
 // 解码线程控制
 @property (nonatomic, assign) BOOL shouldDecode;
@@ -536,6 +538,34 @@ static size_t vcam_decode_max_edge(void) {
     vcam_player_log(@"[vcam] Decoding paused (thread persistent)");
 }
 
+// 空闲卸载(2026-08-18 云闪付崩溃循环): 投递卸载代数, reader/asset/track 的
+// 释放由解码线程在检测代数变化时执行(单线程持有约定, 无 use-after-free);
+// 帧队列即时清(内部有锁)。currentVideoPath 保留供恢复重载。
+- (void)unloadForIdle {
+    _pendingUnload = YES;
+    __sync_add_and_fetch(&_requestedLoadGen, 1);
+    [self clearFrameQueue];
+    vcam_player_log(@"[vcam] Idle unload requested (jetsam guard)");
+}
+
+// 解码线程内释放媒体管线(reader/output/asset/track, 同线程安全)
+- (void)releaseMediaOnDecodeThread {
+    if (_assetReader) {
+        [_assetReader cancelReading];
+        _assetReader = nil;
+    }
+    _videoOutput = nil;
+    _urlAsset = nil;
+    _videoTrack = nil;
+    _reusableTrack = nil;
+    [self clearFrameQueue];
+    if (_cachedImageBuffer) {
+        CVPixelBufferRelease(_cachedImageBuffer);
+        _cachedImageBuffer = NULL;
+    }
+    vcam_player_log(@"[vcam] Media pipeline released on decode thread (idle unload)");
+}
+
 - (void)decodeLoop {
     @autoreleasepool {
         // 绝对时间节拍器(与预渲染线程一致): nextTick += interval 累计节拍,
@@ -544,7 +574,17 @@ static size_t vcam_decode_max_edge(void) {
         while (YES) {
             @autoreleasepool {
                 if (!_shouldDecode) {
-                    // disable: 空转等待(常驻线程约定, 不退出)
+                    // disable: 空转等待(常驻线程约定, 不退出)。
+                    // 空转时也要处理代数(2026-08-18 idle unload 修复): unloadForIdle
+                    // 投递的代数变化若只在 shouldDecode=YES 分支检测, 暂停态永远
+                    // 不应用 → 媒体管线不释放 → jetsam 崩溃循环照旧
+                    if (_requestedLoadGen != _appliedLoadGen) {
+                        _appliedLoadGen = _requestedLoadGen;
+                        if (_pendingUnload) {
+                            _pendingUnload = NO;
+                            [self releaseMediaOnDecodeThread];
+                        }
+                    }
                     [NSThread sleepForTimeInterval:0.1];
                     continue;
                 }
@@ -554,6 +594,12 @@ static size_t vcam_decode_max_edge(void) {
                 // 外部线程只投递代数, 消除切源/重播/enable 时的 use-after-free)
                 if (_requestedLoadGen != _appliedLoadGen) {
                     _appliedLoadGen = _requestedLoadGen;
+                    // 空闲卸载优先(2026-08-18): 释放媒体管线后本循环空转等待恢复
+                    if (_pendingUnload) {
+                        _pendingUnload = NO;
+                        [self releaseMediaOnDecodeThread];
+                        continue;
+                    }
                     if (_mediaType == VCamMediaTypeVideo) {
                         [self rebuildReaderOnDecodeThread];
                     }
