@@ -94,6 +94,12 @@ static void vcam_player_log(NSString *msg) {
 @property (nonatomic, copy) NSString *pendingPath;
 // 空闲卸载请求(2026-08-18): 代数变化时优先于 rebuild —— 解码线程释放媒体管线
 @property (nonatomic, assign) volatile BOOL pendingUnload;
+// 空闲恢复续播(2026-08-19 卡顿修复): idle 卸载前记下最后解码 PTS, 恢复 rebuild
+// 时用 timeRange 从该位置继续 —— 旧逻辑每轮重载都从第 0 帧重播, 扫码页帧间歇
+// 突发(2s+ 间隙反复卸载/重载)时画面永远冻在视频开头"卡住很久才开始播"。
+// 显式重播/换源时置 0(从头播)。
+@property (nonatomic, assign) double lastDecodedPosSec;
+@property (nonatomic, assign) double resumeAtSeconds;
 
 // 解码线程控制
 @property (nonatomic, assign) BOOL shouldDecode;
@@ -233,6 +239,8 @@ static size_t vcam_decode_max_edge(void) {
         _reusableAsset = [AVURLAsset URLAssetWithURL:url options:opts];
         _reusableTrack = nil;
         _assetPath = [path copy];
+        _resumeAtSeconds = 0;   // 换源从头播(2026-08-19)
+        _lastDecodedPosSec = 0;
         vcam_player_log([NSString stringWithFormat:@"[vcam] New AVURLAsset created for %@", path]);
     }
     _urlAsset = _reusableAsset;
@@ -341,6 +349,17 @@ static size_t vcam_decode_max_edge(void) {
         return;
     }
     [_assetReader addOutput:_videoOutput];
+
+    // 空闲恢复续播(2026-08-19): 从 idle 卸载前记下的 PTS 继续, 不从第 0 帧重播。
+    // 位置有效才 seek; 临近结尾/无效则从头(自然进入循环)。seek 后 PTS 校准状态
+    // 保留(PTS 单调, 不影响 effectiveFps 的间隔采样)。
+    if (_resumeAtSeconds > 0.05 && _videoDuration > 0.3 &&
+        _resumeAtSeconds < _videoDuration - 0.15) {
+        CMTime start = CMTimeMakeWithSeconds(_resumeAtSeconds, 600);
+        _assetReader.timeRange = CMTimeRangeFromTimeToTime(start, _urlAsset.duration);
+        vcam_player_log([NSString stringWithFormat:@"[vcam] Reader seek to %.2fs for idle resume (duration %.1fs)", _resumeAtSeconds, _videoDuration]);
+    }
+    _resumeAtSeconds = 0;  // 一次性消费: 后续 rebuild(循环/重播/换源)都从头
 
     if (![_assetReader startReading]) {
         vcam_player_log([NSString stringWithFormat:@"[vcam] Failed to start reading: %@", _assetReader.error]);
@@ -466,6 +485,7 @@ static size_t vcam_decode_max_edge(void) {
             }
             _lastPTS = ptsSec;
             _hasLastPTS = YES;
+            _lastDecodedPosSec = ptsSec;  // idle 续播位置(2026-08-19)
         }
     }
     CFRelease(sampleBuffer);
@@ -544,8 +564,16 @@ static size_t vcam_decode_max_edge(void) {
 - (void)unloadForIdle {
     _pendingUnload = YES;
     __sync_add_and_fetch(&_requestedLoadGen, 1);
+    // 续播位置(2026-08-19): 视频模式记下最后解码 PTS, 恢复 rebuild 从此续播
+    _resumeAtSeconds = (_mediaType == VCamMediaTypeVideo) ? _lastDecodedPosSec : 0;
     [self clearFrameQueue];
     vcam_player_log(@"[vcam] Idle unload requested (jetsam guard)");
+}
+
+// 显式从头播(重播按钮/换源): 清续播位置
+- (void)resetPlaybackPosition {
+    _resumeAtSeconds = 0;
+    _lastDecodedPosSec = 0;
 }
 
 // 解码线程内释放媒体管线(reader/output, 同线程安全)
