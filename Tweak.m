@@ -26,6 +26,13 @@
 #import <CoreVideo/CoreVideo.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <signal.h>
+#import <execinfo.h>
+#import <fcntl.h>
+#import <unistd.h>
+#import <time.h>
+#import <string.h>
+#import <ucontext.h>
 
 #import "VCamCore.h"
 #import "VCamFloatingBall.h"
@@ -419,6 +426,51 @@ static void initializeInSpringBoard(void) {
 
 #pragma mark - 入口
 
+// ===== SIGSEGV 崩溃捕获器(2026-08-19 首次进入黑屏取证) =====
+// 设备实证(launchctl): "last terminating signal = Segmentation fault: 11" ——
+// msd 首次相机建图期被 SIGSEGV 干掉(App 重进即正常), 且系统侧无 .ips 落盘。
+// 捕获器在崩溃瞬间把 backtrace 写 /tmp/vcam_crash.txt(低频一次性写入,
+// 磁盘配额安全), 然后恢复默认处理让系统走原终止流程。
+static void vcam_crash_handler(int sig, siginfo_t *info, void *ucontext) {
+    (void)ucontext;
+    int fd = open("/tmp/vcam_crash.txt", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        dprintf(fd, "[vcam] ===== SIG%d addr=%p date=", sig, info ? info->si_addr : NULL);
+        char ts[32] = {0};
+        time_t now = time(NULL);
+        struct tm tmv;
+        localtime_r(&now, &tmv);
+        strftime(ts, sizeof(ts), "%H:%M:%S", &tmv);
+        dprintf(fd, "%s threads-backtrace:\n", ts);
+        void *frames[64];
+        int n = backtrace(frames, 64);
+        backtrace_symbols_fd(frames, n, fd);
+        // 出错线程的寄存器 PC/LR 辅助定位(si_addr 未必是代码地址)
+        if (ucontext) {
+            ucontext_t *uc = (ucontext_t *)ucontext;
+#if defined(__arm64__)
+            dprintf(fd, "pc=%#llx lr=%#llx\n",
+                    (unsigned long long)uc->uc_mcontext->__ss.__pc,
+                    (unsigned long long)uc->uc_mcontext->__ss.__lr);
+#endif
+        }
+        close(fd);
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void vcam_install_crash_handler(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = vcam_crash_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
+}
+
 __attribute__((constructor))
 static void vcamInit(void) {
     @autoreleasepool {
@@ -426,6 +478,7 @@ static void vcamInit(void) {
         vcam_tweak_log([NSString stringWithFormat:@"[vcam] Loading in process: %@", processName]);
 
         if ([processName isEqualToString:@"mediaserverd"]) {
+            vcam_install_crash_handler();  // 崩溃取证: SIGSEGV backtrace 落盘
             initializeInMediaserverd();
         } else if ([processName isEqualToString:@"SpringBoard"]) {
             initializeInSpringBoard();
