@@ -22,9 +22,13 @@ static BOOL vcam_log_enabled(void) {
     return cached == 1;
 }
 
+// 日志全局限速令牌桶(定义在 VCamCore.m, 全进程共享磁盘写入预算 —— 磁盘配额击杀根治)
+extern BOOL vcam_log_budget_take(void);
+
 static volatile int32_t vcamQueueLogCount = 0;
 static void vcam_queue_log(NSString *msg) {
     if (!vcam_log_enabled()) return;
+    if (!vcam_log_budget_take()) return;
     int32_t n = __sync_add_and_fetch(&vcamQueueLogCount, 1);
     if (n > 50) return;  // 限制日志量避免 I/O 阻塞
     @try {
