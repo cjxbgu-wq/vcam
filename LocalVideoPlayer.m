@@ -548,7 +548,12 @@ static size_t vcam_decode_max_edge(void) {
     vcam_player_log(@"[vcam] Idle unload requested (jetsam guard)");
 }
 
-// 解码线程内释放媒体管线(reader/output/asset/track, 同线程安全)
+// 解码线程内释放媒体管线(reader/output, 同线程安全)
+// asset/track 复用链保留(2026-08-18 云闪付黑屏根因修复, 对齐千面常驻复用):
+// 旧实现连 _reusableTrack 一起释放 → 每次空闲恢复重载都重跑同步
+// tracksWithMediaType → 反复向 CommonURLAsset* 队列派发任务 → 云闪付频繁
+// 切前后台场景队列堆积卡死 60s → WATCHDOG 杀 mediaserverd → "点进去就黑屏"。
+// 保留后恢复重载跳过 track 解析(loadVideoFile 的复用分支), rebuildReader <100ms
 - (void)releaseMediaOnDecodeThread {
     if (_assetReader) {
         [_assetReader cancelReading];
@@ -557,7 +562,6 @@ static size_t vcam_decode_max_edge(void) {
     _videoOutput = nil;
     _urlAsset = nil;
     _videoTrack = nil;
-    _reusableTrack = nil;
     [self clearFrameQueue];
     if (_cachedImageBuffer) {
         CVPixelBufferRelease(_cachedImageBuffer);
