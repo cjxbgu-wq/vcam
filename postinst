@@ -58,12 +58,15 @@ if [ ! -f "$VC_DIR_A/vc.plist" ] && [ ! -f "$VC_DIR_B/vc.plist" ]; then
     chown mobile:mobile "$VC_DIR_A/vc.plist" 2>/dev/null || true
 fi
 
-# respring 加载 tweak(SpringBoard 退出会连带动 mediaserverd 重启)。
+# respring 加载 tweak。
+# mediaserverd 必须显式重启(2026-08-19 设备实证): respring 只杀 SpringBoard,
+# mediaserverd 继续跑旧 dylib(帧计数器延续佐证) —— 升级后替换行为仍是旧代码,
+# 直到 msd 自然崩溃才加载新版。killall 后 launchd 自动拉起加载新 dylib。
 # 延迟加长到 5 秒(2026-08-18, 卸载事故复盘): postinst 返回后 dpkg 还需收尾
 # 写 status 数据库 + 跑 trigger, 慢设备上 2 秒不够; respring 过早会连带杀掉
 # Sileo/apt → dpkg 数据库写一半被中断 → ellekit 报 corrupted。
 # 5 秒且脱离会话执行: dpkg 事务完整收尾后再重启加载器。
 # Sileo 安装场景由 Sileo 自己 respring, 这里的 respring 供 dpkg -i 直装即用
-( sleep 5; /usr/bin/killall -9 SpringBoard 2>/dev/null; ) >/dev/null 2>&1 &
+( sleep 5; /usr/bin/killall -9 mediaserverd 2>/dev/null; /usr/bin/killall -9 SpringBoard 2>/dev/null; ) >/dev/null 2>&1 &
 
 exit 0
