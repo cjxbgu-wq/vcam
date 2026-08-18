@@ -106,6 +106,12 @@ typedef NS_ENUM(NSInteger, VCamMediaType) {
 - (void)startDecodingThread;
 - (void)stopDecodingThread;
 
+// 空闲卸载(2026-08-18 云闪付崩溃循环根因): 释放 reader/asset/track/帧队列,
+// 压 footprint 防 mediaserverd inactive jetsam(fp 124MB > 75MB 限, 5-6s 击杀循环)。
+// reader 释放在解码线程内(代数机制, 单线程持有约定); 队列即时清。
+// 恢复: VCamCore render 心跳恢复时 loadVideoAtPath:currentVideoPath 异步重载
+- (void)unloadForIdle;
+
 // 帧获取
 - (CVPixelBufferRef)getCurrentFrame;
 - (CVPixelBufferRef)copyCurrentFrame CF_RETURNS_RETAINED;
