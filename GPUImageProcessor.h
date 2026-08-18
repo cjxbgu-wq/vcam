@@ -93,4 +93,9 @@
 // 恢复渲染时惰性重建(首帧多付一次 session/staging 创建, ~10-20ms 一次性)
 - (void)releaseIdleMemory;
 
+// 预渲染重缓冲释放(2026-08-18 云闪付崩溃循环): 旋转 3 槽池 + 镜像 3 槽池 +
+// 自适应旋转缓存 + BGRA 缓冲池。相机 idle 2s 暂停时与 videoPlayer unloadForIdle
+// 配套调用, 压 footprint 过 inactive jetsam 75MB 线。恢复首帧惰性重建。
+- (void)releaseHeavyBuffersForIdle;
+
 @end
