@@ -17,6 +17,9 @@
 #import <CoreVideo/CoreVideo.h>
 #import <mach/mach.h>
 
+// 日志令牌桶(定义见下方 vcam_log_budget_take, 全进程共享磁盘写入预算)
+BOOL vcam_log_budget_take(void);
+
 // ===== 资源自监控(2026-08-16 黑屏取证 v2: +CPU% +按流渲染统计) =====
 // mediaserverd 周期性被杀(相机替换活跃 ~150s)但无 .ips 落盘, 系统侧无法判死因。
 // v2 探针每 30s 记一行: 内存(已证平稳)/进程 CPU%(所有线程 user+system 累计差分)/
@@ -60,6 +63,7 @@ static void vcam_telemetry_sample(uint64_t renderedFrames, NSString *streamStats
     lastCpu = cpuSec;
 
     @try {
+        if (!vcam_log_budget_take()) return;  // 磁盘配额保护: 遥测也走令牌桶
         NSString *line = [NSString stringWithFormat:
             @"%.0f fp=%lluMB res=%lluMB cpu=%.0f%% renders=%llu | %@\n",
             now, footprint >> 20, resident >> 20, cpuPct, renderedFrames,
@@ -91,8 +95,39 @@ static BOOL vcam_log_enabled(void) {
     return cached == 1;
 }
 
+// 日志全局限速令牌桶(2026-08-19 磁盘配额击杀循环根治): 设备实证 1.2.6 时代
+// logEnabled=true 时, 每次开相机突发 40+ 行日志(emit#/write#/render#/init...)
+// —— 每行按 4KB 脏页记账, 瞬时速率 >> 12.43KB/s 配额 → EXC_RESOURCE 击杀
+// mediaserverd → 重启又写突发 → 再杀 = 自馈崩溃循环(runs 49→57/30s,
+// launchctl "immediate reason = inefficient", 设备实证)。
+// 令牌桶: 容量 24(短突发可过), 持续 3 行/s(=12KB/s, 恰在配额内)。
+// 超限行直接丢弃 —— 诊断日志本就采样降频(%600), 丢行不影响取证大局。
+// 全进程所有 vcam_*_log / telemetry 共用同一预算(定义于本文件, 其余编译单元 extern)。
+BOOL vcam_log_budget_take(void) {
+    static NSLock *lk = nil;
+    static double tokens = 24.0;
+    static double lastRefill = 0;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        lk = [[NSLock alloc] init];
+        lastRefill = CFAbsoluteTimeGetCurrent();
+    });
+    [lk lock];
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (lastRefill < now) {
+        double refilled = tokens + (now - lastRefill) * 3.0;
+        tokens = refilled > 24.0 ? 24.0 : refilled;
+        lastRefill = now;
+    }
+    BOOL ok = NO;
+    if (tokens >= 1.0) { tokens -= 1.0; ok = YES; }
+    [lk unlock];
+    return ok;
+}
+
 static void vcam_core_log(NSString *msg) {
     if (!vcam_log_enabled()) return;
+    if (!vcam_log_budget_take()) return;
     @try {
         NSString *logPath = @"/tmp/vcam_core_log.txt";
         NSString *ts = [NSDate date].description;
@@ -462,11 +497,15 @@ static void vcam_core_log(NSString *msg) {
         // 保留: 仅不可见的拍照编码流(≥10MP, 产物是静态照片, 12MP VT 转换昂贵)
         // 放宽到 1fps; lowPower 紧急档 20fps
         {
-            static NSMutableDictionary<NSString *, NSDictionary *> *freezeState = nil;
-            if (!freezeState) freezeState = [NSMutableDictionary dictionary];
+            // 卡顿优化(2026-08-19): window==0(普通流: 非 ≥10MP 照片流且非降载档)
+            // 时整块跳过 —— 旧实现每帧每流无条件 NSString 分配 + @synchronized
+            // 字典读写, 8 流 × 30fps = 每秒数百次分配, 纯诊断路径白付。
             uint64_t px = (uint64_t)targetW * targetH;
             double window = px > 10000000ull ? 1.0
                           : (lowPower ? 0.05 : 0.0);
+            if (window > 0.0) {
+            static NSMutableDictionary<NSString *, NSDictionary *> *freezeState = nil;
+            if (!freezeState) freezeState = [NSMutableDictionary dictionary];
             NSString *fk = [NSString stringWithFormat:@"%zu_%zu_%u", targetW, targetH, (unsigned)origFormat];
             @synchronized(freezeState) {
                 NSDictionary *st = freezeState[fk];
@@ -481,6 +520,7 @@ static void vcam_core_log(NSString *msg) {
                     freezeState[fk] = @{@"t": @(nowT), @"tok": @(gen)};
                 }
             }
+            }  // window > 0.0
         }
     }
 
