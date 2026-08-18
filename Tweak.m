@@ -32,7 +32,6 @@
 #import <unistd.h>
 #import <time.h>
 #import <string.h>
-#import <ucontext.h>
 
 #import "VCamCore.h"
 #import "VCamFloatingBall.h"
@@ -435,25 +434,16 @@ static void vcam_crash_handler(int sig, siginfo_t *info, void *ucontext) {
     (void)ucontext;
     int fd = open("/tmp/vcam_crash.txt", O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd >= 0) {
-        dprintf(fd, "[vcam] ===== SIG%d addr=%p date=", sig, info ? info->si_addr : NULL);
+        dprintf(fd, "[vcam] ===== SIG%d addr=%p ", sig, info ? info->si_addr : NULL);
         char ts[32] = {0};
         time_t now = time(NULL);
         struct tm tmv;
         localtime_r(&now, &tmv);
         strftime(ts, sizeof(ts), "%H:%M:%S", &tmv);
-        dprintf(fd, "%s threads-backtrace:\n", ts);
+        dprintf(fd, "%s backtrace:\n", ts);
         void *frames[64];
         int n = backtrace(frames, 64);
         backtrace_symbols_fd(frames, n, fd);
-        // 出错线程的寄存器 PC/LR 辅助定位(si_addr 未必是代码地址)
-        if (ucontext) {
-            ucontext_t *uc = (ucontext_t *)ucontext;
-#if defined(__arm64__)
-            dprintf(fd, "pc=%#llx lr=%#llx\n",
-                    (unsigned long long)uc->uc_mcontext->__ss.__pc,
-                    (unsigned long long)uc->uc_mcontext->__ss.__lr);
-#endif
-        }
         close(fd);
     }
     signal(sig, SIG_DFL);
