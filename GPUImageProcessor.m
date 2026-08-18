@@ -21,6 +21,9 @@ OSStatus VTSessionSetProperty(CFTypeRef session, CFStringRef propertyKey, CFType
 typedef OSStatus (*VTPixelRotationSessionCreateFunc)(CFAllocatorRef, VTPixelRotationSessionRef *);
 typedef OSStatus (*VTPixelRotationSessionTransferImageFunc)(VTPixelRotationSessionRef, CVPixelBufferRef, CVPixelBufferRef);
 
+// 日志全局限速令牌桶(定义在 VCamCore.m, 全进程共享磁盘写入预算 —— 磁盘配额击杀根治)
+extern BOOL vcam_log_budget_take(void);
+
 // 日志总开关(2026-08-16, diskwrites 崩溃循环止血): 默认静默, vc.plist "logEnabled=YES" 打开
 static BOOL vcam_log_enabled(void) {
     static int cached = -1;
@@ -36,6 +39,7 @@ static BOOL vcam_log_enabled(void) {
 
 static void vcam_gpu_log(NSString *msg) {
     if (!vcam_log_enabled()) return;
+    if (!vcam_log_budget_take()) return;
     @try {
         NSString *logPath = @"/tmp/vcam_gpu_log.txt";
         NSString *ts = [NSDate date].description;
@@ -76,9 +80,10 @@ static void vcam_gpu_log(NSString *msg) {
 // (原始 720x538 与 CCW90 旋转后 538x720 并存), 旧 grow-only 单 staging 在两种
 // 尺寸间互相触发重建 → 每帧 12MB 创建/释放风暴 → 相机线程卡死 → msd 被杀
 // (设备实证: 同秒 "Lane staging built" 交替 20 次)。按源尺寸 key 缓存(上限 4),
-// 每尺寸建一次后零重建。key = w*100000+h(NSNumber), token 同步 per-key。
-@property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSValue *> *laneStagingMap;   // srcSizeKey -> buffer
-@property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *laneTokenMap;    // srcSizeKey -> staging 内容 token
+// 每尺寸建一次后零重建。
+// 卡顿优化(2026-08-19): 字典版每帧 NSNumber 装箱 + 双字典查找(且在串行车道锁内),
+// 改定长槽位数组纯指针比较 —— 零分配; (w,h,token) 全部原值存取。
+// (定义见 @interface 之后的文件级区: gVcamLaneStaging)
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *laneFailCounts;   // 格式 fourcc → 连续失败
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *laneDisabled;     // 格式 fourcc → 熔断标记
 // 私有格式两步法中转: 已迁移到下方 per-key 池(2026-08-15), 旧单例字段移除
@@ -155,9 +160,7 @@ static void vcam_gpu_log(NSString *msg) {
 // mediaserverd("Timed out waiting for the capture graph to stop") -> 崩溃循环。
 @property (nonatomic, strong) NSLock *statsLock;
 @property (nonatomic, strong) NSLock *poolDictLock;
-// 按流渲染统计(诊断窗口): key -> 渲染次数 / key -> 目标像素累计
-@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *streamRenderStats;
-@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *streamPixelStats;
+// (按流渲染统计定长槽位 gVcamStatSlots 见 @interface 外文件级定义)
 
 // 私有 API 函数指针
 @property (nonatomic, assign) VTPixelRotationSessionCreateFunc createRotationSession;
@@ -199,9 +202,7 @@ static void vcam_gpu_log(NSString *msg) {
 // (调用方已持该 key 的 per-key 锁, 池字典自身用 @synchronized 保护)
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *gpuImgTokenPool;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, CIImage *> *gpuImgOutPool;
-// 每流 stage 耗时统计(2026-08-16 CPU 归因探针): key -> @{s1: [totalMs,count], s2:...}
-// takeStreamStats 周期输出平均 ms, 定位 58-64% CPU 具体烧在哪个流哪一步
-@property (nonatomic, strong) NSMutableDictionary<NSString *, NSMutableDictionary<NSString *, NSNumber *> *> *stageTimingPool;
+// 每流 stage 耗时统计已并入定长槽位 gVcamStatSlots(见文件头)
 // 一步直转熔断(2026-08-17 统一路径配套): 连续失败 2 次的流永久跳过(保真实相机)
 // —— 替代两步法时代的 twoStepDisabledPool 职责('18f0' wakeups 风暴教训)
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *oneStepFailPool;
@@ -213,6 +214,46 @@ static void vcam_gpu_log(NSString *msg) {
 // 内部方法（前向声明，让 ARC 正确处理 CF_RETURNS_RETAINED）
 - (CVPixelBufferRef)scaleToBGRA:(CVPixelBufferRef)input width:(size_t)width height:(size_t)height CF_RETURNS_RETAINED;
 @end
+
+// ===== 文件级零分配数据结构(2026-08-19 卡顿优化) =====
+// 按流渲染统计定长槽位: 旧字典实现每帧每流 ~5 次 NSString 分配 + NSNumber 装箱
+// + 字典写(且在车道锁内), 8 流 × 30fps = 每秒数百次分配/malloc 争用 = 渲染
+// 延迟毛刺。改纯数字累计, takeStreamStats 30s 出字符串。
+// (文件级静态: 每进程仅一个 GPUImageProcessor 实例, 统计是纯诊断用途)
+typedef struct {
+    uint32_t fmt;
+    uint32_t w, h;
+    uint64_t renders;
+    uint64_t pixels;
+    double   s1TotalMs;
+    uint64_t s1Cnt;
+    double   s2TotalMs;
+    uint64_t s2Cnt;
+} VCamStatSlot;
+#define kVcamStatSlots 12
+static VCamStatSlot gVcamStatSlots[kVcamStatSlots];
+
+// 私有车道 staging 定长槽位(替代 laneStagingMap/laneTokenMap 两个字典):
+// 每帧 NSNumber 装箱 + 双字典查找(串行车道锁内) → 纯指针比较零分配。
+// 全部访问都在 _laneLockPrivate 临界区内, dealloc/idle 释放例外(进程级单实例安全)。
+typedef struct {
+    size_t w, h;
+    CVPixelBufferRef staging;   // 所有权归槽位(槽位占用即持有)
+    uint64_t token;             // staging 内容的帧代数
+} VCamLaneStagingSlot;
+#define kVcamLaneStagingMax 4
+static VCamLaneStagingSlot gVcamLaneStaging[kVcamLaneStagingMax];
+
+// 车道熔断 memo: 热路径零装箱查表; 熔断写入时刷新对应槽
+static uint32_t gVcamLaneMemoFmt[4] = {0, 0, 0, 0};
+static BOOL gVcamLaneMemoOff[4] = {NO, NO, NO, NO};
+static void vcamLaneMemoInvalidate(uint32_t fmt, BOOL off) {
+    for (int i = 0; i < 4; i++) {
+        if (gVcamLaneMemoFmt[i] == fmt) { gVcamLaneMemoOff[i] = off; return; }
+    }
+    gVcamLaneMemoFmt[fmt & 3] = fmt;
+    gVcamLaneMemoOff[fmt & 3] = off;
+}
 
 @implementation GPUImageProcessor
 
@@ -239,11 +280,9 @@ static void vcam_gpu_log(NSString *msg) {
         _twoStepKeyLockPool = [[NSMutableDictionary alloc] init];
         _adaptiveRotatedGen = 0;
         _streamKeyOrder = [NSMutableArray array];
-        _streamRenderStats = [NSMutableDictionary dictionary];
-        _streamPixelStats = [NSMutableDictionary dictionary];
+        memset(gVcamStatSlots, 0, sizeof(gVcamStatSlots));  // 统计槽位(替代三个字典)
         _gpuImgTokenPool = [NSMutableDictionary dictionary];
         _gpuImgOutPool = [NSMutableDictionary dictionary];
-        _stageTimingPool = [NSMutableDictionary dictionary];
         _oneStepFailPool = [NSMutableDictionary dictionary];
         _oneStepDisabledPool = [NSMutableDictionary dictionary];
         _groupStagingPool = [[NSMutableDictionary alloc] init];
@@ -260,12 +299,11 @@ static void vcam_gpu_log(NSString *msg) {
         _poolDictLock = [[NSLock alloc] init];
 
         // 千面模型固定车道(2026-08-19): 3 锁 + s1 会话 + 熔断表
+        // (staging 槽位 gVcamLaneStaging 为文件级静态数组, 零初始化即空槽)
         _laneLockBGRA = [[NSLock alloc] init];
         _laneLockYUV = [[NSLock alloc] init];
         _laneLockPrivate = [[NSLock alloc] init];
         _twoStepS1Session = NULL;
-        _laneStagingMap = [NSMutableDictionary dictionary];
-        _laneTokenMap = [NSMutableDictionary dictionary];
         _laneFailCounts = [NSMutableDictionary dictionary];
         _laneDisabled = [NSMutableDictionary dictionary];
 
@@ -327,14 +365,18 @@ static void vcam_gpu_log(NSString *msg) {
         InvalidateFunc invalidate = (InvalidateFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionInvalidate");
         if (invalidate) invalidate(_privateTransferSession);
     }
-    // 千面车道(2026-08-19): s1 会话 + 中转 map
+    // 千面车道(2026-08-19): s1 会话 + staging 槽位
     if (_twoStepS1Session) {
         InvalidateFunc invalidate = (InvalidateFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionInvalidate");
         if (invalidate) invalidate(_twoStepS1Session);
     }
-    for (NSValue *v in _laneStagingMap.allValues) {
-        CVPixelBufferRef b = (CVPixelBufferRef)[v pointerValue];
-        if (b) CVPixelBufferRelease(b);
+    for (int i = 0; i < kVcamLaneStagingMax; i++) {
+        if (gVcamLaneStaging[i].staging) {
+            CVPixelBufferRelease(gVcamLaneStaging[i].staging);
+            gVcamLaneStaging[i].staging = NULL;
+            gVcamLaneStaging[i].w = gVcamLaneStaging[i].h = 0;
+            gVcamLaneStaging[i].token = 0;
+        }
     }
     // 释放两步法池(per-key session + staging buffer)
     {
@@ -1221,8 +1263,6 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
     size_t srcW = CVPixelBufferGetWidth(src);
     size_t srcH = CVPixelBufferGetHeight(src);
 
-    NSString *poolKey = [NSString stringWithFormat:@"%zu_%zu_%u", dstW, dstH, (unsigned)dstFormat];
-
     // ===== 千面模型固定车道(2026-08-19 相机开启猝死链路根治, 全 App 通用) =====
     // 设备实证(1.2.4): 相机开启多流突发时 per-key 池体系在热路径现场建 session/
     // 建 staging + LRU 淘汰重建 + 组锁串行 → 相机回调线程阻塞 → watchdog 杀
@@ -1232,8 +1272,20 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
     // 可接受 —— 稳定性优先于并行)。token 复用保留(同帧多消费者 s1 免单 +
     // CPU 降载冻结复用)。按格式(非按流)熔断: 同 fourcc 连续失败 2 次 →
     // 永久跳过该格式保真实相机(防 wakeups 风暴, '18f0' 分析流教训)。
-    NSNumber *fmtKey = @(dstFormat);
-    if ([_laneDisabled[fmtKey] boolValue]) return NO;
+    // 卡顿优化(2026-08-19): 熔断查表走文件级 memo(零装箱零字典),
+    // 熔断写入路径 vcamLaneMemoInvalidate 同步刷新
+    {
+        BOOL laneOff = NO;
+        int hit = -1;
+        for (int i = 0; i < 4; i++) {
+            if (gVcamLaneMemoFmt[i] == dstFormat) { hit = i; laneOff = gVcamLaneMemoOff[i]; break; }
+        }
+        if (hit < 0) {
+            laneOff = [_laneDisabled[@(dstFormat)] boolValue];
+            vcamLaneMemoInvalidate((uint32_t)dstFormat, laneOff);  // 建槽并缓存
+        }
+        if (laneOff) return NO;
+    }
 
     BOOL isYuvLane = ((dstFormat & 0xffffffef) == '420f' || dstFormat == 0x70343230 /* p420 */);
     BOOL isBgraLane = (dstFormat == kCVPixelFormatType_32BGRA);
@@ -1257,37 +1309,47 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
             }
         }
         // staging 按源尺寸缓存(2026-08-19 交替重建风暴修复): 源有 2 种尺寸并存
-        // (原始/CCW90 旋转后), 每尺寸一条, 建后零重建; 上限 4 条防极端场景
-        NSNumber *skey = @((long long)srcW * 100000ll + (long long)srcH);
-        CVPixelBufferRef staging = NULL;
-        {
-            NSValue *sv = _laneStagingMap[skey];
-            if (sv) staging = (CVPixelBufferRef)[sv pointerValue];
+        // (原始/CCW90 旋转后), 每尺寸一条, 建后零重建; 槽位数组零分配(卡顿优化)
+        VCamLaneStagingSlot *slot = NULL;
+        for (int i = 0; i < kVcamLaneStagingMax; i++) {
+            if (gVcamLaneStaging[i].staging &&
+                gVcamLaneStaging[i].w == srcW && gVcamLaneStaging[i].h == srcH) {
+                slot = &gVcamLaneStaging[i];
+                break;
+            }
         }
-        if (!staging && _laneStagingMap.count < 4) {
-            CVPixelBufferRef nb = NULL;
-            if (CVPixelBufferCreate(kCFAllocatorDefault, srcW, srcH,
-                                    kCVPixelFormatType_32BGRA, NULL, &nb) == noErr && nb) {
-                staging = nb;  // 所有权归池
-                _laneStagingMap[skey] = [NSValue valueWithPointer:nb];
-                _laneTokenMap[skey] = @0;
-                vcam_gpu_log([NSString stringWithFormat:@"[vcam] Lane staging built %zux%zu (map %lu)", srcW, srcH, (unsigned long)_laneStagingMap.count]);
+        if (!slot) {
+            // 空槽现建(每尺寸进程内仅一次; 上限 4 条防极端场景)
+            for (int i = 0; i < kVcamLaneStagingMax; i++) {
+                if (!gVcamLaneStaging[i].staging) {
+                    CVPixelBufferRef nb = NULL;
+                    if (CVPixelBufferCreate(kCFAllocatorDefault, srcW, srcH,
+                                            kCVPixelFormatType_32BGRA, NULL, &nb) == noErr && nb) {
+                        gVcamLaneStaging[i].w = srcW;
+                        gVcamLaneStaging[i].h = srcH;
+                        gVcamLaneStaging[i].staging = nb;  // 所有权归槽位
+                        gVcamLaneStaging[i].token = 0;
+                        slot = &gVcamLaneStaging[i];
+                        vcam_gpu_log([NSString stringWithFormat:@"[vcam] Lane staging built %zux%zu (slot %d)", srcW, srcH, i]);
+                    }
+                    break;
+                }
             }
         }
 
         BOOL ok = NO;
-        if (_twoStepS1Session && _privateTransferSession && staging) {
+        if (_twoStepS1Session && _privateTransferSession && slot) {
+            CVPixelBufferRef staging = slot->staging;
             // s1: token 复用(同帧多消费者/CPU 冻结 token → 跳过缩放只付 s2)
-            uint64_t stTok = [_laneTokenMap[skey] unsignedLongLongValue];
-            if (token != 0 && stTok == token) {
+            if (token != 0 && slot->token == token) {
                 ok = YES;  // staging 内容已是本帧
             } else {
                 OSStatus st1 = VTPixelTransferSessionTransferImage(_twoStepS1Session, src, staging);
                 if (st1 == noErr) {
-                    _laneTokenMap[skey] = @(token);  // token=0 也记(下帧不匹配自然重付)
+                    slot->token = token;  // token=0 也记(下帧不匹配自然重付)
                     ok = YES;
                 } else {
-                    _laneTokenMap[skey] = @0;  // staging 内容不可信
+                    slot->token = 0;  // staging 内容不可信
                     vcam_gpu_log([NSString stringWithFormat:@"[vcam] lane s1 failed (%d)", (int)st1]);
                 }
             }
@@ -1295,22 +1357,23 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
             if (ok) {
                 CFAbsoluteTime t2 = CFAbsoluteTimeGetCurrent();
                 OSStatus st2 = VTPixelTransferSessionTransferImage(_privateTransferSession, staging, dst);
-                [self noteStageTiming:poolKey stage:2 ms:(CFAbsoluteTimeGetCurrent() - t2) * 1000.0];
+                [self noteStageTimingFmt:(uint32_t)dstFormat w:(uint32_t)dstW h:(uint32_t)dstH stage:2 ms:(CFAbsoluteTimeGetCurrent() - t2) * 1000.0];
                 if (st2 != noErr) ok = NO;
             }
         }
         [_laneLockPrivate unlock];
 
         if (ok) {
-            [self noteStreamRender:poolKey pixels:(uint64_t)dstW * dstH];
+            [self noteStreamRenderFmt:(uint32_t)dstFormat w:(uint32_t)dstW h:(uint32_t)dstH pixels:(uint64_t)dstW * dstH];
             return YES;
         }
-        // 失败计数/熔断(按格式): 同 fourcc 连续 2 次 → 永久跳过
+        // 失败计数/熔断(按格式): 同 fourcc 连续 2 次 → 永久跳过(同步刷新上面的 memo)
         @synchronized(self) {
-            NSInteger fails = [_laneFailCounts[fmtKey] integerValue] + 1;
-            _laneFailCounts[fmtKey] = @(fails);
+            NSInteger fails = [_laneFailCounts[@(dstFormat)] integerValue] + 1;
+            _laneFailCounts[@(dstFormat)] = @(fails);
             if (fails >= 2) {
-                _laneDisabled[fmtKey] = @YES;
+                _laneDisabled[@(dstFormat)] = @YES;
+                vcamLaneMemoInvalidate(dstFormat, YES);
                 vcam_gpu_log([NSString stringWithFormat:@"[vcam] lane CIRCUIT-BROKEN format %u (err, keep camera)", (unsigned)dstFormat]);
             }
         }
@@ -1329,19 +1392,20 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
     [laneLock lock];
     CFAbsoluteTime tOp = CFAbsoluteTimeGetCurrent();
     OSStatus status = VTPixelTransferSessionTransferImage(session, src, dst);
-    [self noteStageTiming:poolKey stage:2 ms:(CFAbsoluteTimeGetCurrent() - tOp) * 1000.0];
+    [self noteStageTimingFmt:(uint32_t)dstFormat w:(uint32_t)dstW h:(uint32_t)dstH stage:2 ms:(CFAbsoluteTimeGetCurrent() - tOp) * 1000.0];
     [laneLock unlock];
 
     if (status == noErr) {
-        [self noteStreamRender:poolKey pixels:(uint64_t)dstW * dstH];
+        [self noteStreamRenderFmt:(uint32_t)dstFormat w:(uint32_t)dstW h:(uint32_t)dstH pixels:(uint64_t)dstW * dstH];
         return YES;
     }
     // 失败计数/熔断(按格式)
     @synchronized(self) {
-        NSInteger fails = [_laneFailCounts[fmtKey] integerValue] + 1;
-        _laneFailCounts[fmtKey] = @(fails);
+        NSInteger fails = [_laneFailCounts[@(dstFormat)] integerValue] + 1;
+        _laneFailCounts[@(dstFormat)] = @(fails);
         if (fails >= 2) {
-            _laneDisabled[fmtKey] = @YES;
+            _laneDisabled[@(dstFormat)] = @YES;
+            vcamLaneMemoInvalidate(dstFormat, YES);
             vcam_gpu_log([NSString stringWithFormat:@"[vcam] lane CIRCUIT-BROKEN format %u (err %d, keep camera)",
                           (unsigned)dstFormat, (int)status]);
         }
@@ -1349,30 +1413,39 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
     return NO;
 }
 
-// 按流渲染统计累计(诊断)
-// 死锁修复(2026-08-17): 专用 statsLock —— 本方法可能被持 keyLock 的 transfer 路径
-// 调用, 旧 @synchronized(self) 与 touchStreamKeyLRU(self→keyLock) 构成锁倒置死锁
-- (void)noteStreamRender:(NSString *)key pixels:(uint64_t)px {
+// 按流渲染统计累计(诊断) —— 定长槽位版(2026-08-19 卡顿优化):
+// 零 NSString/NSNumber 分配, 短临界区纯数字累计(旧字典版每帧 ~5 次分配)。
+// 死锁修复(2026-08-17 沿用): 专用 statsLock, 锁序 @synchronized(self)/keyLock → statsLock 单向
+static VCamStatSlot *vcam_stat_slot(uint32_t fmt, uint32_t w, uint32_t h) {
+    for (int i = 0; i < kVcamStatSlots; i++) {
+        if (gVcamStatSlots[i].fmt == fmt && gVcamStatSlots[i].w == w && gVcamStatSlots[i].h == h) {
+            return &gVcamStatSlots[i];
+        }
+        if (gVcamStatSlots[i].fmt == 0 && gVcamStatSlots[i].renders == 0) {
+            gVcamStatSlots[i].fmt = fmt;
+            gVcamStatSlots[i].w = w;
+            gVcamStatSlots[i].h = h;
+            return &gVcamStatSlots[i];
+        }
+    }
+    return NULL;  // 槽位满(>12 条流, 罕见): 丢弃统计不影响渲染
+}
+
+- (void)noteStreamRenderFmt:(uint32_t)fmt w:(uint32_t)w h:(uint32_t)h pixels:(uint64_t)px {
     [_statsLock lock];
-    _streamRenderStats[key] = @([_streamRenderStats[key] unsignedIntegerValue] + 1);
-    _streamPixelStats[key] = @([_streamPixelStats[key] unsignedLongLongValue] + px);
+    VCamStatSlot *s = vcam_stat_slot(fmt, w, h);
+    if (s) { s->renders++; s->pixels += px; }
     [_statsLock unlock];
 }
 
 // 每流 stage 耗时累计(诊断): stage 1=缩放 2=格式转换
-// 死锁修复(2026-08-17): 同上换 statsLock(twoStepTransferLocked 持 keyLock 高频调用)
-- (void)noteStageTiming:(NSString *)key stage:(int)stage ms:(double)ms {
+- (void)noteStageTimingFmt:(uint32_t)fmt w:(uint32_t)w h:(uint32_t)h stage:(int)stage ms:(double)ms {
     [_statsLock lock];
-    NSString *sk = [NSString stringWithFormat:@"s%d", stage];
-    NSMutableDictionary *d = _stageTimingPool[key];
-    if (!d) {
-        d = [NSMutableDictionary dictionary];
-        _stageTimingPool[key] = d;
+    VCamStatSlot *s = vcam_stat_slot(fmt, w, h);
+    if (s) {
+        if (stage == 1) { s->s1TotalMs += ms; s->s1Cnt++; }
+        else            { s->s2TotalMs += ms; s->s2Cnt++; }
     }
-    double total = [d[sk] doubleValue] + ms;  // 打包 [count.total] 双数值见下
-    NSInteger cnt = [d[[NSString stringWithFormat:@"%@c", sk]] integerValue] + 1;
-    d[sk] = @(total);
-    d[[NSString stringWithFormat:@"%@c", sk]] = @(cnt);
     [_statsLock unlock];
 }
 
@@ -1572,12 +1645,15 @@ static const NSUInteger kVcamMaxStreamKeys = 6;
     }
     // 千面车道中转释放(2026-08-19): 深度空闲时归还内存, 恢复首帧锁内重建(一次性)
     [_laneLockPrivate lock];
-    for (NSValue *v in _laneStagingMap.allValues) {
-        CVPixelBufferRef b = (CVPixelBufferRef)[v pointerValue];
-        if (b) { CVPixelBufferRelease(b); released++; }
+    for (int i = 0; i < kVcamLaneStagingMax; i++) {
+        if (gVcamLaneStaging[i].staging) {
+            CVPixelBufferRelease(gVcamLaneStaging[i].staging);
+            gVcamLaneStaging[i].staging = NULL;
+            gVcamLaneStaging[i].w = gVcamLaneStaging[i].h = 0;
+            gVcamLaneStaging[i].token = 0;
+            released++;
+        }
     }
-    [_laneStagingMap removeAllObjects];
-    [_laneTokenMap removeAllObjects];
     [_laneLockPrivate unlock];
     vcam_gpu_log([NSString stringWithFormat:@"[vcam] idle heavy buffers released: %lu entries (jetsam guard)", (unsigned long)released]);
 }
@@ -1588,22 +1664,19 @@ static const NSUInteger kVcamMaxStreamKeys = 6;
 - (NSString *)takeStreamStats {
     [_statsLock lock];
     NSString *out = @"";
-    if (_streamRenderStats.count > 0) {
-        NSMutableArray *parts = [NSMutableArray array];
-        for (NSString *k in _streamRenderStats) {
-            NSUInteger cnt = [_streamRenderStats[k] unsignedIntegerValue];
-            uint64_t mb = ([_streamPixelStats[k] unsignedLongLongValue] * 4ull) >> 20;  // BGRA 4B/px
-            // stage 均值: s1=缩放(内容帧才跑) s2=格式转换(每相机帧都跑)
-            NSDictionary *tm = _stageTimingPool[k];
-            double s1Avg = (tm && [tm[@"s1c"] integerValue] > 0) ? ([tm[@"s1"] doubleValue] / [tm[@"s1c"] integerValue]) : -1;
-            double s2Avg = (tm && [tm[@"s2c"] integerValue] > 0) ? ([tm[@"s2"] doubleValue] / [tm[@"s2c"] integerValue]) : -1;
-            [parts addObject:[NSString stringWithFormat:@"%@:%lu/%lluMB(%.1f,%.1fms)", k, (unsigned long)cnt, mb, s1Avg, s2Avg]];
-        }
-        out = [parts componentsJoinedByString:@" "];
-        [_streamRenderStats removeAllObjects];
-        [_streamPixelStats removeAllObjects];
-        [_stageTimingPool removeAllObjects];
+    NSMutableArray *parts = [NSMutableArray array];
+    for (int i = 0; i < kVcamStatSlots; i++) {
+        VCamStatSlot *s = &gVcamStatSlots[i];
+        if (s->fmt == 0 || s->renders == 0) continue;
+        uint64_t mb = (s->pixels * 4ull) >> 20;  // BGRA 4B/px
+        // stage 均值: s1=缩放(内容帧才跑) s2=格式转换(每相机帧都跑)
+        double s1Avg = s->s1Cnt > 0 ? (s->s1TotalMs / s->s1Cnt) : -1.0;
+        double s2Avg = s->s2Cnt > 0 ? (s->s2TotalMs / s->s2Cnt) : -1.0;
+        [parts addObject:[NSString stringWithFormat:@"%ux%u_%u:%llu/%lluMB(%.1f,%.1fms)",
+                          s->w, s->h, s->fmt, s->renders, mb, s1Avg, s2Avg]];
     }
+    if (parts.count > 0) out = [parts componentsJoinedByString:@" "];
+    memset(gVcamStatSlots, 0, sizeof(gVcamStatSlots));
     [_statsLock unlock];
     return out;
 }
@@ -1726,7 +1799,8 @@ static const NSUInteger kVcamMaxStreamKeys = 6;
                 CFAbsoluteTime tB = CFAbsoluteTimeGetCurrent();
                 OSStatus stB = VTPixelTransferSessionTransferImage(blitS, cacheBuf, dst);
                 double msB = (CFAbsoluteTimeGetCurrent() - tB) * 1000.0;
-                [self noteStageTiming:poolKey stage:2 ms:msB];
+                [self noteStageTimingFmt:(uint32_t)CVPixelBufferGetPixelFormatType(dst)
+                                       w:(uint32_t)dstW h:(uint32_t)dstH stage:2 ms:msB];
                 if (stB == noErr) return YES;
                 // 私有→私有 blit 该组合 VT 不支持: 熔断缓存路径(该 key 永远全价), 无风暴
                 _resultBlitDisabledPool[poolKey] = @YES;
@@ -1782,7 +1856,9 @@ static const NSUInteger kVcamMaxStreamKeys = 6;
             if (gSession) {
                 CFAbsoluteTime t1 = CFAbsoluteTimeGetCurrent();
                 OSStatus st1 = VTPixelTransferSessionTransferImage(gSession, src, groupStaging);
-                [self noteStageTiming:poolKey stage:1 ms:(CFAbsoluteTimeGetCurrent() - t1) * 1000.0];
+                [self noteStageTimingFmt:(uint32_t)CVPixelBufferGetPixelFormatType(dst)
+                                       w:(uint32_t)dstW h:(uint32_t)dstH stage:1
+                                       ms:(CFAbsoluteTimeGetCurrent() - t1) * 1000.0];
                 if (st1 == noErr) {
                     _groupTokenPool[ratioKey] = @(token);
                     groupOk = YES;
@@ -1825,7 +1901,8 @@ static const NSUInteger kVcamMaxStreamKeys = 6;
             CFAbsoluteTime t2 = CFAbsoluteTimeGetCurrent();
             OSStatus st2a = VTPixelTransferSessionTransferImage(s2, effectiveStaging, cacheBuf);
             double ms2 = (CFAbsoluteTimeGetCurrent() - t2) * 1000.0;
-            [self noteStageTiming:poolKey stage:2 ms:ms2];
+            [self noteStageTimingFmt:(uint32_t)CVPixelBufferGetPixelFormatType(dst)
+                                   w:(uint32_t)dstW h:(uint32_t)dstH stage:2 ms:ms2];
             if (st2a == noErr) {
                 VTPixelTransferSessionRef blitS = [self resultBlitSessionForKey:poolKey];
                 OSStatus st2b = blitS ? VTPixelTransferSessionTransferImage(blitS, cacheBuf, dst) : -1;
@@ -1851,7 +1928,9 @@ static const NSUInteger kVcamMaxStreamKeys = 6;
     // 直转(首次消费 / 缓存路径不可用)
     CFAbsoluteTime t2 = CFAbsoluteTimeGetCurrent();
     OSStatus st2 = VTPixelTransferSessionTransferImage(s2, effectiveStaging, dst);
-    [self noteStageTiming:poolKey stage:2 ms:(CFAbsoluteTimeGetCurrent() - t2) * 1000.0];
+    [self noteStageTimingFmt:(uint32_t)CVPixelBufferGetPixelFormatType(dst)
+                           w:(uint32_t)dstW h:(uint32_t)dstH stage:2
+                           ms:(CFAbsoluteTimeGetCurrent() - t2) * 1000.0];
     _lastReqTokenPool[poolKey] = @(token);
     CVPixelBufferRelease(effectiveStaging);
     if (st2 == noErr) return YES;
@@ -1946,7 +2025,8 @@ static const NSUInteger kVcamMaxStreamKeys = 6;
         if (!s1) return NO;
         tS1 = CFAbsoluteTimeGetCurrent();
         OSStatus st1 = VTPixelTransferSessionTransferImage(s1, src, staging);
-        [self noteStageTiming:poolKey stage:1 ms:(CFAbsoluteTimeGetCurrent() - tS1) * 1000.0];
+        [self noteStageTimingFmt:(uint32_t)dstFmt w:(uint32_t)dstW h:(uint32_t)dstH stage:1
+                               ms:(CFAbsoluteTimeGetCurrent() - tS1) * 1000.0];
         if (st1 != noErr &&
             CVPixelBufferGetPixelFormatType(staging) != kCVPixelFormatType_32BGRA) {
             // 同格式 staging 的组合 VT 不支持 → 每流一次性回退 BGRA staging 重试
@@ -1958,7 +2038,8 @@ static const NSUInteger kVcamMaxStreamKeys = 6;
             _twoStepStagingPool[poolKey] = [NSValue valueWithPointer:staging];
             tS1 = CFAbsoluteTimeGetCurrent();
             st1 = VTPixelTransferSessionTransferImage(s1, src, staging);
-            [self noteStageTiming:poolKey stage:1 ms:(CFAbsoluteTimeGetCurrent() - tS1) * 1000.0];
+            [self noteStageTimingFmt:(uint32_t)dstFmt w:(uint32_t)dstW h:(uint32_t)dstH stage:1
+                                   ms:(CFAbsoluteTimeGetCurrent() - tS1) * 1000.0];
         }
         if (st1 != noErr) {
             // stage1 失败也计数熔断(2026-08-17 微型流放开配套): 同格式与 BGRA
@@ -1990,7 +2071,8 @@ static const NSUInteger kVcamMaxStreamKeys = 6;
     VTPixelTransferSessionRef s2 = [self twoStepSessionForKey:poolKey];
     tS2 = CFAbsoluteTimeGetCurrent();
     OSStatus st2 = s2 ? VTPixelTransferSessionTransferImage(s2, staging, dst) : -1;
-    [self noteStageTiming:poolKey stage:2 ms:(CFAbsoluteTimeGetCurrent() - tS2) * 1000.0];
+    [self noteStageTimingFmt:(uint32_t)dstFmt w:(uint32_t)dstW h:(uint32_t)dstH stage:2
+                           ms:(CFAbsoluteTimeGetCurrent() - tS2) * 1000.0];
     if (st2 != noErr) {
         NSInteger fails = [_twoStepFailCountPool[poolKey] integerValue] + 1;
         _twoStepFailCountPool[poolKey] = @(fails);
