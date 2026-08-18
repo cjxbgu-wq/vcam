@@ -60,6 +60,24 @@ static void vcam_gpu_log(NSString *msg) {
 @property (nonatomic, assign) VTPixelTransferSessionRef yuvTransferSession;        // render 线程: 420v/420f 目标专用
 @property (nonatomic, assign) VTPixelTransferSessionRef privateTransferSession;    // render 线程: 私有格式目标专用(base, 隔离状态)
 @property (nonatomic, assign) VTPixelTransferSessionRef prerenderTransferSession;  // 预渲染线程专用
+
+// ===== 千面模型固定车道(2026-08-19 相机开启猝死链路根治) =====
+// 设备实证(1.2.4, 13:48:42-13:49:02): 相机开启多流突发时 mediaserverd 4 连崩,
+// 无 .ips/无 CPU 超限 —— 根因是 per-key 池体系在热路径现场建 session/建 12MB
+// staging + LRU 淘汰重建 + 全局组锁串行, 相机回调线程阻塞 → Apple watchdog 杀。
+// 千面(唯一稳定参照)只有 3 个全局 session: 永不冷启动/永不重建/零抖动。
+// 本体系对齐: 固定 3 车道 + 单一 grow-only 中转 + 全局 token 复用 + 按格式熔断。
+// 旧 per-key/组共享/结果缓存体系整体退役(热路径不再触达, 池保持空)。
+@property (nonatomic, strong) NSLock *laneLockBGRA;        // BGRA 车道锁
+@property (nonatomic, strong) NSLock *laneLockYUV;         // 420f/420v/p420 车道锁
+@property (nonatomic, strong) NSLock *laneLockPrivate;     // 私有格式两步法车道锁(含 s1)
+@property (nonatomic, assign) VTPixelTransferSessionRef twoStepS1Session;  // 420f→BGRA 专用(与 prerender session 隔离)
+@property (nonatomic, assign) CVPixelBufferRef laneStaging;     // 两步法唯一中转(grow-only, BGRA)
+@property (nonatomic, assign) size_t laneStagingW;
+@property (nonatomic, assign) size_t laneStagingH;
+@property (nonatomic, assign) uint64_t laneLastToken;      // staging 内容帧代数(同帧多消费者 s1 免单)
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *laneFailCounts;   // 格式 fourcc → 连续失败
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *laneDisabled;     // 格式 fourcc → 熔断标记
 // 私有格式两步法中转: 已迁移到下方 per-key 池(2026-08-15), 旧单例字段移除
 // 两步法按流池化(2026-08-15): 相机多条流(预览/照片/录像)目标尺寸各异,
 // 共用一个 session/staging 交替不同尺寸 → VT 内部 pipeline 状态污染 → 偶发
@@ -238,6 +256,18 @@ static void vcam_gpu_log(NSString *msg) {
         _statsLock = [[NSLock alloc] init];
         _poolDictLock = [[NSLock alloc] init];
 
+        // 千面模型固定车道(2026-08-19): 3 锁 + s1 会话 + 熔断表
+        _laneLockBGRA = [[NSLock alloc] init];
+        _laneLockYUV = [[NSLock alloc] init];
+        _laneLockPrivate = [[NSLock alloc] init];
+        _twoStepS1Session = NULL;
+        _laneStaging = NULL;
+        _laneStagingW = 0;
+        _laneStagingH = 0;
+        _laneLastToken = 0;
+        _laneFailCounts = [NSMutableDictionary dictionary];
+        _laneDisabled = [NSMutableDictionary dictionary];
+
         // 软件渲染 CIContext（回退用）
         @try {
             _preprocessContext = [CIContext contextWithOptions:@{
@@ -295,6 +325,15 @@ static void vcam_gpu_log(NSString *msg) {
     if (_privateTransferSession) {
         InvalidateFunc invalidate = (InvalidateFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionInvalidate");
         if (invalidate) invalidate(_privateTransferSession);
+    }
+    // 千面车道(2026-08-19): s1 会话 + 唯一中转
+    if (_twoStepS1Session) {
+        InvalidateFunc invalidate = (InvalidateFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionInvalidate");
+        if (invalidate) invalidate(_twoStepS1Session);
+    }
+    if (_laneStaging) {
+        CVPixelBufferRelease(_laneStaging);
+        _laneStaging = NULL;
     }
     // 释放两步法池(per-key session + staging buffer)
     {
@@ -1183,102 +1222,125 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
 
     NSString *poolKey = [NSString stringWithFormat:@"%zu_%zu_%u", dstW, dstH, (unsigned)dstFormat];
 
-    // 已熔断流不进 LRU(2026-08-17 微型流放开配套): 熔断语义是永久跳过, 若继续
-    // touch LRU 会在池中占位, 把真正活跃流的 session/staging 挤出去 → 循环淘汰
-    // 重建 → 抖动。先查熔断标记再决定是否跟踪
-    // 视频模式卡顿修复(2026-08-17): 'p420'(0x70343230) 是标准 YUV 4:2:0 平面家族
-    // (录像回放/编码流常用), 之前不在白名单被判"私有"送两步法 —— 停录瞬间
-    // 1920x1080 p420 流 s1+s2 = 32ms/帧, CPU 冲 141%, 全部流排队 = 画面卡住。
-    // p420 一步直转(420f→p420)是日志实证可行路径, 归入一步白名单
-    BOOL isPrivate = !(dstFormat == kCVPixelFormatType_32BGRA ||
-                       dstFormat == 0x70343230 /* 'p420' */ ||
-                       (dstFormat & 0xffffffef) == '420f');
-    if (isPrivate ? [_twoStepDisabledPool[poolKey] boolValue]
-                  : [_oneStepDisabledPool[poolKey] boolValue]) {
-        return NO;
-    }
-    [self touchStreamKeyLRU:poolKey];
-    BOOL isYuv = ((dstFormat & 0xffffffef) == '420f' ||
-                  dstFormat == 0x70343230);  // 420f/420v 掩码同判 + p420
-    uint64_t dstPixels = (uint64_t)dstW * dstH;
+    // ===== 千面模型固定车道(2026-08-19 相机开启猝死链路根治, 全 App 通用) =====
+    // 设备实证(1.2.4): 相机开启多流突发时 per-key 池体系在热路径现场建 session/
+    // 建 staging + LRU 淘汰重建 + 组锁串行 → 相机回调线程阻塞 → watchdog 杀
+    // mediaserverd(13:48:42-13:49:02 四连崩, 无 .ips 无 CPU 超限)。
+    // 对齐千面(唯一稳定参照, 3 全局 session): 固定车道 + 车道锁, 热路径零创建
+    // 零淘汰零抖动; 私有格式两步法整车道串行(千面等价稳定模型, 多流排队延迟
+    // 可接受 —— 稳定性优先于并行)。token 复用保留(同帧多消费者 s1 免单 +
+    // CPU 降载冻结复用)。按格式(非按流)熔断: 同 fourcc 连续失败 2 次 →
+    // 永久跳过该格式保真实相机(防 wakeups 风暴, '18f0' 分析流教训)。
+    NSNumber *fmtKey = @(dstFormat);
+    if ([_laneDisabled[fmtKey] boolValue]) return NO;
 
-    // ===== GPU 快路径(2026-08-16 多流 1080p CPU 超配额最终解) =====
-    // 已禁用(CI/MTL 在 mediaserverd 实测 CPU fallback 6.4ms/帧, 见 init 注释)
-    if (_metalAvailable && (dstFormat == kCVPixelFormatType_32BGRA || isYuv)) {
-        NSLock *glock = [self oneStepLockForKey:poolKey];
-        [glock lock];
-        BOOL gok = [self gpuCropFillRender:src toPixelBuffer:dst key:poolKey token:token];
-        [glock unlock];
-        if (gok) {
-            [self noteStreamRender:poolKey pixels:dstPixels];
+    BOOL isYuvLane = ((dstFormat & 0xffffffef) == '420f' || dstFormat == 0x70343230 /* p420 */);
+    BOOL isBgraLane = (dstFormat == kCVPixelFormatType_32BGRA);
+
+    // ---- 私有格式车道: 两步法(src→BGRA staging→私有), 整车道串行 ----
+    if (!isBgraLane && !isYuvLane) {
+        [_laneLockPrivate lock];
+        // s1/s2 会话懒建(进程内仅一次, 之后热路径零创建)
+        if (!_twoStepS1Session) {
+            if (VTPixelTransferSessionCreate(kCFAllocatorDefault, &_twoStepS1Session) == noErr) {
+                VTSessionSetProperty(_twoStepS1Session, CFSTR("ScalingMode"), CFSTR("Trim"));
+                VTSessionSetProperty(_twoStepS1Session, CFSTR("RealTime"), kCFBooleanTrue);
+                vcam_gpu_log(@"[vcam] Lane S1 session created (Trim)");
+            }
+        }
+        if (!_privateTransferSession) {
+            if (VTPixelTransferSessionCreate(kCFAllocatorDefault, &_privateTransferSession) == noErr) {
+                VTSessionSetProperty(_privateTransferSession, CFSTR("ScalingMode"), CFSTR("Trim"));
+                VTSessionSetProperty(_privateTransferSession, CFSTR("RealTime"), kCFBooleanTrue);
+                vcam_gpu_log(@"[vcam] Lane S2(private) session created (Trim)");
+            }
+        }
+        // staging grow-only: 源是解码输出(尺寸恒定), 通常进程内只建一次;
+        // 换更大分辨率源时原地重建(锁内, 无读者)
+        if (!_laneStaging || _laneStagingW < srcW || _laneStagingH < srcH) {
+            CVPixelBufferRef nb = NULL;
+            if (CVPixelBufferCreate(kCFAllocatorDefault, srcW, srcH,
+                                    kCVPixelFormatType_32BGRA, NULL, &nb) == noErr && nb) {
+                if (_laneStaging) CVPixelBufferRelease(_laneStaging);
+                _laneStaging = nb;
+                _laneStagingW = srcW;
+                _laneStagingH = srcH;
+                _laneLastToken = 0;  // 内容失效
+                vcam_gpu_log([NSString stringWithFormat:@"[vcam] Lane staging built %zux%zu", srcW, srcH]);
+            }
+        }
+
+        BOOL ok = NO;
+        if (_twoStepS1Session && _privateTransferSession && _laneStaging) {
+            // s1: token 复用(同帧多消费者/CPU 冻结 token → 跳过缩放只付 s2)
+            if (token != 0 && _laneLastToken == token) {
+                ok = YES;  // staging 内容已是本帧
+            } else {
+                OSStatus st1 = VTPixelTransferSessionTransferImage(_twoStepS1Session, src, _laneStaging);
+                if (st1 == noErr) {
+                    _laneLastToken = token;  // token=0 也记(下帧若带 token 不匹配自然重付)
+                    ok = YES;
+                } else {
+                    _laneLastToken = 0;  // staging 内容不可信
+                    vcam_gpu_log([NSString stringWithFormat:@"[vcam] lane s1 failed (%d)", (int)st1]);
+                }
+            }
+            // s2: BGRA staging → 私有目标(逐流尺寸/格式不同, VT 内部处理)
+            if (ok) {
+                CFAbsoluteTime t2 = CFAbsoluteTimeGetCurrent();
+                OSStatus st2 = VTPixelTransferSessionTransferImage(_privateTransferSession, _laneStaging, dst);
+                [self noteStageTiming:poolKey stage:2 ms:(CFAbsoluteTimeGetCurrent() - t2) * 1000.0];
+                if (st2 != noErr) ok = NO;
+            }
+        }
+        [_laneLockPrivate unlock];
+
+        if (ok) {
+            [self noteStreamRender:poolKey pixels:(uint64_t)dstW * dstH];
             return YES;
         }
-    }
-
-    // ===== 混合路径(2026-08-17 闪烁修复: 按目标格式分流) =====
-    // 教训: "统一一步直转"是过头改革 —— 420f→私有格式(|8v0/-8f0/xv0)一步被 VT
-    // 拒绝(-12905, 这正是两步法当初存在的原因), 失败帧保留真实相机画面 →
-    // 与成功帧交替显示 = 用户看到的"替换/原画面闪烁"。
-    // 420f→p420 一步直转是日志实证的可行特例(标准 YUV 家族内互转)。
-    // 正确分流:
-    //   私有格式目标 → 两步法(BGRA staging, 实测唯一可行: 昨天 stage2 12.1ms
-    //     成功日志 = BGRA→|8v0 可行; 420f 直转被拒)
-    //   标准格式(BGRA/420f/420v/p420) → 一步直转(便宜 ~0.5-7ms 且实证成功)
-    // 两步法 CPU 高(17.8ms/帧)但卡顿根因(46/48 横跳)已由 80/60 紧急档根治,
-    // 高成本只落在私有流上且不再触发任何机制切换 → 稳定不闪烁。
-    if (isPrivate) {
-        // 组 key LRU touch 必须在 per-key 锁外(@synchronized 与 keyLock 锁序单向:
-        // 淘汰路径 synchronized→keyLock, transfer 路径禁止 keyLock→synchronized)
-        if (token != 0) {
-            NSString *rk = [NSString stringWithFormat:@"g:%d",
-                            (int)llround((double)dstH * 1000.0 / (double)dstW)];
-            [self touchStreamKeyLRU:rk];
-        }
-        NSLock *keyLock = [self twoStepLockForKey:poolKey];
-        [keyLock lock];
-        BOOL ok = [self twoStepTransferLocked:src toPixelBuffer:dst key:poolKey token:token];
-        [keyLock unlock];
-        if (ok) [self noteStreamRender:poolKey pixels:(uint64_t)dstW * dstH];
-        return ok;
-    }
-
-    // 标准格式一步直转: per-stream session+锁并行, 连续失败 2 次熔断
-    // (跳过该流保真实相机, 防 wakeups 风暴 —— '18f0' 分析流教训)
-    NSLock *lock = [self oneStepLockForKey:poolKey];
-    if (!lock) return NO;
-    [lock lock];
-
-    // 熔断检查(锁内, 与失败计数同 key)
-    if ([_oneStepDisabledPool[poolKey] boolValue]) {
-        [lock unlock];
-        return NO;
-    }
-
-    // 顺序: 先锁后取 session —— LRU 淘汰持同一把锁, 避免窗口期 use-after-free
-    VTPixelTransferSessionRef session = [self oneStepSessionForKey:poolKey];
-    if (!session) {
-        [lock unlock];
-        return NO;
-    }
-    CFAbsoluteTime tOp = CFAbsoluteTimeGetCurrent();
-    OSStatus status = VTPixelTransferSessionTransferImage(session, src, dst);
-    [self noteStageTiming:poolKey stage:2 ms:(CFAbsoluteTimeGetCurrent() - tOp) * 1000.0];
-    [lock unlock];
-
-    if (status != noErr) {
+        // 失败计数/熔断(按格式): 同 fourcc 连续 2 次 → 永久跳过
         @synchronized(self) {
-            NSInteger fails = [_oneStepFailPool[poolKey] integerValue] + 1;
-            _oneStepFailPool[poolKey] = @(fails);
+            NSInteger fails = [_laneFailCounts[fmtKey] integerValue] + 1;
+            _laneFailCounts[fmtKey] = @(fails);
             if (fails >= 2) {
-                _oneStepDisabledPool[poolKey] = @YES;
-                vcam_gpu_log([NSString stringWithFormat:@"[vcam] one-step CIRCUIT-BROKEN stream %@ (err %d, keep camera)",
-                              poolKey, (int)status]);
+                _laneDisabled[fmtKey] = @YES;
+                vcam_gpu_log([NSString stringWithFormat:@"[vcam] lane CIRCUIT-BROKEN format %u (err, keep camera)", (unsigned)dstFormat]);
             }
         }
         return NO;
     }
-    [self noteStreamRender:poolKey pixels:(uint64_t)dstW * dstH];
-    return YES;
+
+    // ---- 标准格式车道: 一步直转, 固定会话 ----
+    VTPixelTransferSessionRef session = isBgraLane ? _bgraTransferSession : _yuvTransferSession;
+    NSLock *laneLock = isBgraLane ? _laneLockBGRA : _laneLockYUV;
+    if (!session) {
+        if (isBgraLane) [self setupBGRATransferSession]; else [self setupYUVTransferSession];
+        session = isBgraLane ? _bgraTransferSession : _yuvTransferSession;
+    }
+    if (!session || !laneLock) return NO;
+
+    [laneLock lock];
+    CFAbsoluteTime tOp = CFAbsoluteTimeGetCurrent();
+    OSStatus status = VTPixelTransferSessionTransferImage(session, src, dst);
+    [self noteStageTiming:poolKey stage:2 ms:(CFAbsoluteTimeGetCurrent() - tOp) * 1000.0];
+    [laneLock unlock];
+
+    if (status == noErr) {
+        [self noteStreamRender:poolKey pixels:(uint64_t)dstW * dstH];
+        return YES;
+    }
+    // 失败计数/熔断(按格式)
+    @synchronized(self) {
+        NSInteger fails = [_laneFailCounts[fmtKey] integerValue] + 1;
+        _laneFailCounts[fmtKey] = @(fails);
+        if (fails >= 2) {
+            _laneDisabled[fmtKey] = @YES;
+            vcam_gpu_log([NSString stringWithFormat:@"[vcam] lane CIRCUIT-BROKEN format %u (err %d, keep camera)",
+                          (unsigned)dstFormat, (int)status]);
+        }
+    }
+    return NO;
 }
 
 // 按流渲染统计累计(诊断)
@@ -1502,6 +1564,17 @@ static const NSUInteger kVcamMaxStreamKeys = 6;
         }
         [_bgraBufferPoolMap removeAllObjects];
     }
+    // 千面车道中转释放(2026-08-19): 深度空闲时归还内存, 恢复首帧锁内重建(一次性)
+    [_laneLockPrivate lock];
+    if (_laneStaging) {
+        CVPixelBufferRelease(_laneStaging);
+        _laneStaging = NULL;
+        _laneStagingW = 0;
+        _laneStagingH = 0;
+        _laneLastToken = 0;
+        released++;
+    }
+    [_laneLockPrivate unlock];
     vcam_gpu_log([NSString stringWithFormat:@"[vcam] idle heavy buffers released: %lu entries (jetsam guard)", (unsigned long)released]);
 }
 
