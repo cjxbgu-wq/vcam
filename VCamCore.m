@@ -84,8 +84,9 @@ static BOOL vcam_log_enabled(void) {
     if (cached < 0) {
         @try {
             NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Media/DCIM/vc.plist"];
-            cached = (d && d[@"logEnabled"]) ? [d[@"logEnabled"] boolValue] : 0;
-        } @catch (NSException *e) { cached = 0; }
+            if (!d) d = [NSDictionary dictionaryWithContentsOfFile:@"/rootfs/private/var/mobile/Media/DCIM/vc.plist"];
+            if (d) cached = d[@"logEnabled"] ? [d[@"logEnabled"] boolValue] : 0;
+        } @catch (NSException *e) {}
     }
     return cached == 1;
 }
@@ -381,14 +382,17 @@ static void vcam_core_log(NSString *msg) {
                     emaPct = emaInit ? (emaPct * 0.6 + pct * 0.4) : pct;
                     emaInit = YES;
                     BOOL minHoldOk = (nowT - lastModeSwitch) > (lowPower ? 5.0 : 8.0);
-                    if (emaPct > 80.0 && !lowPower && minHoldOk) {
+                    // 阈值下调(2026-08-18 云闪付扫码被杀): 扫码 App 多流高频场景 CPU
+                    // 冲 >80% 时 runningboardd 先于降载出手杀进程(无 .ips, EXC_RESOURCE
+                    // 类击杀, mediaserverd runs+1 = 黑屏)。72% 提前介入给系统留余量。
+                    if (emaPct > 72.0 && !lowPower && minHoldOk) {
                         lowPower = YES;
                         lastModeSwitch = nowT;
-                        vcam_core_log([NSString stringWithFormat:@"[vcam] CPU %.0f%% (ema) >80%%, EMERGENCY throttle ON", emaPct]);
-                    } else if (emaPct < 60.0 && lowPower && minHoldOk) {
+                        vcam_core_log([NSString stringWithFormat:@"[vcam] CPU %.0f%% (ema) >72%%, EMERGENCY throttle ON", emaPct]);
+                    } else if (emaPct < 55.0 && lowPower && minHoldOk) {
                         lowPower = NO;
                         lastModeSwitch = nowT;
-                        vcam_core_log([NSString stringWithFormat:@"[vcam] CPU %.0f%% (ema) <60%%, throttle OFF", emaPct]);
+                        vcam_core_log([NSString stringWithFormat:@"[vcam] CPU %.0f%% (ema) <55%%, throttle OFF", emaPct]);
                     }
                 }
             // 负差分(线程快照抖动): 只推进时间基线, 不更新 CPU 基线(下轮重算), 不判退
@@ -923,21 +927,25 @@ static void vcam_core_log(NSString *msg) {
             vcam_core_log(@"[vcam] camera idle >2s, pipeline paused (decode+prerender)");
         }
 
-        // 深度空闲内存释放(2026-08-17 偶发全黑优化): 空闲暂停后再等 10s(排除
+        // 深度空闲内存释放(2026-08-17 偶发全黑优化): 空闲暂停后再等 58s(排除
         // 快速开关相机场景, 避免重建开销), 释放 GPU 池全部流资源(组 staging
         // ~45MB+ per-key session/staging/cache)。mediaserverd inactive jetsam
         // 硬限 75MB, 空闲 footprint 120MB+ 会被杀 → 下次开相机黑屏 2-3s。
-        // 恢复渲染时惰性重建(首帧一次性 ~10-20ms)
+        // 恢复渲染时惰性重建(首帧一次性 ~10-20ms)。
+        // 12s→60s(2026-08-18 云闪付扫码黑屏): 扫码页相机流周期性静默/唤醒, 12s 窗口
+        // 造成"释放→重建→释放"循环, 每轮重建 session/staging 是 CPU 尖峰, 叠加扫码
+        // 多流稳态负载推高 CPU → runningboardd 杀进程。60s 只在真长期空闲(锁屏/退
+        // 出相机)才释放, 扫码场景不再循环。
         if (strongSelf.isMediaserverdProcess && strongSelf.enabled && strongSelf.pipelineIdle &&
             strongSelf->_lastRenderActivity > 0 &&
-            (CFAbsoluteTimeGetCurrent() - strongSelf->_lastRenderActivity) > 12.0) {
+            (CFAbsoluteTimeGetCurrent() - strongSelf->_lastRenderActivity) > 60.0) {
             static CFAbsoluteTime lastIdleRelease = 0;
             CFAbsoluteTime nowIdle = CFAbsoluteTimeGetCurrent();
             // 释放一次后不再重复(资源已空); render 心跳恢复后再空闲才会重新进入
             if (nowIdle - lastIdleRelease > 30.0) {
                 lastIdleRelease = nowIdle;
                 [strongSelf->_gpuProcessor releaseIdleMemory];
-                vcam_core_log(@"[vcam] camera idle >12s, GPU stream pools released (jetsam guard)");
+                vcam_core_log(@"[vcam] camera idle >60s, GPU stream pools released (jetsam guard)");
             }
         }
 
