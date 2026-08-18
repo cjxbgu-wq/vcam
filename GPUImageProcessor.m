@@ -1488,6 +1488,38 @@ static const NSUInteger kVcamMaxStreamKeys = 12;
     }
 }
 
+// 预渲染重缓冲释放(2026-08-18 云闪付崩溃循环): 只动缓冲不动 session(恢复零成本)。
+// idle 暂停态调用(预渲染线程已 sleep, render 心跳静默 >2s, 竞态窗口与
+// releaseIdleMemory 同级)。释放后 VCamCore 的 _syncDisplayFrame 快照保留,
+// 恢复期间 render 冻结帧显示, 重载完成后无缝跟上。
+- (void)releaseHeavyBuffersForIdle {
+    NSUInteger released = 0;
+    @synchronized(self) {
+        if (_adaptiveRotateCache) {
+            CVPixelBufferRelease(_adaptiveRotateCache);
+            _adaptiveRotateCache = NULL;
+            released++;
+        }
+        for (int i = 0; i < 3; i++) {
+            CVPixelBufferRef b = [self prerenderRotateBufferAtSlot:i];
+            if (b) {
+                CVPixelBufferRelease(b);
+                [self setPrerenderRotateBuffer:NULL atSlot:i];
+                released++;
+            }
+        }
+        if (_prerenderMirrorPool0) { CVPixelBufferRelease(_prerenderMirrorPool0); _prerenderMirrorPool0 = NULL; released++; }
+        if (_prerenderMirrorPool1) { CVPixelBufferRelease(_prerenderMirrorPool1); _prerenderMirrorPool1 = NULL; released++; }
+        if (_prerenderMirrorPool2) { CVPixelBufferRelease(_prerenderMirrorPool2); _prerenderMirrorPool2 = NULL; released++; }
+        for (id key in _bgraBufferPoolMap) {
+            CVPixelBufferPoolRelease((__bridge CVPixelBufferPoolRef)_bgraBufferPoolMap[key]);
+            released++;
+        }
+        [_bgraBufferPoolMap removeAllObjects];
+    }
+    vcam_gpu_log([NSString stringWithFormat:@"[vcam] idle heavy buffers released: %lu entries (jetsam guard)", (unsigned long)released]);
+}
+
 // 按流渲染统计(诊断, 30s 窗口): takeStreamStats 输出并清零
 // 2026-08-16: 附带每流 stage1/stage2 平均耗时(ms) —— CPU 归因探针
 // 死锁修复(2026-08-17): statsLock(与写入端一致, 不再用 @synchronized(self))
