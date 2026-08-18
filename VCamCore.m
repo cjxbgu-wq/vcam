@@ -156,6 +156,10 @@ static void vcam_core_log(NSString *msg) {
 // CPU≈0)+预渲染睡眠; 相机流恢复(render 被调)同步即时唤醒(先吃缓存帧, 解码 ~100ms 内跟上)
 @property (nonatomic, assign) CFAbsoluteTime lastRenderActivity;
 @property (nonatomic, assign) BOOL pipelineIdle;
+// 空闲卸载标记(2026-08-18 云闪付崩溃循环): pipelineIdle 暂停时已卸载媒体管线,
+// render 心跳恢复时按 _idleResumePath 异步重载(期间渲染冻结快照帧不黑屏)
+@property (nonatomic, assign) BOOL idleUnloaded;
+@property (nonatomic, copy) NSString *idleResumePath;
 // CPU 闭环降载(2026-08-16): 进程 CPU 接近 daemon 50% 红线时置 YES ——
 // 解码/预渲染节拍降为 1/3(替换内容 ~10fps 更新, 连续无感), 冻结帧走 staging 复用
 @property (nonatomic, assign) BOOL lowPowerDecode;
@@ -302,6 +306,17 @@ static void vcam_core_log(NSString *msg) {
     if (self->_pipelineIdle) {
         self->_pipelineIdle = NO;                 // 预渲染线程 ≤0.1s 内自行恢复
         [self->_videoPlayer startDecodingThread]; // 空转线程恢复解码标志
+        // 空闲卸载过媒体管线(2026-08-18): 异步重载 —— 期间本帧与后续帧渲染
+        // _syncDisplayFrame 冻结快照(画面静止不黑), 加载完成后预渲染无缝跟上。
+        // completion 置 nil: 失败场景与正常加载路径一致由轮询/文件监听兜底
+        if (self->_idleUnloaded) {
+            self->_idleUnloaded = NO;
+            NSString *resumePath = self->_idleResumePath;
+            if (resumePath.length > 0) {
+                [self->_videoPlayer loadVideoAtPath:resumePath completion:nil];
+                vcam_core_log([NSString stringWithFormat:@"[vcam] camera resume after idle unload, reloading: %@", resumePath.lastPathComponent]);
+            }
+        }
     }
 
     // 1. 显示快照 + 帧代数(2026-08-16 照片模式叠影修复):
@@ -918,13 +933,23 @@ static void vcam_core_log(NSString *msg) {
 
         // 空闲看门狗(2026-08-16 发热优化): 替换开着但相机流心跳 >2s 未刷新
         // (相机关闭/切后台/非相机 App) → 暂停解码+预渲染, CPU 归零;
-        // 相机重新打开时 render 同步清 pipelineIdle 即时恢复
+        // 相机重新打开时 render 同步清 pipelineIdle 即时恢复。
+        // 2026-08-18 云闪付崩溃循环根因修复: 只停 CPU 不够 —— 部分扫码 App 的
+        // 相机流不经过 hook 节点, mediaserverd 被系统判 inactive, 而 dylib 已初始化
+        // 的 footprint 124MB > inactive jetsam 硬限 75MB → 5-6s 击杀 → 崩溃循环
+        // (renders=0 即被杀, CPU 仅 1%, 无 .ips, telemetry fp=124MB 实证)。
+        // 暂停时同步卸载媒体管线(reader/asset/帧队列/预渲染缓冲), 把 footprint
+        // 压回线下; 恢复时冻结快照帧顶住 + 异步重载(~几百 ms)无缝跟上
         if (strongSelf.isMediaserverdProcess && strongSelf.enabled && !strongSelf.pipelineIdle &&
             strongSelf->_lastRenderActivity > 0 &&
             (CFAbsoluteTimeGetCurrent() - strongSelf->_lastRenderActivity) > 2.0) {
             strongSelf->_pipelineIdle = YES;
             [strongSelf->_videoPlayer stopDecodingThread];
-            vcam_core_log(@"[vcam] camera idle >2s, pipeline paused (decode+prerender)");
+            strongSelf->_idleResumePath = [strongSelf->_videoPlayer currentVideoPath];
+            [strongSelf->_videoPlayer unloadForIdle];
+            [strongSelf->_gpuProcessor releaseHeavyBuffersForIdle];
+            strongSelf->_idleUnloaded = YES;
+            vcam_core_log(@"[vcam] camera idle >2s, pipeline paused + media unloaded (jetsam guard)");
         }
 
         // 深度空闲内存释放(2026-08-17 偶发全黑优化): 空闲暂停后再等 58s(排除
