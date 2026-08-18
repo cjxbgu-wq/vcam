@@ -394,23 +394,45 @@ static void vcam_core_log(NSString *msg) {
             static BOOL emaInit = NO;
             static BOOL lowPower = NO;
             static CFAbsoluteTime lastModeSwitch = 0;  // 上次 ON/OFF 切换时刻
+            // 启动冷却(2026-08-18 6秒三连崩根因): mediaserverd 启动/重启后首帧,
+            // 相机管线初始化 + 视频加载 + 帧队列预填全速叠加 → CPU 冲 195%
+            // (telemetry 实证) → runningboardd 杀(EXC_RESOURCE CPU, 无 .ips) →
+            // 重启又冲 → 6 秒三连崩循环。首帧起 10s 强制 lowPower(解码/预渲染
+            // 20fps 上限), 系统稳住后转 CPU 闭环接管。static 生命周期 = 进程级,
+            // mediaserverd 重启归零重新生效, 相机开关(App 切换)不误触发
+            static CFAbsoluteTime bootGraceUntil = 0;
+            static BOOL bootGraceDone = NO;
             CFAbsoluteTime nowT = CFAbsoluteTimeGetCurrent();
-            if (nowT - lastCpuCheck > 2.0) {
+            if (!bootGraceDone) {
+                if (bootGraceUntil == 0) {
+                    bootGraceUntil = nowT + 10.0;
+                    lowPower = YES;
+                    vcam_core_log(@"[vcam] boot grace: forced throttle 10s (startup storm guard)");
+                } else if (nowT >= bootGraceUntil) {
+                    bootGraceDone = YES;
+                    lastModeSwitch = nowT;  // 退出判定从冷却结束起算
+                    vcam_core_log(@"[vcam] boot grace ended, CPU loop takes over");
+                }
+            }
+            BOOL graceOn = !bootGraceDone;  // 冷却期内强制低功率
+            if (nowT - lastCpuCheck > 0.8) {  // 2s→0.8s(2026-08-18): 响应提速, 旧 2s+EMA 滞后 4-6s 挡不住启动风暴
                 double cpuSec = [vcam_process_cpu_seconds() doubleValue];
                 double delta = cpuSec - lastCpuSec;
                 if (lastCpuSec > 0 && nowT > lastCpuSample && delta >= 0) {
                     double pct = delta / (nowT - lastCpuSample) * 100.0;
-                    emaPct = emaInit ? (emaPct * 0.6 + pct * 0.4) : pct;
+                    emaPct = emaInit ? (emaPct * 0.5 + pct * 0.5) : pct;  // 0.6/0.4→0.5/0.5 更灵敏
                     emaInit = YES;
-                    BOOL minHoldOk = (nowT - lastModeSwitch) > (lowPower ? 5.0 : 8.0);
-                    // 阈值下调(2026-08-18 云闪付扫码被杀): 扫码 App 多流高频场景 CPU
-                    // 冲 >80% 时 runningboardd 先于降载出手杀进程(无 .ips, EXC_RESOURCE
-                    // 类击杀, mediaserverd runs+1 = 黑屏)。72% 提前介入给系统留余量。
-                    if (emaPct > 72.0 && !lowPower && minHoldOk) {
+                    // 进入快(2s)/退出慢(10s): 2026-08-18 重构 —— 旧 8s 进入 hold
+                    // 在启动风暴里形同虚设(6 秒内死 3 次); 退出放慢防振荡
+                    BOOL minHoldOk = (nowT - lastModeSwitch) > (lowPower ? 10.0 : 2.0);
+                    // 硬闸: EMA>110% = 逼近 2 核, 无视 hold 立即压(秒级尖峰也杀进程)
+                    BOOL hardTrip = (emaPct > 110.0);
+                    // 阈值(2026-08-18): 72% 提前介入给 runningboardd 留余量;
+                    if ((emaPct > 72.0 || hardTrip) && !lowPower && (minHoldOk || hardTrip)) {
                         lowPower = YES;
                         lastModeSwitch = nowT;
                         vcam_core_log([NSString stringWithFormat:@"[vcam] CPU %.0f%% (ema) >72%%, EMERGENCY throttle ON", emaPct]);
-                    } else if (emaPct < 55.0 && lowPower && minHoldOk) {
+                    } else if (emaPct < 55.0 && lowPower && minHoldOk && !graceOn) {
                         lowPower = NO;
                         lastModeSwitch = nowT;
                         vcam_core_log([NSString stringWithFormat:@"[vcam] CPU %.0f%% (ema) <55%%, throttle OFF", emaPct]);
