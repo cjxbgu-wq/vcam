@@ -114,6 +114,9 @@ typedef NS_ENUM(NSInteger, VCamMediaType) {
 // 恢复: VCamCore render 心跳恢复时 loadVideoAtPath:currentVideoPath 异步重载
 - (void)unloadForIdle;
 
+// 显式从头播(重播按钮/换源): 清除空闲续播位置(2026-08-19)
+- (void)resetPlaybackPosition;
+
 // 帧获取
 - (CVPixelBufferRef)getCurrentFrame;
 - (CVPixelBufferRef)copyCurrentFrame CF_RETURNS_RETAINED;
