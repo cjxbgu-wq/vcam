@@ -308,13 +308,19 @@ static void vcam_core_log(NSString *msg) {
         [self->_videoPlayer startDecodingThread]; // 空转线程恢复解码标志
         // 空闲卸载过媒体管线(2026-08-18): 异步重载 —— 期间本帧与后续帧渲染
         // _syncDisplayFrame 冻结快照(画面静止不黑), 加载完成后预渲染无缝跟上。
-        // completion 置 nil: 失败场景与正常加载路径一致由轮询/文件监听兜底
+        // 必须后台队列(2026-08-18 watchdog 修复): loadVideoFile 内
+        // tracksWithMediaType 是同步磁盘解析, 直接在 render(相机管线 hook 线程)
+        // 执行会阻塞相机管线 0.5-2s → mediaserverd watchdog 杀进程(设备实证:
+        // 恢复重载后 6s 被杀)。冻结帧机制保证加载期间画面连续
         if (self->_idleUnloaded) {
             self->_idleUnloaded = NO;
             NSString *resumePath = self->_idleResumePath;
             if (resumePath.length > 0) {
-                [self->_videoPlayer loadVideoAtPath:resumePath completion:nil];
-                vcam_core_log([NSString stringWithFormat:@"[vcam] camera resume after idle unload, reloading: %@", resumePath.lastPathComponent]);
+                VCamCore *core = self;
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+                    [core->_videoPlayer loadVideoAtPath:resumePath completion:nil];
+                });
+                vcam_core_log([NSString stringWithFormat:@"[vcam] camera resume after idle unload, reloading(async): %@", resumePath.lastPathComponent]);
             }
         }
     }
@@ -948,6 +954,24 @@ static void vcam_core_log(NSString *msg) {
             strongSelf->_idleResumePath = [strongSelf->_videoPlayer currentVideoPath];
             [strongSelf->_videoPlayer unloadForIdle];
             [strongSelf->_gpuProcessor releaseHeavyBuffersForIdle];
+            // live 帧链也释放(2026-08-18 砍常驻内存): 预渲染线程已因 pipelineIdle
+            // 睡眠不再产出, _syncDisplayFrame 快照独立 retain 旧内容, 恢复期间
+            // render 冻结显示快照(L353 的 _liveYUV 为 NO 不推进), 重载完成后无缝跟上。
+            // 持 _processLock 与 render 线程互斥(该字段 render 侧同锁访问)
+            [strongSelf->_processLock lock];
+            if (strongSelf->_liveYUVPixelBuffer) {
+                CVPixelBufferRelease(strongSelf->_liveYUVPixelBuffer);
+                strongSelf->_liveYUVPixelBuffer = NULL;
+            }
+            if (strongSelf->_liveBGRAPixelBuffer) {
+                CVPixelBufferRelease(strongSelf->_liveBGRAPixelBuffer);
+                strongSelf->_liveBGRAPixelBuffer = NULL;
+            }
+            if (strongSelf->_cachedProcessedFrame) {
+                CVPixelBufferRelease(strongSelf->_cachedProcessedFrame);
+                strongSelf->_cachedProcessedFrame = NULL;
+            }
+            [strongSelf->_processLock unlock];
             strongSelf->_idleUnloaded = YES;
             vcam_core_log(@"[vcam] camera idle >2s, pipeline paused + media unloaded (jetsam guard)");
         }
