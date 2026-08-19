@@ -261,12 +261,17 @@ static VTPixelTransferSessionRef gVcamNormalSession = NULL;
 // 设备遥测实证: |xv0 流 BGRA→私有 3MP 上采样+RGB→YUV = 8.1ms/帧(×24fps≈19% CPU,
 // 发热主热点); 而 p420 流 420f→p420 YUV 域直转同量级输出仅 2.8ms。
 // 拆两段: RGB→YUV 在源分辨率完成(~1ms), 上采样走同格式缩放(YUV 域快路径 ~3ms)。
+// 设备实证#2(2026-08-20 1.3.7): BGRA→私有 **同尺寸**直转 -12905 —— 私有格式
+// 写入仅走缩放路径 → mid 必须与源有尺寸差(源+2 微拉伸 <0.3% 不可见);
+// "私有→私有 同格式缩放"支持性未知 → 运行时一次性探针验证, 失败永久 memo
+// 回退直转(防每帧重试+日志风暴, 1.3.7 曾因此 8.1→9.3ms 反退化)。
 // 调用方持 _laneLockPrivate; lastUse LRU 同裁剪槽
 typedef struct {
     uint32_t fmt;               // 私有目标格式(|xv0/-8f0/|8v0...)
-    size_t w, h;                // 源尺寸(s2src 尺寸)
-    CVPixelBufferRef staging;   // 私有格式 @ 源尺寸
+    size_t w, h;                // mid 尺寸(= 源+2, 强制缩放路径)
+    CVPixelBufferRef staging;   // 私有格式 @ mid 尺寸
     uint64_t token;             // 内容帧代数(同帧多流共享跳过 s2a 转换)
+    int8_t probeState;          // 0=未探测 1=拆段可用 -1=不支持(永久回退直转)
     CFAbsoluteTime lastUse;
 } VCamYuvStagingSlot;
 #define kVcamYuvStagingMax 4
@@ -1420,23 +1425,32 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
     return copied ? slot->staging : NULL;
 }
 
-// 发热优化(2026-08-20): 取/建私有格式 @ 源尺寸的 YUV 中转槽, 并把 s2src(BGRA)
-// 转换进去(RGB→YUV 在源分辨率完成, ~0.3MP 只付 ~1ms; 3MP 直转要 8.1ms)。
-// 同帧( token 匹配)同源已转 → 直接复用跳过转换。返回 NULL = 转换失败(回退直转)。
+// 发热优化(2026-08-20 v2): 取/建私有格式 @ mid(源+2) 尺寸的 YUV 中转槽, 并把
+// s2src(BGRA) 转换进去(RGB→YUV 在 ~0.3MP 源分辨率完成 ~1ms; 3MP 直转要 8.1ms)。
+// 同帧(token 匹配)已转 → 直接复用跳过转换。
+// 一次性探针: s2b(私有→私有同格式缩放)支持性未知, 用自有 dst 尺寸探针验证,
+// 失败永久 memo(槽级)回退直转 —— 不每帧重试(1.3.7 教训: -12905 每帧重试+日志
+// 风暴反而 8.1→9.3ms)。返回 NULL = 拆段不可用(调用方回退直转)。
 // 调用方持 _laneLockPrivate
 - (CVPixelBufferRef)yuvStagingForSrc:(CVPixelBufferRef)s2src
                                   fmt:(uint32_t)dstFormat
-                             srcToken:(uint64_t)srcToken {
+                             srcToken:(uint64_t)srcToken
+                              session:(VTPixelTransferSessionRef)s2sess
+                                  dstW:(size_t)dstW
+                                  dstH:(size_t)dstH {
     if (!s2src) return NULL;
     size_t sw = CVPixelBufferGetWidth(s2src), sh = CVPixelBufferGetHeight(s2src);
-    if (!sw || !sh) return NULL;
+    if (!sw || !sh || !dstW || !dstH) return NULL;
+    // mid = 源+2(偶): 与源有尺寸差强制走缩放路径(同尺寸 -12905), 偶对齐保 UV
+    size_t mw = (sw + 2) & ~(size_t)1, mh = (sh + 2) & ~(size_t)1;
+    if (mw == sw && mh == sh) mw += 2;  // 极端: 源已是探针上轮 mid? 不会(源≠mid 恒成立), 保险
 
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     VCamYuvStagingSlot *slot = NULL;
     int lruIdx = 0;
     for (int i = 0; i < kVcamYuvStagingMax; i++) {
         if (gVcamYuvStaging[i].staging && gVcamYuvStaging[i].fmt == dstFormat &&
-            gVcamYuvStaging[i].w == sw && gVcamYuvStaging[i].h == sh) {
+            gVcamYuvStaging[i].w == mw && gVcamYuvStaging[i].h == mh) {
             slot = &gVcamYuvStaging[i]; break;
         }
         if (gVcamYuvStaging[i].lastUse < gVcamYuvStaging[lruIdx].lastUse) lruIdx = i;
@@ -1452,25 +1466,46 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
             gVcamYuvStaging[idx].staging = NULL;
         }
         CVPixelBufferRef nb = NULL;
-        if (CVPixelBufferCreate(kCFAllocatorDefault, sw, sh, dstFormat, NULL, &nb) != noErr || !nb) return NULL;
+        if (CVPixelBufferCreate(kCFAllocatorDefault, mw, mh, dstFormat, NULL, &nb) != noErr || !nb) return NULL;
         gVcamYuvStaging[idx].fmt = dstFormat;
-        gVcamYuvStaging[idx].w = sw; gVcamYuvStaging[idx].h = sh;
+        gVcamYuvStaging[idx].w = mw; gVcamYuvStaging[idx].h = mh;
         gVcamYuvStaging[idx].staging = nb;
-        gVcamYuvStaging[idx].token = 0;  // 新槽内容无效, 强制转换
+        gVcamYuvStaging[idx].token = 0;        // 新槽内容无效, 强制转换
+        gVcamYuvStaging[idx].probeState = 0;   // 新槽需探测
         gVcamYuvStaging[idx].lastUse = now;
         slot = &gVcamYuvStaging[idx];
-        vcam_gpu_log([NSString stringWithFormat:@"[vcam] YUV upscale staging built %zux%zu fmt=0x%x (slot %d, heat fix)", sw, sh, (unsigned)dstFormat, idx]);
+        vcam_gpu_log([NSString stringWithFormat:@"[vcam] YUV upscale staging built %zux%zu fmt=0x%x (slot %d, heat fix)", mw, mh, (unsigned)dstFormat, idx]);
     }
     slot->lastUse = now;
-    if (slot->token == srcToken && srcToken != 0) return slot->staging;  // 同帧已转
+    if (slot->token == srcToken && srcToken != 0 && slot->probeState == 1) return slot->staging;  // 同帧已转
 
-    // BGRA → 私有格式 @ 同尺寸(Trim 会话同尺寸无 crop, 纯格式转换);
+    // 一次性探针(首帧): s2a 真实执行(BGRA→私有 mid 微缩放, Normal 拉伸 <0.3% 不可见)
+    // + s2b 用自有 dst 尺寸探针验证(私有→私有同格式缩放支持性)
+    if (slot->probeState == 0) {
+        slot->probeState = -1;  // 默认不可用(探测中途失败也安全)
+        CVPixelBufferRef probeDst = NULL;
+        if (CVPixelBufferCreate(kCFAllocatorDefault, dstW, dstH, dstFormat, NULL, &probeDst) == noErr && probeDst) {
+            OSStatus pa = VTPixelTransferSessionTransferImage([self normalTransferSession], s2src, slot->staging);
+            OSStatus pb = (pa == noErr) ? VTPixelTransferSessionTransferImage(s2sess, slot->staging, probeDst) : (OSStatus)-1;
+            CVPixelBufferRelease(probeDst);
+            if (pa == noErr && pb == noErr) {
+                slot->probeState = 1;
+                slot->token = srcToken;   // mid 内容即本帧(s2a 已真实执行)
+                vcam_gpu_log([NSString stringWithFormat:@"[vcam] YUV split path probed OK %zux%zu->%zux%zu fmt=0x%x (heat fix)", mw, mh, dstW, dstH, (unsigned)dstFormat]);
+                return slot->staging;
+            }
+            vcam_gpu_log([NSString stringWithFormat:@"[vcam] YUV split path unsupported (s2a=%d s2b=%d), keep direct 8.1ms path", (int)pa, (int)pb]);
+        }
+        return NULL;  // 探测失败: 永久回退直转(probeState=-1 memo)
+    }
+    if (slot->probeState < 0) return NULL;
+
+    // s2a: BGRA → 私有 @ mid(Normal 微拉伸, 强制缩放路径);
     // VT 自动携带色彩附件(非 memcpy), 无需手动同步
-    OSStatus st = VTPixelTransferSessionTransferImage(_privateTransferSession, s2src, slot->staging);
+    OSStatus st = VTPixelTransferSessionTransferImage([self normalTransferSession], s2src, slot->staging);
     if (st != noErr) {
         slot->token = 0;
-        vcam_gpu_log([NSString stringWithFormat:@"[vcam] yuv staging s2a failed (%d), fallback direct", (int)st]);
-        return NULL;
+        return NULL;  // 单次失败(非探测期)也回退直转, 下帧再试 s2a
     }
     slot->token = srcToken;
     return slot->staging;
@@ -1612,7 +1647,7 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
                 uint64_t dstPx = (uint64_t)dstW * dstH;
                 uint64_t srcPx = (uint64_t)CVPixelBufferGetWidth(s2src) * CVPixelBufferGetHeight(s2src);
                 if (dstPx > 4 * srcPx) {
-                    CVPixelBufferRef yuvMid = [self yuvStagingForSrc:s2src fmt:(uint32_t)dstFormat srcToken:slot->token];
+                    CVPixelBufferRef yuvMid = [self yuvStagingForSrc:s2src fmt:(uint32_t)dstFormat srcToken:slot->token session:s2sess dstW:dstW dstH:dstH];
                     if (yuvMid) {
                         st2 = VTPixelTransferSessionTransferImage(s2sess, yuvMid, dst);
                     }
@@ -1936,6 +1971,7 @@ static const NSUInteger kVcamMaxStreamKeys = 6;
             gVcamYuvStaging[i].w = gVcamYuvStaging[i].h = 0;
             gVcamYuvStaging[i].fmt = 0;
             gVcamYuvStaging[i].token = 0;
+            gVcamYuvStaging[i].probeState = 0;
             gVcamYuvStaging[i].lastUse = 0;
             released++;
         }
