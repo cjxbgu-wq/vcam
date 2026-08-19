@@ -373,6 +373,7 @@ static void vcam_core_log(NSString *msg) {
     if (self->_pipelineIdle) {
         self->_pipelineIdle = NO;                 // 预渲染线程 ≤0.1s 内自行恢复
         [self->_videoPlayer startDecodingThread]; // 空转线程恢复解码标志
+        self->_lastIdleResumeTime = CFAbsoluteTimeGetCurrent();  // 恢复保持窗口起算(2026-08-19): 每次"暂停→恢复"都刷新, 防止相机流 5-10s 周期静默时 pause/resume 抖动
         // 空闲卸载过媒体管线(2026-08-18): 异步重载 —— 期间本帧与后续帧渲染
         // _syncDisplayFrame 冻结快照(画面静止不黑), 加载完成后预渲染无缝跟上。
         // 必须后台队列(2026-08-18 watchdog 修复): loadVideoFile 内
@@ -381,7 +382,6 @@ static void vcam_core_log(NSString *msg) {
         // 恢复重载后 6s 被杀)。冻结帧机制保证加载期间画面连续
         if (self->_idleUnloaded) {
                 self->_idleUnloaded = NO;
-                self->_lastIdleResumeTime = CFAbsoluteTimeGetCurrent();  // 恢复保持窗口起算(2026-08-19)
                 NSString *resumePath = self->_idleResumePath;
             if (resumePath.length > 0) {
                 VCamCore *core = self;
@@ -1033,55 +1033,32 @@ static void vcam_core_log(NSString *msg) {
             [strongSelf setEnabled:enabled];
         }
 
-        // 空闲看门狗(2026-08-16 发热优化): 替换开着但相机流心跳 >2s 未刷新
+        // 空闲看门狗分级(2026-08-19 首开冻结根治): 替换开着但相机流心跳 >2s 未刷新
         // (相机关闭/切后台/非相机 App) → 暂停解码+预渲染, CPU 归零;
         // 相机重新打开时 render 同步清 pipelineIdle 即时恢复。
-        // 2026-08-18 云闪付崩溃循环根因修复: 只停 CPU 不够 —— 部分扫码 App 的
-        // 相机流不经过 hook 节点, mediaserverd 被系统判 inactive, 而 dylib 已初始化
-        // 的 footprint 124MB > inactive jetsam 硬限 75MB → 5-6s 击杀 → 崩溃循环
-        // (renders=0 即被杀, CPU 仅 1%, 无 .ips, telemetry fp=124MB 实证)。
-        // 暂停时同步卸载媒体管线(reader/asset/帧队列/预渲染缓冲), 把 footprint
-        // 压回线下; 恢复时冻结快照帧顶住 + 异步重载(~几百 ms)无缝跟上
+        // 旧版缺陷(设备实证 11:08-11:11 日志): 2s 即全量卸载媒体管线, 而扫码页
+        // 相机流周期性静默/重建(5-10s 周期) → "卸载→重载"抖动循环, 每轮重载期间
+        // render 只能显示冻结快照 1-14s(loadVideo+rebuild+prefill), 用户看到
+        // "首开画面被替换但卡住, 等一段时间才开始播放"。
+        // 新分级: 2s 只暂停(不动 reader/帧队列, 恢复=置标志零延迟); 60s 真长期
+        // 空闲(锁屏/退出相机)才卸载媒体管线+GPU 池。
         if (strongSelf.isMediaserverdProcess && strongSelf.enabled && !strongSelf.pipelineIdle &&
             strongSelf->_lastRenderActivity > 0 &&
             (CFAbsoluteTimeGetCurrent() - strongSelf->_lastRenderActivity) > 2.0 &&
-            (CFAbsoluteTimeGetCurrent() - strongSelf->_lastIdleResumeTime) > 5.0) {  // 恢复保持(2026-08-19): 恢复重载后 5s 内不重复卸载
+            (CFAbsoluteTimeGetCurrent() - strongSelf->_lastIdleResumeTime) > 5.0) {  // 恢复保持: 恢复后 5s 内不重复暂停
             strongSelf->_pipelineIdle = YES;
             [strongSelf->_videoPlayer stopDecodingThread];
-            strongSelf->_idleResumePath = [strongSelf->_videoPlayer currentVideoPath];
-            [strongSelf->_videoPlayer unloadForIdle];
-            [strongSelf->_gpuProcessor releaseHeavyBuffersForIdle];
-            // live 帧链也释放(2026-08-18 砍常驻内存): 预渲染线程已因 pipelineIdle
-            // 睡眠不再产出, _syncDisplayFrame 快照独立 retain 旧内容, 恢复期间
-            // render 冻结显示快照(L353 的 _liveYUV 为 NO 不推进), 重载完成后无缝跟上。
-            // 持 _processLock 与 render 线程互斥(该字段 render 侧同锁访问)
-            [strongSelf->_processLock lock];
-            if (strongSelf->_liveYUVPixelBuffer) {
-                CVPixelBufferRelease(strongSelf->_liveYUVPixelBuffer);
-                strongSelf->_liveYUVPixelBuffer = NULL;
-            }
-            if (strongSelf->_liveBGRAPixelBuffer) {
-                CVPixelBufferRelease(strongSelf->_liveBGRAPixelBuffer);
-                strongSelf->_liveBGRAPixelBuffer = NULL;
-            }
-            if (strongSelf->_cachedProcessedFrame) {
-                CVPixelBufferRelease(strongSelf->_cachedProcessedFrame);
-                strongSelf->_cachedProcessedFrame = NULL;
-            }
-            [strongSelf->_processLock unlock];
-            strongSelf->_idleUnloaded = YES;
-            vcam_core_log(@"[vcam] camera idle >2s, pipeline paused + media unloaded (jetsam guard)");
+            vcam_core_log(@"[vcam] camera idle >2s, pipeline paused (CPU zero, reader kept)");
         }
 
-        // 深度空闲内存释放(2026-08-17 偶发全黑优化): 空闲暂停后再等 58s(排除
-        // 快速开关相机场景, 避免重建开销), 释放 GPU 池全部流资源(组 staging
-        // ~45MB+ per-key session/staging/cache)。mediaserverd inactive jetsam
-        // 硬限 75MB, 空闲 footprint 120MB+ 会被杀 → 下次开相机黑屏 2-3s。
-        // 恢复渲染时惰性重建(首帧一次性 ~10-20ms)。
-        // 12s→60s(2026-08-18 云闪付扫码黑屏): 扫码页相机流周期性静默/唤醒, 12s 窗口
-        // 造成"释放→重建→释放"循环, 每轮重建 session/staging 是 CPU 尖峰, 叠加扫码
-        // 多流稳态负载推高 CPU → runningboardd 杀进程。60s 只在真长期空闲(锁屏/退
-        // 出相机)才释放, 扫码场景不再循环。
+        // 深度空闲卸载(60s, jetsam guard): 真长期空闲才释放媒体管线+GPU 池。
+        // 2026-08-18 云闪付崩溃循环根因: 部分扫码 App 相机流不经过 hook 节点,
+        // mediaserverd 被系统判 inactive, dylib 已初始化的 footprint 124MB >
+        // inactive jetsam 硬限 75MB → 5-6s 击杀。卸载 reader/帧队列/living 帧链/
+        // GPU 池压回线下; asset/track 复用链保留(LocalVideoPlayer 内部), 恢复
+        // 重载跳过 tracksWithMediaType, rebuild <100ms。
+        // 60s 窗口(2026-08-18): 扫码页相机流 5-10s 周期静默在 2s 暂停层已被
+        // 零成本吸收, 不会到达这里; 只有锁屏/退出相机才触发。
         if (strongSelf.isMediaserverdProcess && strongSelf.enabled && strongSelf.pipelineIdle &&
             strongSelf->_lastRenderActivity > 0 &&
             (CFAbsoluteTimeGetCurrent() - strongSelf->_lastRenderActivity) > 60.0) {
@@ -1090,8 +1067,35 @@ static void vcam_core_log(NSString *msg) {
             // 释放一次后不再重复(资源已空); render 心跳恢复后再空闲才会重新进入
             if (nowIdle - lastIdleRelease > 30.0) {
                 lastIdleRelease = nowIdle;
-                [strongSelf->_gpuProcessor releaseIdleMemory];
-                vcam_core_log(@"[vcam] camera idle >60s, GPU stream pools released (jetsam guard)");
+                if (!strongSelf->_idleUnloaded) {
+                    strongSelf->_idleUnloaded = YES;
+                    strongSelf->_idleResumePath = [strongSelf->_videoPlayer currentVideoPath];
+                    [strongSelf->_videoPlayer unloadForIdle];
+                    [strongSelf->_gpuProcessor releaseHeavyBuffersForIdle];
+                    [strongSelf->_gpuProcessor releaseIdleMemory];
+                    // live 帧链也释放(砍常驻内存): 预渲染线程已因 pipelineIdle
+                    // 睡眠不再产出, _syncDisplayFrame 快照独立 retain 旧内容, 恢复期间
+                    // render 冻结显示快照, 重载完成后无缝跟上。
+                    // 持 _processLock 与 render 线程互斥(该字段 render 侧同锁访问)
+                    [strongSelf->_processLock lock];
+                    if (strongSelf->_liveYUVPixelBuffer) {
+                        CVPixelBufferRelease(strongSelf->_liveYUVPixelBuffer);
+                        strongSelf->_liveYUVPixelBuffer = NULL;
+                    }
+                    if (strongSelf->_liveBGRAPixelBuffer) {
+                        CVPixelBufferRelease(strongSelf->_liveBGRAPixelBuffer);
+                        strongSelf->_liveBGRAPixelBuffer = NULL;
+                    }
+                    if (strongSelf->_cachedProcessedFrame) {
+                        CVPixelBufferRelease(strongSelf->_cachedProcessedFrame);
+                        strongSelf->_cachedProcessedFrame = NULL;
+                    }
+                    [strongSelf->_processLock unlock];
+                    vcam_core_log(@"[vcam] camera idle >60s, media pipeline + GPU pools released (jetsam guard)");
+                } else {
+                    [strongSelf->_gpuProcessor releaseIdleMemory];
+                    vcam_core_log(@"[vcam] camera idle >60s, GPU stream pools released (jetsam guard)");
+                }
             }
         }
 
