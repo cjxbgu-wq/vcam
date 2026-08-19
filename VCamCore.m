@@ -493,6 +493,11 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
             // <30s = 冷启动首开, 保留 10s 强制降载(三连崩实证必须压)
             static CFAbsoluteTime bootGraceUntil = 0;
             static BOOL bootGraceDone = NO;
+            // 退出后再进冷却(2026-08-20 横跳修复): 设备实证 OFF→ON 最短 3s
+            // (18:14:26 OFF → 18:14:30 ON), 24↔20fps 快速横跳本身就是卡顿感。
+            // OFF 后 6s 内不许再进(负载在滞回带边缘波动时给用户稳定流畅窗);
+            // hardTrip(>110) 无视冷却立即压(保命优先)
+            static CFAbsoluteTime lastThrottleExit = 0;
             CFAbsoluteTime nowT = CFAbsoluteTimeGetCurrent();
             if (!bootGraceDone) {
                 if (bootGraceUntil == 0) {
@@ -507,12 +512,20 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                     }
                 } else if (nowT >= bootGraceUntil) {
                     bootGraceDone = YES;
-                    // 帧数优化(2026-08-20): 冷却结束时 CPU 已舒适(ema<62)则免退出
-                    // 保持立即交接 —— 旧版固定再等 10s 保持, 首开内容 20fps 窗口被
-                    // 拉长到 ~20s(10s grace + 10s hold); ema 未测得(极端快启动)或
-                    // 仍偏高时保守走正常 10s 保持, 由 CPU 闭环接管
-                    lastModeSwitch = (emaInit && emaPct < 62.0) ? (nowT - 11.0) : nowT;
-                    vcam_core_log(@"[vcam] boot grace ended, CPU loop takes over");
+                    // 交接线 62→72(2026-08-20 首开卡顿修复): 62-72 是正常运行带
+                    // (稳态实测 45-58% + 余量), grace 强制期结束后 EMA 在此区间
+                    // 不应继续保持降载 —— 旧版等 <62 才退, 多流负载 EMA 在 62 边缘
+                    // 徘徊时用户被压 20fps 近 1 分钟(设备实证 18:13:16 ended →
+                    // 18:14:02 才 OFF, 首开 59s 低帧率)。ema 未测得(极端快启动)或
+                    // ≥72(真过载)时保守走正常保持, 由 CPU 闭环接管
+                    if (emaInit && emaPct < 72.0 && lowPower) {
+                        lowPower = NO;
+                        lastModeSwitch = nowT - 11.0;  // 免保持, 允许闭环立即再评估
+                        vcam_core_log([NSString stringWithFormat:@"[vcam] boot grace ended, EMA %.0f%% in normal band, immediate OFF", emaPct]);
+                    } else {
+                        lastModeSwitch = nowT;
+                        vcam_core_log(@"[vcam] boot grace ended, CPU loop takes over");
+                    }
                 }
             }
             BOOL graceOn = !bootGraceDone;  // 冷却期内强制低功率
@@ -537,19 +550,23 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                     // 8s 后闭环正常接管(持续真过载仍会降载)
                     BOOL sessionExempt = (self->_camSessionStart > 0 &&
                                           (nowT - self->_camSessionStart) < 8.0);
+                    // 退出后再进冷却(见 lastThrottleExit 声明): OFF 后 6s 稳定窗
+                    BOOL exitCooldownOk = (lastThrottleExit == 0 ||
+                                           (nowT - lastThrottleExit) > 6.0);
                     // 阈值(2026-08-18): 72% 提前介入给 runningboardd 留余量;
                     // 退出线 55→62(2026-08-20 帧数修复): 正常运行区间实测 45-58%,
                     // 旧退出线 55 落在正常带内部 —— 稳态 56-58% 时一旦因尖峰进入
                     // 降载(20fps)就永远退不出(需 <55), 替换视频被长期压在 20fps =
                     // "帧数不稳定"直接来源。62 在正常带顶(58)之上, 与 72 进入线构成
                     // 10 点滞回带(对齐 2026-08-17 教训: 退出线必须高于正常带顶)
-                    if ((emaPct > 72.0 || hardTrip) && !lowPower && (minHoldOk || hardTrip) && (!sessionExempt || hardTrip)) {
+                    if ((emaPct > 72.0 || hardTrip) && !lowPower && (minHoldOk || hardTrip) && (!sessionExempt || hardTrip) && (exitCooldownOk || hardTrip)) {
                         lowPower = YES;
                         lastModeSwitch = nowT;
                         vcam_core_log([NSString stringWithFormat:@"[vcam] CPU %.0f%% (ema) >72%%, EMERGENCY throttle ON", emaPct]);
                     } else if (emaPct < 62.0 && lowPower && minHoldOk && !graceOn) {
                         lowPower = NO;
                         lastModeSwitch = nowT;
+                        lastThrottleExit = nowT;
                         vcam_core_log([NSString stringWithFormat:@"[vcam] CPU %.0f%% (ema) <62%%, throttle OFF", emaPct]);
                     }
                 }
