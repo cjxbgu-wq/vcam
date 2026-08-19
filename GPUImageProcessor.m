@@ -244,6 +244,19 @@ typedef struct {
 #define kVcamLaneStagingMax 4
 static VCamLaneStagingSlot gVcamLaneStaging[kVcamLaneStagingMax];
 
+// 绿线修复 v2: per-ratio 预裁剪 staging 槽(非整数 crop 流专用)。
+// 调用方持 _laneLockPrivate; lastUse 做 LRU(极端多比例族时淘汰最久未用)
+typedef struct {
+    size_t w, h;
+    CVPixelBufferRef staging;
+    uint64_t token;         // 源 staging 的帧代数(同帧跳过 memcpy)
+    CFAbsoluteTime lastUse;
+} VCamCropStagingSlot;
+#define kVcamCropStagingMax 4
+static VCamCropStagingSlot gVcamCropStaging[kVcamCropStagingMax];
+// Normal 等比缩放 session(预裁剪路径专用, 进程级懒建, 锁内调用)
+static VTPixelTransferSessionRef gVcamNormalSession = NULL;
+
 // 车道熔断 memo: 热路径零装箱查表; 熔断写入时刷新对应槽
 static uint32_t gVcamLaneMemoFmt[4] = {0, 0, 0, 0};
 static BOOL gVcamLaneMemoOff[4] = {NO, NO, NO, NO};
@@ -883,37 +896,15 @@ static void vcamMirrorRowsInPlace(CVPixelBufferRef pb) {
     CVPixelBufferUnlockBaseAddress(pb, 0);
 }
 
-// 边缘色度修复(2026-08-19 录像绿线根治): VT Trim 缩放的 crop offset 非整数时,
-// RGB->YUV420 私有格式路径('-8v0' 等)的边界半像素越界 → 该行/列 UV=0 → 绿线。
-// 设备实证: 系统相机竖屏录像, s2 BGRA 720x538 → 1920x1080 '-8v0',
-// scale=2.667 垂直 crop 354.7 非整 → 顶行 UV=0 → 录制文件旋转 90° 后显示为左侧绿线。
-// 预览流无此问题: BGRA 无 UV 子采样; 420f→420f 是 YUV 域缩放(千面同路径, 边界正常)。
-// 修法: VT 写完后用相邻正常行/列覆盖边缘 UV(仅色度平面, 微秒级);
-// 非双平面格式/lock 失败静默跳过(保底不崩)。YUV 域(YUV 车道)无需修 —— 只修私有车道 s2。
-static void vcamFixEdgeChroma(CVPixelBufferRef dst, BOOL fixH, BOOL fixV) {
-    if (!dst || (!fixH && !fixV)) return;
-    if (CVPixelBufferGetPlaneCount(dst) != 2) return;  // 只处理 Y+UV 双平面 420 族
-    if (CVPixelBufferLockBaseAddress(dst, 0) != kCVReturnSuccess) return;
-    uint8_t *uv = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(dst, 1);
-    size_t uvW = CVPixelBufferGetWidthOfPlane(dst, 1);
-    size_t uvH = CVPixelBufferGetHeightOfPlane(dst, 1);
-    size_t uvRB = CVPixelBufferGetBytesPerRowOfPlane(dst, 1);
-    if (uv && uvW >= 4 && uvH >= 4 && uvRB >= uvW * 2) {
-        size_t rowBytes = uvW * 2;  // CbCr 交织: 每 UV 列 2 字节
-        if (fixV) {  // 顶/底行 ← 相邻行
-            memcpy(uv, uv + uvRB, rowBytes);
-            memcpy(uv + (uvH - 1) * uvRB, uv + (uvH - 2) * uvRB, rowBytes);
-        }
-        if (fixH) {  // 左/右 UV 列 ← 相邻列(2 字节粒度, CbCr 对不可拆)
-            for (size_t y = 0; y < uvH; y++) {
-                uint8_t *r = uv + y * uvRB;
-                memcpy(r, r + 4, 4);                              // UV 列 0-1 ← 列 2-3
-                memcpy(r + (uvW - 2) * 2, r + (uvW - 4) * 2, 4);  // 末 2 UV 列 ← 前 2 列
-            }
-        }
-    }
-    CVPixelBufferUnlockBaseAddress(dst, 0);
-}
+// 录像绿线修复教训(2026-08-19):
+// v1(已回滚): VT 写完后对相机 dst IOSurface 做 CPU lock + 边缘 UV 覆盖 ——
+// 录制时编码器持该 surface GPU fence, CPU map 与 fence 互等死锁(IOFence 事故
+// 同款) → 录制黑屏(1.3.3 设备实证)。相机 surface 绝不允许 CPU lock。
+// v2(现行): 裁剪几何前移到自有 staging(见 cropStagingForRatio), 不碰相机 buffer。
+// 根因: VT Trim crop offset 非整数(如 BGRA 720x538→1920x1080 垂直 crop 354.7)
+// 时 RGB→YUV420 私有格式路径边界半像素越界 → 边缘 UV=0 → 绿线
+// (竖屏录制文件旋转 90° 后显示为左侧)。
+// 预览流无此问题: BGRA 无 UV 子采样; 420f→420f 是 YUV 域缩放(千面同路径)。
 
 // Trim crop offset 非整数判定: 水平/垂直 crop 总量非正偶数 → offset x.5/x.33 非整
 static void vcamTrimFractionalCrop(CVPixelBufferRef src, CVPixelBufferRef dst, BOOL *fixH, BOOL *fixV) {
@@ -1306,6 +1297,93 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
     }
 }
 
+// Normal 等比缩放 session(预裁剪路径专用): 比例已匹配 → 纯等比拉伸(<0.5% 不可见),
+// 无 crop 概念 → 边界 clamp 正常, 规避 VT Trim 非整数 crop 的边界色度 bug
+- (VTPixelTransferSessionRef)normalTransferSession {
+    if (!gVcamNormalSession) {
+        if (VTPixelTransferSessionCreate(kCFAllocatorDefault, &gVcamNormalSession) == noErr) {
+            VTSessionSetProperty(gVcamNormalSession, CFSTR("ScalingMode"), CFSTR("Normal"));
+            VTSessionSetProperty(gVcamNormalSession, CFSTR("RealTime"), kCFBooleanTrue);
+            vcam_gpu_log(@"[vcam] Lane S2-Normal session created (green-line fix)");
+        }
+    }
+    return gVcamNormalSession;
+}
+
+// 绿线修复 v2: 源尺寸 staging 中心整数预裁剪到 dst 比例(per-ratio 槽)。
+// 自有 CPU buffer 的 memcpy(非相机 IOSurface, 无 IOFence 死锁风险);
+// 裁剪矩形宽高/偏移均偶对齐; token 与源 staging 同步(同帧多流共享跳过 memcpy)。
+// 调用方持 _laneLockPrivate。返回 NULL = 裁剪失败(调用方回退 Trim 直转)
+- (CVPixelBufferRef)cropStagingForRatio:(CVPixelBufferRef)staging dst:(CVPixelBufferRef)dst srcToken:(uint64_t)srcToken {
+    if (!staging || !dst) return NULL;
+    size_t sw = CVPixelBufferGetWidth(staging), sh = CVPixelBufferGetHeight(staging);
+    size_t dw = CVPixelBufferGetWidth(dst), dh = CVPixelBufferGetHeight(dst);
+    if (!sw || !sh || !dw || !dh) return NULL;
+
+    double r = (double)dw / dh;
+    size_t cw, ch;
+    if ((double)sw / sh > r) { ch = sh; cw = (size_t)(sh * r); }
+    else                     { cw = sw; ch = (size_t)(sw / r); }
+    cw &= ~(size_t)1; ch &= ~(size_t)1;  // 偶对齐(UV 2:1)
+    if (cw < 4 || ch < 4 || cw > sw || ch > sh) return NULL;
+    size_t cx = (((sw - cw) / 2) & ~(size_t)1);
+    size_t cy = (((sh - ch) / 2) & ~(size_t)1);
+
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    // 查槽(key = 裁剪尺寸) / LRU 淘汰建槽
+    VCamCropStagingSlot *slot = NULL;
+    int lruIdx = 0;
+    for (int i = 0; i < kVcamCropStagingMax; i++) {
+        if (gVcamCropStaging[i].staging &&
+            gVcamCropStaging[i].w == cw && gVcamCropStaging[i].h == ch) { slot = &gVcamCropStaging[i]; break; }
+        if (gVcamCropStaging[i].lastUse < gVcamCropStaging[lruIdx].lastUse) lruIdx = i;
+    }
+    if (!slot) {
+        int idx = -1;
+        for (int i = 0; i < kVcamCropStagingMax; i++) {
+            if (!gVcamCropStaging[i].staging) { idx = i; break; }
+        }
+        if (idx < 0) {  // 全满: LRU 覆盖
+            idx = lruIdx;
+            CVPixelBufferRelease(gVcamCropStaging[idx].staging);
+            gVcamCropStaging[idx].staging = NULL;
+        }
+        CVPixelBufferRef nb = NULL;
+        if (CVPixelBufferCreate(kCFAllocatorDefault, cw, ch,
+                                kCVPixelFormatType_32BGRA, NULL, &nb) != noErr || !nb) return NULL;
+        gVcamCropStaging[idx].w = cw; gVcamCropStaging[idx].h = ch;
+        gVcamCropStaging[idx].staging = nb;
+        gVcamCropStaging[idx].token = 0;  // 新槽内容无效, 强制 memcpy
+        gVcamCropStaging[idx].lastUse = now;
+        slot = &gVcamCropStaging[idx];
+        vcam_gpu_log([NSString stringWithFormat:@"[vcam] Crop staging built %zux%zu (slot %d)", cw, ch, idx]);
+    }
+    slot->lastUse = now;
+    if (slot->token == srcToken && srcToken != 0) return slot->staging;  // 同帧已裁剪
+
+    // memcpy 中心裁剪(BGRA 4B/px, 自有 CPU buffer); 失败返回 NULL 回退 Trim 直转
+    BOOL copied = NO;
+    if (CVPixelBufferLockBaseAddress(staging, kCVPixelBufferLock_ReadOnly) == kCVReturnSuccess) {
+        if (CVPixelBufferLockBaseAddress(slot->staging, 0) == kCVReturnSuccess) {
+            uint8_t *sb = (uint8_t *)CVPixelBufferGetBaseAddress(staging);
+            uint8_t *db = (uint8_t *)CVPixelBufferGetBaseAddress(slot->staging);
+            size_t srb = CVPixelBufferGetBytesPerRow(staging);
+            size_t drb = CVPixelBufferGetBytesPerRow(slot->staging);
+            if (sb && db && srb >= cw * 4 && drb >= cw * 4) {
+                size_t rowBytes = cw * 4;
+                for (size_t y = 0; y < ch; y++) {
+                    memcpy(db + y * drb, sb + (cy + y) * srb + cx * 4, rowBytes);
+                }
+                slot->token = srcToken;
+                copied = YES;
+            }
+            CVPixelBufferUnlockBaseAddress(slot->staging, 0);
+        }
+        CVPixelBufferUnlockBaseAddress(staging, kCVPixelBufferLock_ReadOnly);
+    }
+    return copied ? slot->staging : NULL;
+}
+
 - (BOOL)transferPixelBuffer:(CVPixelBufferRef)src toPixelBuffer:(CVPixelBufferRef)dst token:(uint64_t)token {
     if (!src || !dst) return NO;
 
@@ -1407,18 +1485,34 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
             }
             // s2: BGRA staging → 私有目标(逐流尺寸/格式不同, VT 内部处理)
             if (ok) {
-                CFAbsoluteTime t2 = CFAbsoluteTimeGetCurrent();
-                OSStatus st2 = VTPixelTransferSessionTransferImage(_privateTransferSession, staging, dst);
-                [self noteStageTimingFmt:(uint32_t)dstFormat w:(uint32_t)dstW h:(uint32_t)dstH stage:2 ms:(CFAbsoluteTimeGetCurrent() - t2) * 1000.0];
-                if (st2 != noErr) ok = NO;
-                else {
-                    // 录像绿线修复(2026-08-19): Trim crop offset 非整数时 VT RGB→YUV420
-                    // 私有格式边界半像素越界 → 边缘 UV=0 → 绿线(录制文件旋转后左侧)。
-                    // 用相邻正常行/列覆盖边缘 UV; 整数 crop 流零成本跳过
+                CVPixelBufferRef s2src = staging;
+                // 录像绿线修复 v2(2026-08-19, v1 CPU 修相机 surface 因 IOFence 死锁回滚):
+                // VT Trim crop offset 非整数时, RGB→YUV420 私有格式边界半像素越界 →
+                // 边缘 UV=0 → 绿线(竖屏录制文件旋转 90° 后左侧)。
+                // v1 教训(设备实证 1.3.3 录制黑屏): VT 写完对相机 IOSurface 做
+                // CVPixelBufferLockBaseAddress + CPU 写 —— 录制时编码器持该 surface
+                // GPU fence, CPU map 与 fence 互等死锁(同帧去重 v2 的 IOFence 事故
+                // 同款) → GPU 管线卡死 → 录制黑屏。相机 surface 绝不允许 CPU lock。
+                // v2: 裁剪几何前移 —— 非整数 crop 命中时, 把自有 staging(纯 CPU
+                // buffer)中心整数预裁剪到 dst 比例(per-ratio 槽, memcpy 安全),
+                // s2 用 Normal 等比缩放(比例匹配无 crop → 无边界重采样 → 无绿线)。
+                {
                     BOOL fixH = NO, fixV = NO;
                     vcamTrimFractionalCrop(staging, dst, &fixH, &fixV);
-                    if (fixH || fixV) vcamFixEdgeChroma(dst, fixH, fixV);
+                    if (fixH || fixV) {
+                        CVPixelBufferRef cropped = [self cropStagingForRatio:staging dst:dst srcToken:slot->token];
+                        if (cropped) s2src = cropped;
+                    }
                 }
+                CFAbsoluteTime t2 = CFAbsoluteTimeGetCurrent();
+                // Normal 车道(预裁剪路径): 等比拉伸填充, 比例已匹配变形 <0.5% 不可见,
+                // 无 crop 概念 → 边界 clamp 正常; 直转路径(整数 crop)仍走 Trim
+                BOOL useNormal = (s2src != staging);
+                VTPixelTransferSessionRef s2sess = useNormal
+                    ? [self normalTransferSession] : _privateTransferSession;
+                OSStatus st2 = VTPixelTransferSessionTransferImage(s2sess, s2src, dst);
+                [self noteStageTimingFmt:(uint32_t)dstFormat w:(uint32_t)dstW h:(uint32_t)dstH stage:2 ms:(CFAbsoluteTimeGetCurrent() - t2) * 1000.0];
+                if (st2 != noErr) ok = NO;
             }
         }
         [_laneLockPrivate unlock];
@@ -1711,6 +1805,17 @@ static const NSUInteger kVcamMaxStreamKeys = 6;
             gVcamLaneStaging[i].staging = NULL;
             gVcamLaneStaging[i].w = gVcamLaneStaging[i].h = 0;
             gVcamLaneStaging[i].token = 0;
+            released++;
+        }
+    }
+    // 绿线修复 v2 裁剪槽同步释放(同上, 深度空闲 jetsam guard)
+    for (int i = 0; i < kVcamCropStagingMax; i++) {
+        if (gVcamCropStaging[i].staging) {
+            CVPixelBufferRelease(gVcamCropStaging[i].staging);
+            gVcamCropStaging[i].staging = NULL;
+            gVcamCropStaging[i].w = gVcamCropStaging[i].h = 0;
+            gVcamCropStaging[i].token = 0;
+            gVcamCropStaging[i].lastUse = 0;
             released++;
         }
     }
