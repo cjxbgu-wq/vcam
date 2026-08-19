@@ -478,7 +478,11 @@ static void vcam_core_log(NSString *msg) {
                     vcam_core_log(@"[vcam] boot grace: forced throttle 10s (startup storm guard)");
                 } else if (nowT >= bootGraceUntil) {
                     bootGraceDone = YES;
-                    lastModeSwitch = nowT;  // 退出判定从冷却结束起算
+                    // 帧数优化(2026-08-20): 冷却结束时 CPU 已舒适(ema<62)则免退出
+                    // 保持立即交接 —— 旧版固定再等 10s 保持, 首开内容 20fps 窗口被
+                    // 拉长到 ~20s(10s grace + 10s hold); ema 未测得(极端快启动)或
+                    // 仍偏高时保守走正常 10s 保持, 由 CPU 闭环接管
+                    lastModeSwitch = (emaInit && emaPct < 62.0) ? (nowT - 11.0) : nowT;
                     vcam_core_log(@"[vcam] boot grace ended, CPU loop takes over");
                 }
             }
@@ -496,14 +500,19 @@ static void vcam_core_log(NSString *msg) {
                     // 硬闸: EMA>110% = 逼近 2 核, 无视 hold 立即压(秒级尖峰也杀进程)
                     BOOL hardTrip = (emaPct > 110.0);
                     // 阈值(2026-08-18): 72% 提前介入给 runningboardd 留余量;
+                    // 退出线 55→62(2026-08-20 帧数修复): 正常运行区间实测 45-58%,
+                    // 旧退出线 55 落在正常带内部 —— 稳态 56-58% 时一旦因尖峰进入
+                    // 降载(20fps)就永远退不出(需 <55), 替换视频被长期压在 20fps =
+                    // "帧数不稳定"直接来源。62 在正常带顶(58)之上, 与 72 进入线构成
+                    // 10 点滞回带(对齐 2026-08-17 教训: 退出线必须高于正常带顶)
                     if ((emaPct > 72.0 || hardTrip) && !lowPower && (minHoldOk || hardTrip)) {
                         lowPower = YES;
                         lastModeSwitch = nowT;
                         vcam_core_log([NSString stringWithFormat:@"[vcam] CPU %.0f%% (ema) >72%%, EMERGENCY throttle ON", emaPct]);
-                    } else if (emaPct < 55.0 && lowPower && minHoldOk && !graceOn) {
+                    } else if (emaPct < 62.0 && lowPower && minHoldOk && !graceOn) {
                         lowPower = NO;
                         lastModeSwitch = nowT;
-                        vcam_core_log([NSString stringWithFormat:@"[vcam] CPU %.0f%% (ema) <55%%, throttle OFF", emaPct]);
+                        vcam_core_log([NSString stringWithFormat:@"[vcam] CPU %.0f%% (ema) <62%%, throttle OFF", emaPct]);
                     }
                 }
             // 负差分(线程快照抖动): 只推进时间基线, 不更新 CPU 基线(下轮重算), 不判退
@@ -863,9 +872,8 @@ static void vcam_core_log(NSString *msg) {
                 // 解码/预渲染是两个独立 24Hz 时钟, 相位漂移使预渲染拍点周期性
                 // 落在解码入队之前 → dequeue 空 → 回退当前帧 = 同一帧重复产出两拍,
                 // 下一拍取到积压帧 = 周期性"重复-紧接"节奏(拍频微卡顿)。
-                // 修: 队列空时短等(≤1/3 帧间隔)让解码先产出; 再 drain-to-latest
-                // 取最新(解码抖动积压 2+ 帧时防止显示滞后累积)。图片模式/暂停
-                // (解码不再产出)等待自然超时走当前帧回退, 行为不变
+                // 修: 队列空时短等(≤1/3 帧间隔)让解码先产出。
+                // 图片模式/暂停(解码不再产出)等待自然超时走当前帧回退, 行为不变
                 CVPixelBufferRef frame = [strongSelf.videoPlayer.frameQueue dequeuePixelBuffer];
                 if (!frame) {
                     CFAbsoluteTime waitStart = CFAbsoluteTimeGetCurrent();
@@ -876,11 +884,15 @@ static void vcam_core_log(NSString *msg) {
                     }
                 }
                 if (frame) {
-                    CVPixelBufferRef newer = [strongSelf.videoPlayer.frameQueue dequeuePixelBuffer];
-                    while (newer) {
-                        CVPixelBufferRelease(frame);
-                        frame = newer;
-                        newer = [strongSelf.videoPlayer.frameQueue dequeuePixelBuffer];
+                    // FIFO + 突发限深(2026-08-20 帧数优化, 取代 drain-to-latest):
+                    // 逐帧顺序消费 —— 相位漂移由队列吸收, 每拍 1:1 产出, 稳态零丢帧
+                    // 零重复; 仅积压 >1(换源预填 5 帧/解码突发)时丢最旧余量, 延迟
+                    // 有界(≤2 帧)。旧 drain-to-latest 把任何 2 帧积压整批丢成最新
+                    // 1 帧 + 顺手清空队列 → 下一拍必然回退重复帧 = "跳帧+重复"成对
+                    // 卡顿(双时钟拍频残留); FIFO 下 2 帧积压是正常相位缓冲, 不丢。
+                    while ([strongSelf.videoPlayer.frameQueue count] > 1) {
+                        CVPixelBufferRef excess = [strongSelf.videoPlayer.frameQueue dequeuePixelBuffer];
+                        if (excess) CVPixelBufferRelease(excess);
                     }
                 }
                 if (!frame) {
