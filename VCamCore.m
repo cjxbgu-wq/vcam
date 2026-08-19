@@ -541,9 +541,14 @@ static void vcam_core_log(NSString *msg) {
                 uint64_t lastTok = st ? [st[@"tok"] unsignedLongLongValue] : 0;
                 if (lastFull > 0 && (nowT - lastFull) < window && lastTok != 0) {
                     gen = lastTok;  // 窗口内: 跳过 stage1 缩放, CCW90 复用缓存
-                    // 抑制帧也推进节拍基准: 否则 60fps 流"隔帧全禁"(全渲染→长抑制→
-                    // 又全渲染), 内容率掉一半; 每帧推进 → 内容精确稳定在 1/window
-                    freezeState[fk] = @{@"t": @(nowT), @"tok": @(lastTok)};
+                    // 基准不滑动(2026-08-19 首开冻结根治): 旧版抑制帧把基准推进到
+                    // nowT(滑动窗) —— 相机流 30/60fps 帧间隔 16-33ms 恒 < window(50ms)
+                    // → 每帧都判"距上一帧 50ms 内" → 永久抑制 → 内容冻结整个降载期
+                    // (boot grace 强制 lowPower 10s + 退出保持 10s ≈ 20s, 设备实证
+                    // 11:34:21-42 全程冻结, 42s throttle OFF 后才开播; 1.3.0 时代
+                    // "先开系统相机暖场才不冻"同根因 —— 暖场消耗掉了 boot grace)。
+                    // 固定基准 = 全渲染每 window 一次, 内容率 1/window(20fps)。
+                    // 抑制帧不写字典(零分配): 状态未变, 无需更新。
                 } else {
                     freezeState[fk] = @{@"t": @(nowT), @"tok": @(gen)};
                 }
