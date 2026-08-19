@@ -204,6 +204,12 @@ static void vcam_core_log(NSString *msg) {
 // CPU 闭环降载(2026-08-16): 进程 CPU 接近 daemon 50% 红线时置 YES ——
 // 解码/预渲染节拍降为 1/3(替换内容 ~10fps 更新, 连续无感), 冻结帧走 staging 复用
 @property (nonatomic, assign) BOOL lowPowerDecode;
+// 相机会话起点(2026-08-20 首开卡顿修复): render 心跳中断 >2s(watchdog 同款判定)
+// 后恢复 = 新相机会话(热进程首开/空闲重开/切App)。会话起点后 8s 是 CPU 闭环
+// 豁免窗 —— 相机启动风暴(管线init+媒体重载+预填+各流首帧建槽)是一次性成本,
+// EMA>72 误触发降载把 24fps 压到 20fps(每秒丢4帧, 用户看到"开头掉帧卡顿"),
+// 再熬 10s 保持期才退出 = "过一段时间才流畅"的直接来源
+@property (nonatomic, assign) CFAbsoluteTime camSessionStart;
 // 多流显示同步(2026-08-16 照片模式叠影修复): 照片模式预览流+照片缩放流同时活跃,
 // 各流 render 时刻不同且缓存 key 不同(尺寸/格式各异), 仅量化代数不够 —— 窗口内
 // 不同流仍会从 live buffer 取到不同时间的帧, App 融合两流 → 两个画面叠影。
@@ -216,6 +222,11 @@ static void vcam_core_log(NSString *msg) {
 @end
 
 @implementation VCamCore
+
+// msd 进程早期时刻(VCamCore init, dylib 加载即跑, 与进程启动几乎同步):
+// 用于 boot grace 的冷热判定 —— 冷启动首帧(间隔<30s)有系统服务启动叠加,
+// 需要 grace 压启动风暴; 热运行首开相机(间隔>30s)无叠加, 全速安全
+static CFAbsoluteTime gVcamProcInitTime = 0;
 
 + (instancetype)sharedInstance {
     static VCamCore *instance;
@@ -283,6 +294,7 @@ static void vcam_core_log(NSString *msg) {
         }
 
         vcam_core_log(@"[vcam] VCamCore initialized with multi-format buffer pools (vcamplus style)");
+        if (gVcamProcInitTime == 0) gVcamProcInitTime = CFAbsoluteTimeGetCurrent();
     }
     return self;
 }
@@ -369,7 +381,13 @@ static void vcam_core_log(NSString *msg) {
     // 相机活跃心跳 + 空闲即时唤醒(2026-08-16 发热优化): 走到这里 = 有真实可见相机流,
     // 刷新心跳; 若管线处于空闲暂停态(相机关闭过)则同步恢复解码(常驻线程只翻标志, 零延迟),
     // 本帧先吃 _liveYUVPixelBuffer 缓存帧, 解码 ~100ms 内跟上 —— 用户无感知
+    CFAbsoluteTime prevActivity = self->_lastRenderActivity;
     self->_lastRenderActivity = CFAbsoluteTimeGetCurrent();
+    // 相机会话起点跟踪(2026-08-20 首开卡顿修复): 首帧 或 心跳中断>2s 后恢复
+    // (watchdog 同款判定) = 新相机会话。会话起点供 CPU 闭环做启动风暴豁免
+    if (prevActivity == 0 || self->_lastRenderActivity - prevActivity > 2.0) {
+        self->_camSessionStart = self->_lastRenderActivity;
+    }
     if (self->_pipelineIdle) {
         self->_pipelineIdle = NO;                 // 预渲染线程 ≤0.1s 内自行恢复
         [self->_videoPlayer startDecodingThread]; // 空转线程恢复解码标志
@@ -468,14 +486,25 @@ static void vcam_core_log(NSString *msg) {
             // 重启又冲 → 6 秒三连崩循环。首帧起 10s 强制 lowPower(解码/预渲染
             // 20fps 上限), 系统稳住后转 CPU 闭环接管。static 生命周期 = 进程级,
             // mediaserverd 重启归零重新生效, 相机开关(App 切换)不误触发
+            // 冷热判定(2026-08-20 首开卡顿修复): 旧版不分冷热 —— 热运行(msd 早已
+            // 稳定)后的相机首开也被压 10s 20fps = 用户日常"第一次打开有摄像头的
+            // App 开头掉帧卡顿"主因。首帧距 VCamCore init(进程启动) >30s = 热运行,
+            // 无系统服务启动叠加, 跳过 grace 直接全速(CPU 闭环+会话豁免兜底);
+            // <30s = 冷启动首开, 保留 10s 强制降载(三连崩实证必须压)
             static CFAbsoluteTime bootGraceUntil = 0;
             static BOOL bootGraceDone = NO;
             CFAbsoluteTime nowT = CFAbsoluteTimeGetCurrent();
             if (!bootGraceDone) {
                 if (bootGraceUntil == 0) {
-                    bootGraceUntil = nowT + 10.0;
-                    lowPower = YES;
-                    vcam_core_log(@"[vcam] boot grace: forced throttle 10s (startup storm guard)");
+                    if (gVcamProcInitTime > 0 && nowT - gVcamProcInitTime > 30.0) {
+                        bootGraceDone = YES;
+                        lastModeSwitch = nowT;
+                        vcam_core_log(@"[vcam] hot process camera open, boot grace skipped");
+                    } else {
+                        bootGraceUntil = nowT + 10.0;
+                        lowPower = YES;
+                        vcam_core_log(@"[vcam] boot grace: forced throttle 10s (cold start)");
+                    }
                 } else if (nowT >= bootGraceUntil) {
                     bootGraceDone = YES;
                     // 帧数优化(2026-08-20): 冷却结束时 CPU 已舒适(ema<62)则免退出
@@ -499,13 +528,22 @@ static void vcam_core_log(NSString *msg) {
                     BOOL minHoldOk = (nowT - lastModeSwitch) > (lowPower ? 10.0 : 2.0);
                     // 硬闸: EMA>110% = 逼近 2 核, 无视 hold 立即压(秒级尖峰也杀进程)
                     BOOL hardTrip = (emaPct > 110.0);
+                    // 会话豁免(2026-08-20 首开卡顿修复): 相机会话起点(render 心跳
+                    // 中断>2s 后恢复 = 热进程首开/空闲重开/切App)后 8s 内, EMA>72
+                    // 不进降载 —— 相机启动风暴(管线init+媒体重载+预填+各流首帧建槽)
+                    // 是一次性成本, 压内容帧率对 CPU 峰值帮助有限, 却让用户看到
+                    // "开头掉帧卡顿"(24fps 压 20fps 每秒丢4帧)再熬 10s 保持期才退出
+                    // = "过一段时间才稳定流畅"。hardTrip(>110)仍立即压(真失控保命);
+                    // 8s 后闭环正常接管(持续真过载仍会降载)
+                    BOOL sessionExempt = (self->_camSessionStart > 0 &&
+                                          (nowT - self->_camSessionStart) < 8.0);
                     // 阈值(2026-08-18): 72% 提前介入给 runningboardd 留余量;
                     // 退出线 55→62(2026-08-20 帧数修复): 正常运行区间实测 45-58%,
                     // 旧退出线 55 落在正常带内部 —— 稳态 56-58% 时一旦因尖峰进入
                     // 降载(20fps)就永远退不出(需 <55), 替换视频被长期压在 20fps =
                     // "帧数不稳定"直接来源。62 在正常带顶(58)之上, 与 72 进入线构成
                     // 10 点滞回带(对齐 2026-08-17 教训: 退出线必须高于正常带顶)
-                    if ((emaPct > 72.0 || hardTrip) && !lowPower && (minHoldOk || hardTrip)) {
+                    if ((emaPct > 72.0 || hardTrip) && !lowPower && (minHoldOk || hardTrip) && (!sessionExempt || hardTrip)) {
                         lowPower = YES;
                         lastModeSwitch = nowT;
                         vcam_core_log([NSString stringWithFormat:@"[vcam] CPU %.0f%% (ema) >72%%, EMERGENCY throttle ON", emaPct]);
