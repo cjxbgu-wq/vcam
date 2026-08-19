@@ -906,6 +906,25 @@ static void vcamMirrorRowsInPlace(CVPixelBufferRef pb) {
 // (竖屏录制文件旋转 90° 后显示为左侧)。
 // 预览流无此问题: BGRA 无 UV 子采样; 420f→420f 是 YUV 域缩放(千面同路径)。
 
+// 色彩附件同步(2026-08-19 变色修复): memcpy 预裁剪只拷像素, colorspace 附件
+// 不跟随 → VT 对无附件源做 RGB→YUV 时用默认色彩矩阵而非源视频实际色彩描述
+// → 录制画面变色(设备实证 1.3.4)。只拷 3 个色彩键 —— 不拷 clean aperture 等
+// 几何附件(裁剪槽几何已变, 旧 CA 会被 VT 二次裁剪)。
+static void vcamSyncColorAttachments(CVPixelBufferRef src, CVPixelBufferRef dst) {
+    if (!src || !dst) return;
+    static CFStringRef keys[3];
+    static dispatch_once_t onceTok;
+    dispatch_once(&onceTok, ^{
+        keys[0] = kCVImageBufferColorPrimariesKey;
+        keys[1] = kCVImageBufferTransferFunctionKey;
+        keys[2] = kCVImageBufferYCbCrMatrixKey;
+    });
+    for (int i = 0; i < 3; i++) {
+        CFTypeRef v = CVBufferGetAttachment(src, keys[i], NULL);
+        if (v) CVBufferSetAttachment(dst, keys[i], v, kCVAttachmentMode_ShouldPropagate);
+    }
+}
+
 // Trim crop offset 非整数判定: 水平/垂直 crop 总量非正偶数 → offset x.5/x.33 非整
 static void vcamTrimFractionalCrop(CVPixelBufferRef src, CVPixelBufferRef dst, BOOL *fixH, BOOL *fixV) {
     *fixH = NO; *fixV = NO;
@@ -1377,6 +1396,8 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
                 slot->token = srcToken;
                 copied = YES;
             }
+            // 色彩附件同步(锁内, buffer 无 GPU 在飞): 源有附件就拷, 无则维持
+            vcamSyncColorAttachments(staging, slot->staging);
             CVPixelBufferUnlockBaseAddress(slot->staging, 0);
         }
         CVPixelBufferUnlockBaseAddress(staging, kCVPixelBufferLock_ReadOnly);
