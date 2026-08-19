@@ -101,7 +101,14 @@ static int vcamScalerArrCount = 0;
 static int vcamEncoderArrCount = 0;
 static int vcamPhotoEmitCount = 0;
 
-static BOOL vcamMetaFixCached = YES;
+// metaFix 默认 NO(2026-08-19 UAF 崩溃修复): CMRemoveAttachment 在 CMCapture 管线并发
+// 使用的 attachments 字典上删 key —— emit/scaler/encoder 三个 hook 在不同 Apple 队列
+// 线程并发操作同一物理 buffer 的 attachments(CFDictionary 非线程安全), 竞态 →
+// use-after-free → SIGSEGV → mediaserverd 重启 → 全 App 相机黑屏(设备实证: 3 次同栈
+// 崩溃 vcam_crash.txt, 帧链 CMCapture→hook→strip 遍历循环区, 崩溃时机=进程启动 0-2s
+// ×2 + 18min 周期窗口, 与 still 诊断/剥离的并发窗口完全吻合; runs=82)。
+// 照片过曝实验(千面同样过曝)退居 vc.plist "metaFix=YES" 显式开启。
+static BOOL vcamMetaFixCached = NO;
 static time_t vcamMetaFixTS = 0;
 static BOOL vcamMetaFixOn(void) {
     time_t now = time(NULL);
@@ -171,9 +178,23 @@ static NSString *vcamTrunc(NSString *s, NSUInteger n) {
     return [NSString stringWithFormat:@"%@...", [s substringToIndex:n]];
 }
 
+// still 到达诊断默认关闭(2026-08-19 UAF 崩溃修复): CMCopyDictionaryOfAttachments +
+// description 遍历与并发 hook 线程的元数据操作/CMCapture 管线访问同一 attachments
+// 字典存在竞态窗口(与 metaFix 同源)。诊断使命已完成, vc.plist "stillDiag=YES" 开启。
+static BOOL vcamStillDiagOn(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        @try {
+            NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Media/DCIM/vc.plist"];
+            cached = (d && d[@"stillDiag"]) ? [d[@"stillDiag"] boolValue] : 0;
+        } @catch (NSException *e) { cached = 0; }
+    }
+    return cached == 1;
+}
+
 // still 管线到达诊断: 像素亮度(定位增益发生段) + 全部附件(找曝光元数据真实 key)
 static void vcamDumpStillArrival(NSString *tag, int idx, CMSampleBufferRef sb, CVPixelBufferRef pb) {
-    if (!pb) return;
+    if (!pb || !vcamStillDiagOn()) return;
     OSType fmt = CVPixelBufferGetPixelFormatType(pb);
     NSString *sbA = @"{}", *pbA = @"{}";
     if (sb) {
