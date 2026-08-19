@@ -883,6 +883,58 @@ static void vcamMirrorRowsInPlace(CVPixelBufferRef pb) {
     CVPixelBufferUnlockBaseAddress(pb, 0);
 }
 
+// 边缘色度修复(2026-08-19 录像绿线根治): VT Trim 缩放的 crop offset 非整数时,
+// RGB->YUV420 私有格式路径('-8v0' 等)的边界半像素越界 → 该行/列 UV=0 → 绿线。
+// 设备实证: 系统相机竖屏录像, s2 BGRA 720x538 → 1920x1080 '-8v0',
+// scale=2.667 垂直 crop 354.7 非整 → 顶行 UV=0 → 录制文件旋转 90° 后显示为左侧绿线。
+// 预览流无此问题: BGRA 无 UV 子采样; 420f→420f 是 YUV 域缩放(千面同路径, 边界正常)。
+// 修法: VT 写完后用相邻正常行/列覆盖边缘 UV(仅色度平面, 微秒级);
+// 非双平面格式/lock 失败静默跳过(保底不崩)。YUV 域(YUV 车道)无需修 —— 只修私有车道 s2。
+static void vcamFixEdgeChroma(CVPixelBufferRef dst, BOOL fixH, BOOL fixV) {
+    if (!dst || (!fixH && !fixV)) return;
+    if (CVPixelBufferGetPlaneCount(dst) != 2) return;  // 只处理 Y+UV 双平面 420 族
+    if (CVPixelBufferLockBaseAddress(dst, 0) != kCVReturnSuccess) return;
+    uint8_t *uv = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(dst, 1);
+    size_t uvW = CVPixelBufferGetWidthOfPlane(dst, 1);
+    size_t uvH = CVPixelBufferGetHeightOfPlane(dst, 1);
+    size_t uvRB = CVPixelBufferGetBytesPerRowOfPlane(dst, 1);
+    if (uv && uvW >= 4 && uvH >= 4 && uvRB >= uvW * 2) {
+        size_t rowBytes = uvW * 2;  // CbCr 交织: 每 UV 列 2 字节
+        if (fixV) {  // 顶/底行 ← 相邻行
+            memcpy(uv, uv + uvRB, rowBytes);
+            memcpy(uv + (uvH - 1) * uvRB, uv + (uvH - 2) * uvRB, rowBytes);
+        }
+        if (fixH) {  // 左/右 UV 列 ← 相邻列(2 字节粒度, CbCr 对不可拆)
+            for (size_t y = 0; y < uvH; y++) {
+                uint8_t *r = uv + y * uvRB;
+                memcpy(r, r + 4, 4);                              // UV 列 0-1 ← 列 2-3
+                memcpy(r + (uvW - 2) * 2, r + (uvW - 4) * 2, 4);  // 末 2 UV 列 ← 前 2 列
+            }
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(dst, 0);
+}
+
+// Trim crop offset 非整数判定: 水平/垂直 crop 总量非正偶数 → offset x.5/x.33 非整
+static void vcamTrimFractionalCrop(CVPixelBufferRef src, CVPixelBufferRef dst, BOOL *fixH, BOOL *fixV) {
+    *fixH = NO; *fixV = NO;
+    if (!src || !dst) return;
+    size_t srcW = CVPixelBufferGetWidth(src), srcH = CVPixelBufferGetHeight(src);
+    size_t dstW = CVPixelBufferGetWidth(dst), dstH = CVPixelBufferGetHeight(dst);
+    if (!srcW || !srcH || !dstW || !dstH) return;
+    double sc = MAX((double)dstW / srcW, (double)dstH / srcH);
+    double cropW = srcW * sc - dstW;   // 水平 crop 总量(>0 才有裁剪)
+    double cropH = srcH * sc - dstH;
+    if (cropW > 0.5) {
+        double off = cropW / 2.0;
+        *fixH = (fabs(off - floor(off + 0.5)) > 1e-3);  // offset 非整数
+    }
+    if (cropH > 0.5) {
+        double off = cropH / 2.0;
+        *fixV = (fabs(off - floor(off + 0.5)) > 1e-3);
+    }
+}
+
 // 逐平面复制(格式/尺寸需一致, bytesPerRow 允许不同 → 逐行 min 拷贝)
 static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
     if (!src || !dst) return NO;
@@ -1359,6 +1411,14 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
                 OSStatus st2 = VTPixelTransferSessionTransferImage(_privateTransferSession, staging, dst);
                 [self noteStageTimingFmt:(uint32_t)dstFormat w:(uint32_t)dstW h:(uint32_t)dstH stage:2 ms:(CFAbsoluteTimeGetCurrent() - t2) * 1000.0];
                 if (st2 != noErr) ok = NO;
+                else {
+                    // 录像绿线修复(2026-08-19): Trim crop offset 非整数时 VT RGB→YUV420
+                    // 私有格式边界半像素越界 → 边缘 UV=0 → 绿线(录制文件旋转后左侧)。
+                    // 用相邻正常行/列覆盖边缘 UV; 整数 crop 流零成本跳过
+                    BOOL fixH = NO, fixV = NO;
+                    vcamTrimFractionalCrop(staging, dst, &fixH, &fixV);
+                    if (fixH || fixV) vcamFixEdgeChroma(dst, fixH, fixV);
+                }
             }
         }
         [_laneLockPrivate unlock];
