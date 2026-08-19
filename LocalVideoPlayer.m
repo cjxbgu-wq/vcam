@@ -568,8 +568,11 @@ static size_t vcam_decode_max_edge(void) {
 - (void)unloadForIdle {
     _pendingUnload = YES;
     __sync_add_and_fetch(&_requestedLoadGen, 1);
-    // 续播位置(2026-08-19): 视频模式记下最后解码 PTS, 恢复 rebuild 从此续播
-    _resumeAtSeconds = (_mediaType == VCamMediaTypeVideo) ? _lastDecodedPosSec : 0;
+    // 恢复从头播(2026-08-19 续播 seek 撤除): AVAssetReader timeRange seek 的
+    // 实现是"从头解码丢帧到目标位置"(7s/24fps 视频 seek 4s+ 需丢 100+ 帧,
+    // 软解 3-8s), 是恢复冻结(设备实测 rebuild 最长 14s)的主要成分。循环播放
+    // 场景从头播自然(千面同款), 换取恢复 rebuild <100ms。
+    _resumeAtSeconds = 0;
     [self clearFrameQueue];
     vcam_player_log(@"[vcam] Idle unload requested (jetsam guard)");
 }
