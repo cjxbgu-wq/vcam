@@ -257,6 +257,21 @@ static VCamCropStagingSlot gVcamCropStaging[kVcamCropStagingMax];
 // Normal 等比缩放 session(预裁剪路径专用, 进程级懒建, 锁内调用)
 static VTPixelTransferSessionRef gVcamNormalSession = NULL;
 
+// 发热优化(2026-08-20): 私有格式 YUV 域上采样中转槽。
+// 设备遥测实证: |xv0 流 BGRA→私有 3MP 上采样+RGB→YUV = 8.1ms/帧(×24fps≈19% CPU,
+// 发热主热点); 而 p420 流 420f→p420 YUV 域直转同量级输出仅 2.8ms。
+// 拆两段: RGB→YUV 在源分辨率完成(~1ms), 上采样走同格式缩放(YUV 域快路径 ~3ms)。
+// 调用方持 _laneLockPrivate; lastUse LRU 同裁剪槽
+typedef struct {
+    uint32_t fmt;               // 私有目标格式(|xv0/-8f0/|8v0...)
+    size_t w, h;                // 源尺寸(s2src 尺寸)
+    CVPixelBufferRef staging;   // 私有格式 @ 源尺寸
+    uint64_t token;             // 内容帧代数(同帧多流共享跳过 s2a 转换)
+    CFAbsoluteTime lastUse;
+} VCamYuvStagingSlot;
+#define kVcamYuvStagingMax 4
+static VCamYuvStagingSlot gVcamYuvStaging[kVcamYuvStagingMax];
+
 // 车道熔断 memo: 热路径零装箱查表; 熔断写入时刷新对应槽
 static uint32_t gVcamLaneMemoFmt[4] = {0, 0, 0, 0};
 static BOOL gVcamLaneMemoOff[4] = {NO, NO, NO, NO};
@@ -1405,6 +1420,62 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
     return copied ? slot->staging : NULL;
 }
 
+// 发热优化(2026-08-20): 取/建私有格式 @ 源尺寸的 YUV 中转槽, 并把 s2src(BGRA)
+// 转换进去(RGB→YUV 在源分辨率完成, ~0.3MP 只付 ~1ms; 3MP 直转要 8.1ms)。
+// 同帧( token 匹配)同源已转 → 直接复用跳过转换。返回 NULL = 转换失败(回退直转)。
+// 调用方持 _laneLockPrivate
+- (CVPixelBufferRef)yuvStagingForSrc:(CVPixelBufferRef)s2src
+                                  fmt:(uint32_t)dstFormat
+                             srcToken:(uint64_t)srcToken {
+    if (!s2src) return NULL;
+    size_t sw = CVPixelBufferGetWidth(s2src), sh = CVPixelBufferGetHeight(s2src);
+    if (!sw || !sh) return NULL;
+
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    VCamYuvStagingSlot *slot = NULL;
+    int lruIdx = 0;
+    for (int i = 0; i < kVcamYuvStagingMax; i++) {
+        if (gVcamYuvStaging[i].staging && gVcamYuvStaging[i].fmt == dstFormat &&
+            gVcamYuvStaging[i].w == sw && gVcamYuvStaging[i].h == sh) {
+            slot = &gVcamYuvStaging[i]; break;
+        }
+        if (gVcamYuvStaging[i].lastUse < gVcamYuvStaging[lruIdx].lastUse) lruIdx = i;
+    }
+    if (!slot) {
+        int idx = -1;
+        for (int i = 0; i < kVcamYuvStagingMax; i++) {
+            if (!gVcamYuvStaging[i].staging) { idx = i; break; }
+        }
+        if (idx < 0) {  // 全满: LRU 覆盖
+            idx = lruIdx;
+            CVPixelBufferRelease(gVcamYuvStaging[idx].staging);
+            gVcamYuvStaging[idx].staging = NULL;
+        }
+        CVPixelBufferRef nb = NULL;
+        if (CVPixelBufferCreate(kCFAllocatorDefault, sw, sh, dstFormat, NULL, &nb) != noErr || !nb) return NULL;
+        gVcamYuvStaging[idx].fmt = dstFormat;
+        gVcamYuvStaging[idx].w = sw; gVcamYuvStaging[idx].h = sh;
+        gVcamYuvStaging[idx].staging = nb;
+        gVcamYuvStaging[idx].token = 0;  // 新槽内容无效, 强制转换
+        gVcamYuvStaging[idx].lastUse = now;
+        slot = &gVcamYuvStaging[idx];
+        vcam_gpu_log([NSString stringWithFormat:@"[vcam] YUV upscale staging built %zux%zu fmt=0x%x (slot %d, heat fix)", sw, sh, (unsigned)dstFormat, idx]);
+    }
+    slot->lastUse = now;
+    if (slot->token == srcToken && srcToken != 0) return slot->staging;  // 同帧已转
+
+    // BGRA → 私有格式 @ 同尺寸(Trim 会话同尺寸无 crop, 纯格式转换);
+    // VT 自动携带色彩附件(非 memcpy), 无需手动同步
+    OSStatus st = VTPixelTransferSessionTransferImage(_privateTransferSession, s2src, slot->staging);
+    if (st != noErr) {
+        slot->token = 0;
+        vcam_gpu_log([NSString stringWithFormat:@"[vcam] yuv staging s2a failed (%d), fallback direct", (int)st]);
+        return NULL;
+    }
+    slot->token = srcToken;
+    return slot->staging;
+}
+
 - (BOOL)transferPixelBuffer:(CVPixelBufferRef)src toPixelBuffer:(CVPixelBufferRef)dst token:(uint64_t)token {
     if (!src || !dst) return NO;
 
@@ -1531,7 +1602,24 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
                 BOOL useNormal = (s2src != staging);
                 VTPixelTransferSessionRef s2sess = useNormal
                     ? [self normalTransferSession] : _privateTransferSession;
-                OSStatus st2 = VTPixelTransferSessionTransferImage(s2sess, s2src, dst);
+                // 发热优化(2026-08-20): 大倍率上采样(dst 像素 >4x 源)拆两段 ——
+                // s2a: BGRA→私有 @ 源尺寸(RGB→YUV 在 ~0.3MP 源分辨率完成 ~1ms);
+                // s2b: 私有→私有 同格式缩放(YUV 域上采样, p420 直转同款快路径 ~3ms)。
+                // 设备遥测实证: |xv0 3MP 直转 8.1ms/帧 ×24fps ≈19% CPU(发热主热点),
+                // 拆段后 ~4ms。任一步 VT 失败回退直转(保底; 熔断只计直转失败,
+                // 拆段路径失败不计 —— 组合支持差异不等于该格式不可用)
+                OSStatus st2 = -1;
+                uint64_t dstPx = (uint64_t)dstW * dstH;
+                uint64_t srcPx = (uint64_t)CVPixelBufferGetWidth(s2src) * CVPixelBufferGetHeight(s2src);
+                if (dstPx > 4 * srcPx) {
+                    CVPixelBufferRef yuvMid = [self yuvStagingForSrc:s2src fmt:(uint32_t)dstFormat srcToken:slot->token];
+                    if (yuvMid) {
+                        st2 = VTPixelTransferSessionTransferImage(s2sess, yuvMid, dst);
+                    }
+                }
+                if (st2 != noErr) {
+                    st2 = VTPixelTransferSessionTransferImage(s2sess, s2src, dst);
+                }
                 [self noteStageTimingFmt:(uint32_t)dstFormat w:(uint32_t)dstW h:(uint32_t)dstH stage:2 ms:(CFAbsoluteTimeGetCurrent() - t2) * 1000.0];
                 if (st2 != noErr) ok = NO;
             }
@@ -1837,6 +1925,18 @@ static const NSUInteger kVcamMaxStreamKeys = 6;
             gVcamCropStaging[i].w = gVcamCropStaging[i].h = 0;
             gVcamCropStaging[i].token = 0;
             gVcamCropStaging[i].lastUse = 0;
+            released++;
+        }
+    }
+    // 发热优化 YUV 上采样中转槽同步释放(同上)
+    for (int i = 0; i < kVcamYuvStagingMax; i++) {
+        if (gVcamYuvStaging[i].staging) {
+            CVPixelBufferRelease(gVcamYuvStaging[i].staging);
+            gVcamYuvStaging[i].staging = NULL;
+            gVcamYuvStaging[i].w = gVcamYuvStaging[i].h = 0;
+            gVcamYuvStaging[i].fmt = 0;
+            gVcamYuvStaging[i].token = 0;
+            gVcamYuvStaging[i].lastUse = 0;
             released++;
         }
     }
