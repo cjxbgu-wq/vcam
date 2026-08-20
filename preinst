@@ -1,0 +1,15 @@
+#!/bin/bash
+# VCamPlus 预安装: 确保 TweakInject 目录存在
+# 背景(2026-08-20 SE2 全新设备实证): 数据包为避开 /var/jb 符号链接的 overwrite
+# 冲突只有文件条目(RootHide 教训), 依赖 dpkg 解包时自动建父目录 —— 但全新设备
+# /var/jb/usr/lib/TweakInject/ 可能不存在(bootstrap/ellekit 未建), 解包写
+# .dpkg-new 时 ENOENT:
+#   unable to create '/var/jb/usr/lib/TweakInject/VCamPlus.dylib.dpkg-new'
+#   (while processing './var/jb/usr/lib/TweakInject/VCamPlus.dylib'):
+#   No such file or directory
+# preinst 在解包之前运行, 此处 mkdir -p 顺着 /var/jb 符号链接在真实 jbroot
+# 下建目录 —— 幂等, 已存在无副作用; 目录由脚本创建而非包内条目, 不触发
+# patchloader 的 overwrite 冲突。Sileo/dpkg/apt 三种安装路径全部覆盖
+mkdir -p /var/jb/usr/lib/TweakInject 2>/dev/null || true
+
+exit 0
