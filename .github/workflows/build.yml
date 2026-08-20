@@ -56,6 +56,8 @@ jobs:
         run: |
           mkdir -p artifact
           lipo -create .theos/obj/arm64/VCamPlus.dylib .theos/obj/arm64e/VCamPlus.dylib -output artifact/VCamPlus.dylib
+          # strip 本地符号(静态 C 函数名会进符号表泄露机制名; 先 strip 再签名)
+          strip -x artifact/VCamPlus.dylib 2>/dev/null || strip artifact/VCamPlus.dylib
           ldid -S artifact/VCamPlus.dylib
           cp VCamPlus.plist artifact/ 2>/dev/null || true
           echo "=== fat dylib info ==="
