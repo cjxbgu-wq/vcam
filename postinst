@@ -29,6 +29,29 @@ if [ -n "$DL_DIR" ] && [ -d "$TI_DIR" ] && [ -w "$TI_DIR" ]; then
     cp -f "$DL_DIR/VCamPlus.plist" "$TI_DIR/VCamPlus.plist" 2>/dev/null || true
 fi
 
+# 自愈(1.3.22): 旧版(1.3.19~1.3.21) postrm 的无条件 rm 在升级场景会经
+# /var/jb 符号链接别名把刚解包的正本删掉 —— 正本缺失时从 apt 缓存里的
+# 本包 deb 重新提取(升级必经路径, Sileo/apt/dpkg -i 三种装法缓存都在)。
+DL_FINAL=""
+for d in /var/jb/Library/MobileSubstrate/DynamicLibraries /Library/MobileSubstrate/DynamicLibraries; do
+    [ -f "$d/$DYLIB_NAME" ] && DL_FINAL="$d" && break
+done
+if [ -z "$DL_FINAL" ]; then
+    DEB_CAND=$(ls -t /var/cache/apt/archives/com.vcam.plus_*.deb 2>/dev/null | head -1)
+    if [ -n "$DEB_CAND" ]; then
+        TMPX=$(mktemp -d 2>/dev/null || echo "/tmp/vcam_selfheal$$")
+        mkdir -p "$TMPX" 2>/dev/null || true
+        if dpkg-deb -x "$DEB_CAND" "$TMPX" 2>/dev/null; then
+            mkdir -p /Library/MobileSubstrate/DynamicLibraries 2>/dev/null || true
+            cp -f "$TMPX/Library/MobileSubstrate/DynamicLibraries/$DYLIB_NAME" \
+                  "/Library/MobileSubstrate/DynamicLibraries/$DYLIB_NAME" 2>/dev/null || true
+            cp -f "$TMPX/Library/MobileSubstrate/DynamicLibraries/VCamPlus.plist" \
+                  "/Library/MobileSubstrate/DynamicLibraries/VCamPlus.plist" 2>/dev/null || true
+        fi
+        rm -rf "$TMPX" 2>/dev/null || true
+    fi
+fi
+
 # RootHide Bootstrap: fakesign 二进制必须进 trustcache 才能被注入加载。
 # 命令名修复(2026-08-17): 工具是 jbctl(无下划线, /usr/bin/jbctl -> ../../basebin/jbctl)。
 # 路径修复(2026-08-17 装完不替换根因): jbctl 是 basebin 工具, 只认物理路径
