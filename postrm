@@ -13,4 +13,9 @@
 #     如需立即生效手动 respring 即可
 # 升级场景(prerm remove + 立即 unpack 新版)同样不重启, 由新版 postinst 统一处理
 
+# 1.3.19: postinst 探测复制的 TweakInject 副本不受 dpkg 跟踪, 手动清理
+# (破损路径场景 rm 失败被吞, 无害 —— dpkg 自管 ./Library 正本的删除)
+rm -f /var/jb/usr/lib/TweakInject/VCamPlus.dylib 2>/dev/null || true
+rm -f /var/jb/usr/lib/TweakInject/VCamPlus.plist 2>/dev/null || true
+
 exit 0
