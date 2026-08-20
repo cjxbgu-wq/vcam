@@ -11,5 +11,7 @@
 # 下建目录 —— 幂等, 已存在无副作用; 目录由脚本创建而非包内条目, 不触发
 # patchloader 的 overwrite 冲突。Sileo/dpkg/apt 三种安装路径全部覆盖
 mkdir -p /var/jb/usr/lib/TweakInject 2>/dev/null || true
+# 双布局(2026-08-20 SE2): 千面式 legacy 路径, RootHide patchloader 扫描点
+mkdir -p /var/jb/Library/MobileSubstrate/DynamicLibraries 2>/dev/null || true
 
 exit 0
