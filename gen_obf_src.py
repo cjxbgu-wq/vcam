@@ -429,6 +429,8 @@ IDENT_RENAMES = {
     'initializeInMediaserverd': 'stageInitA',   # 方法名含进程目标词
     'initializeInSpringBoard': 'stageInitB',
     'vcam_log_budget_take': 'qzbt0',            # 全局符号(strip -x 不删外部符号)
+    'activePlaybackPath': 'ap0x',               # 类方法名(plist 键字符串已加密, 不受影响)
+    'setActivePlaybackPath': 'setAp0x',         # 对应 setter(大小写变体)
 }
 
 
