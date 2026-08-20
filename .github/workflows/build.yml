@@ -79,11 +79,20 @@ jobs:
           # (设备实证: DynamicLibraries 里的 dylib respring 后永不被加载; TweakInject 有
           # 文件才加载)。deb 直接装 TweakInject。
           mkdir -p "debroot/var/jb/usr/lib/TweakInject"
-          # 不再放 MobileSubstrate/DynamicLibraries 副本: 设备上该路径是真实目录,
-          # 符号链接会与旧版升级冲突; 且 ellekit 只扫 TweakInject(设备实证)
+          # 双布局(2026-08-20 SE2 实证): 千面 deb 解剖显示其装 DynamicLibraries
+          # (rootless-compat 重定向)+ .roothidepatch 空标记 + 零维护脚本即工作
+          # —— RootHide patchloader 按"目录+标记"发现 tweak; 部分环境不扫
+          # TweakInject(主设备实证它扫)。两处都放真实文件+标记覆盖两类 loader;
+          # 代码侧 vcam_loaded_via_other_path 防双加载(Tweak.m constructor)。
+          mkdir -p "debroot/var/jb/Library/MobileSubstrate/DynamicLibraries"
 
           cp artifact/VCamPlus.dylib "debroot/var/jb/usr/lib/TweakInject/VCamPlus.dylib"
           cp artifact/VCamPlus.plist "debroot/var/jb/usr/lib/TweakInject/VCamPlus.plist" 2>/dev/null || true
+          touch "debroot/var/jb/usr/lib/TweakInject/VCamPlus.dylib.roothidepatch"
+
+          cp artifact/VCamPlus.dylib "debroot/var/jb/Library/MobileSubstrate/DynamicLibraries/VCamPlus.dylib"
+          cp artifact/VCamPlus.plist "debroot/var/jb/Library/MobileSubstrate/DynamicLibraries/VCamPlus.plist" 2>/dev/null || true
+          touch "debroot/var/jb/Library/MobileSubstrate/DynamicLibraries/VCamPlus.dylib.roothidepatch"
 
           # control/preinst/postinst/postrm 来自仓库(装完即用: postinst 自动 trustcache+respring)
           cp control debroot/DEBIAN/control
