@@ -7,3 +7,4 @@ Maintainer: vcam
 Author: vcam
 Section: Tweaks
 Depends: mobilesubstrate, ellekit
+Pre-Depends: rootless-compat(>= 0.9)
