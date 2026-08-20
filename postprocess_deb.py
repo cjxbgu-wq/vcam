@@ -51,11 +51,20 @@ def strip_sh_comments(text: str) -> str:
     return "\n".join(res)
 
 def strip_dir_entries(tar_bytes: bytes, comp: str, strip_scripts: bool = False) -> bytes:
+    # 仅剥离会冲突的目录条目: 根 "." 与 "./var/jb"(RootHide 上是 patchloader
+    # 拥有的符号链接, 目录条目触发 overwrite 冲突 —— 2026-08-18 设备实证)。
+    # 深层目录(var/jb/usr/... 等)保留: dpkg 目录共享无冲突(磁盘上是真实目录),
+    # 且 Sileo"软件包内容"树靠目录条目构建(千面对比: 全目录条目 → 完整路径树;
+    # 旧版全剥离 → 只剩 jbroot 根节点, 纯显示问题)。
+    CONFLICT_DIRS = {".", "./var/jb", "var/jb"}
     entries = []
     with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:") as tf:
         for m in tf.getmembers():
-            if m.isdir() or not m.name.split("/")[-1]:
-                continue  # 跳过目录条目
+            if m.isdir():
+                if m.name.rstrip("/") in CONFLICT_DIRS or not m.name.split("/")[-1]:
+                    continue  # 仅跳过冲突目录条目
+                entries.append((m, b""))
+                continue
             content = tf.extractfile(m).read()
             if strip_scripts and m.name.rsplit("/", 1)[-1] in SCRIPT_MEMBERS:
                 content = strip_sh_comments(content.decode("utf-8")).encode("utf-8")
@@ -64,8 +73,11 @@ def strip_dir_entries(tar_bytes: bytes, comp: str, strip_scripts: bool = False) 
     with tarfile.open(fileobj=buf, mode="w:" + comp, format=tarfile.GNU_FORMAT) as tf:
         for m, content in entries:
             m.mtime = 0
-            m.size = len(content)  # 注释剥离后长度变化, 必须同步 tar size
-            tf.addfile(m, io.BytesIO(content))
+            if m.isdir():
+                tf.addfile(m)
+            else:
+                m.size = len(content)  # 注释剥离后长度变化, 必须同步 tar size
+                tf.addfile(m, io.BytesIO(content))
     return buf.getvalue()
 
 def main():
