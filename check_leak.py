@@ -25,9 +25,12 @@ KEYWORDS = [
     'decodeMaxEdge', 'restartToken', 'manualRotation',
     # 队列/通知名
     'com.vcam',
-    # VT 属性与符号(应全部运行时解密)
+    # VT 属性与符号(应全部运行时解密; 用完整符号名, 避免误伤编译器
+    # 生成的属性类型编码 T^{OpaqueVTPixelRotationSession=} —— 那是
+    # @property 声明 C 指针类型的必然产物, 不属于字符串泄露)
     'ScalingMode', 'FlipHorizontalOrientation', 'kVTRotation',
-    'VTPixelRotationSession', 'VTPixelTransferSession',
+    'kVTPixelRotationPropertyKey', 'VTPixelRotationSessionCreate',
+    'VTPixelRotationSessionRotateImage', 'VTPixelRotationSessionInvalidate',
     'MTLCreateSystemDefaultDevice',
     # 日志前缀
     '[vcam]',
