@@ -5,6 +5,18 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = VCamPlus
 
+# 发布构建(FINALPACKAGE=1)从 obfsrc/ 编译: 字符串全量加密 + 类运行时改名
+# (gen_obf_src.py 生成, CI 在 make 前运行); 本地开发构建用明文源码
+ifeq ($(FINALPACKAGE),1)
+VCamPlus_FILES = obfsrc/Tweak.m \
+	obfsrc/VCamCore.m \
+	obfsrc/GPUImageProcessor.m \
+	obfsrc/LocalVideoPlayer.m \
+	obfsrc/NSQueue.m \
+	obfsrc/VCamNotify.m \
+	obfsrc/VCamFloatingBall.m \
+	obfsrc/ObfStrData.m
+else
 VCamPlus_FILES = Tweak.m \
 	VCamCore.m \
 	GPUImageProcessor.m \
@@ -12,6 +24,7 @@ VCamPlus_FILES = Tweak.m \
 	NSQueue.m \
 	VCamNotify.m \
 	VCamFloatingBall.m
+endif
 
 VCamPlus_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-function -Wno-incompatible-pointer-types-discards-qualifiers -Wno-incompatible-function-pointer-types -Wno-unused-but-set-variable
 VCamPlus_LDFLAGS = -Wl,-platform_version,ios,15.0,15.6 -Wl,-undefined,dynamic_lookup -Wl,-weak_framework,UIKit -Wl,-weak_framework,PhotosUI -Wl,-weak_framework,Metal
