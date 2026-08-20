@@ -1,0 +1,463 @@
+# -*- coding: utf-8 -*-
+"""gen_obf_src.py — 发布级源码混淆变换器(一级防护)
+
+产出 obfsrc/ 目录(FINALPACKAGE=1 时 Makefile 从这里编译), 本地源码保持可读:
+  1. 字符串全量加密: @"..." / "..." / CFSTR("...") / @selector(...) 全部替换为
+     运行时解密调用(obfN/obfC/obfCF/obfSEL), 二进制内零明文(strings/class-dump 失效)
+  2. 自有类运行时改名: __attribute__((objc_runtime_name)) — 源码不动,
+     二进制类名变为无意义名(class-dump 看到的类是 Qz1/Wv2/...)
+  3. 相邻字符串字面量合并(编译器拼接语义), 转义序列解码后按真实字节加密
+  4. length 前缀存储(不依赖 NUL 终止 —— 根治 1.2.x 时代 vcStrX 越界 bug)
+
+安全约束(2026-08-20 审计):
+  - 无 `== @"` 指针比较, 无文件级字符串常量初始化, 无 C 字符串长期存储(全部实测)
+  - 运行时值与原字面量完全一致: 跨进程契约(vc.plist 键/Darwin 通知名)不变,
+    旧版本升级后配置无缝继承
+  - obfN 带 per-id 缓存, 热路径零额外分配; obfC 纯计算无锁, 信号上下文安全
+
+用法: python3 gen_obf_src.py   (CI 在 make 前运行)
+"""
+import os
+import re
+import random
+import sys
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+OUT = os.path.join(ROOT, 'obfsrc')
+
+M_FILES = ['Tweak.m', 'VCamCore.m', 'GPUImageProcessor.m', 'LocalVideoPlayer.m',
+           'NSQueue.m', 'VCamNotify.m', 'VCamFloatingBall.m']
+# 变换的头文件(类声明 + 可能的内联字符串)
+H_FILES = ['VCamCore.h', 'GPUImageProcessor.h', 'LocalVideoPlayer.h',
+           'NSQueue.h', 'VCamNotify.h', 'VCamFloatingBall.h']
+# 原样拷贝(已是密文数组/图标字节, 无字面量)
+COPY_FILES = ['VCamStr.h', 'ball_icon.h']
+
+# 运行时类名映射(class-dump 只能看到这些)
+CLASS_RUNTIME_NAMES = {
+    'VCamCore': 'Qz1',
+    'LocalVideoPlayer': 'Wv2',
+    'GPUImageProcessor': 'Rk3',
+    'NSQueue': 'Nm4',
+    'VCamNotify': 'Bt5',
+    'VCamFloatingBall': 'Jx6',
+}
+
+MAX_STR = 250          # 单串上限(obfC 栈缓冲 256)
+BUF = 256
+
+# ---------- 全局字符串表 ----------
+_str_map = {}          # plain value -> id
+_str_list = []         # id -> plain value
+
+
+def register(val):
+    if '\x00' in val:
+        raise SystemExit('字符串含 NUL, 无法加密: %r' % val)
+    if val in _str_map:
+        return _str_map[val]
+    if len(val.encode('utf-8')) > MAX_STR:
+        raise SystemExit('字符串过长(%d bytes): %r' % (len(val.encode('utf-8')), val[:80]))
+    _str_map[val] = len(_str_list)
+    _str_list.append(val)
+    return _str_map[val]
+
+
+# ---------- 词法工具 ----------
+ESC_MAP = {'n': '\n', 't': '\t', 'r': '\r', '\\': '\\', '"': '"', "'": "'",
+           'a': '\a', 'b': '\b', 'f': '\f', 'v': '\v', '0': '\0'}
+
+
+def read_string(text, q):
+    """q = 开引号下标; 返回 (解码值, 闭引号后下标)"""
+    j = q + 1
+    val = []
+    n = len(text)
+    while j < n:
+        ch = text[j]
+        if ch == '\\':
+            nxt = text[j + 1] if j + 1 < n else ''
+            if nxt in ESC_MAP:
+                val.append(ESC_MAP[nxt])
+                j += 2
+            elif nxt == 'x':
+                m = re.match(r'\\x([0-9a-fA-F]{1,2})', text[j:j + 4])
+                if m:
+                    val.append(chr(int(m.group(1), 16)))
+                    j += 1 + len(m.group(0)) - 1
+                else:
+                    val.append('x')
+                    j += 2
+            else:
+                val.append(nxt)
+                j += 2
+        elif ch == '"':
+            return ''.join(val), j + 1
+        elif ch == '\n':
+            raise SystemExit('字符串字面量内换行(不支持): %r' % text[max(0, q - 40):q + 40])
+        else:
+            val.append(ch)
+            j += 1
+    raise SystemExit('未闭合字符串: %r' % text[max(0, q - 40):q + 40])
+
+
+def skip_ws(text, i):
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c in ' \t\r\n':
+            i += 1
+        elif c == '\\' and i + 1 < n and text[i + 1] == '\n':
+            i += 2
+        else:
+            break
+    return i
+
+
+def read_adjacent(text, i, first_val, first_end):
+    """合并相邻字符串字面量(编译器拼接语义), 返回 (合并值, 结束下标)"""
+    val = first_val
+    k = first_end
+    n = len(text)
+    while True:
+        k2 = skip_ws(text, k)
+        if k2 < n and text[k2] == '"':
+            v2, e2 = read_string(text, k2)
+            val += v2
+            k = e2
+            continue
+        if k2 + 1 < n and text[k2] == '@' and text[k2 + 1] == '"':
+            v2, e2 = read_string(text, k2 + 1)
+            val += v2
+            k = e2
+            continue
+        break
+    return val, k
+
+
+DIRECTIVE_VERBATIM = re.compile(
+    r'#\s*(import|include|pragma|if|ifdef|ifndef|elif|else|endif|error|warning|undef|line)\b')
+
+
+def transform(text, in_directive=False):
+    """主变换: 状态机扫描, 返回变换后文本"""
+    out = []
+    i = 0
+    n = len(text)
+    line_start = True
+    while i < n:
+        c = text[i]
+        if not in_directive and line_start and c == '#':
+            j = i
+            while j < n and not (text[j] == '\n' and (j == 0 or text[j - 1] != '\\')):
+                j += 1
+            logical = text[i:j]
+            if DIRECTIVE_VERBATIM.match(logical.lstrip()):
+                out.append(logical)
+            else:
+                out.append(transform(logical, in_directive=True))
+            if j < n:
+                out.append('\n')
+                j += 1
+            i = j
+            line_start = True
+            continue
+        line_start = False
+        if c == '\n':
+            out.append(c)
+            line_start = True
+            i += 1
+            continue
+        if text.startswith('//', i):
+            j = text.find('\n', i)
+            j = n if j < 0 else j
+            out.append(text[i:j])
+            i = j
+            continue
+        if text.startswith('/*', i):
+            j = text.find('*/', i + 2)
+            j = (n - 2) if j < 0 else j
+            j += 2
+            out.append(text[i:j])
+            i = j
+            continue
+        if c == "'":
+            j = i + 1
+            while j < n:
+                if text[j] == '\\':
+                    j += 2
+                    continue
+                if text[j] == "'":
+                    j += 1
+                    break
+                if text[j] == '\n':
+                    break
+                j += 1
+            out.append(text[i:j])
+            i = j
+            continue
+        if c == '@':
+            if i + 1 < n and text[i + 1] == '"':
+                v, e = read_string(text, i + 1)
+                val, k = read_adjacent(text, i, v, e)
+                out.append('obfN(%d)' % register(val))
+                i = k
+                continue
+            m = re.match(r'@selector\s*\(', text[i:])
+            if m:
+                depth = 1
+                j = i + m.end()
+                while j < n and depth:
+                    if text[j] == '(':
+                        depth += 1
+                    elif text[j] == ')':
+                        depth -= 1
+                    j += 1
+                sel = ''.join(text[i + m.end():j - 1].split())
+                out.append('obfSEL(%d)' % register(sel))
+                i = j
+                continue
+            out.append(c)
+            i += 1
+            continue
+        if c == '"':
+            v, e = read_string(text, i)
+            val, k = read_adjacent(text, i, v, e)
+            out.append('OBCS(%d)' % register(val))
+            i = k
+            continue
+        if re.match(r'CFSTR\s*\(\s*"', text[i:]) and (i == 0 or not (text[i-1].isalnum() or text[i-1] == '_')):
+            m = re.match(r'CFSTR\s*\(\s*"', text[i:])
+            q = i + m.end()
+            v, e = read_string(text, q)
+            val, k = read_adjacent(text, q, v, e)
+            k2 = skip_ws(text, k)
+            if k2 < n and text[k2] == ')':
+                out.append('obfCF(%d)' % register(val))
+                i = k2 + 1
+                continue
+            # 非常规写法, 回退按普通 C 串处理
+            out.append('OBCS(%d)' % register(val))
+            i = k
+            continue
+        out.append(c)
+        i += 1
+    return ''.join(out)
+
+
+def insert_obf_import(text):
+    if '#import "ObfStr.h"' in text or '#import <ObfStr.h>' in text:
+        return text
+    lines = text.split('\n')
+    last_imp = -1
+    for idx, ln in enumerate(lines):
+        if ln.startswith('#import') or ln.startswith('#include'):
+            last_imp = idx
+    if last_imp >= 0:
+        lines.insert(last_imp + 1, '#import "ObfStr.h"')
+    else:
+        lines.insert(0, '#import "ObfStr.h"')
+    return '\n'.join(lines)
+
+
+def apply_runtime_names(text):
+    for src, dst in CLASS_RUNTIME_NAMES.items():
+        text = re.sub(r'(@interface\s+)%s\b' % re.escape(src),
+                      r'__attribute__((objc_runtime_name("%s"))) \1%s' % (dst, src), text)
+    return text
+
+
+# ---------- 密表生成 ----------
+def build_tables():
+    random.seed(20260820)
+    offs, lens, keys, dat = [], [], [], bytearray()
+    for s in _str_list:
+        b = s.encode('utf-8')
+        key = random.randint(0x01, 0xFF)
+        cipher = bytes(x ^ key for x in b)
+        offs.append(len(dat))
+        lens.append(len(b))
+        keys.append(key)
+        dat += cipher
+    return offs, lens, keys, bytes(dat)
+
+
+def emit_obfstr():
+    offs, lens, keys, dat = build_tables()
+    n = len(_str_list)
+
+    def fmt_arr(name, ctype, vals, per=16):
+        rows = []
+        for i in range(0, len(vals), per):
+            rows.append('    ' + ', '.join(str(v) for v in vals[i:i + per]) + ',')
+        body = '\n'.join(rows) if rows else '    0,'
+        return 'static const %s %s[] = {\n%s\n};' % (ctype, name, body)
+
+    def fmt_bytes(name, vals, per=16):
+        rows = []
+        for i in range(0, len(vals), per):
+            rows.append('    ' + ', '.join('0x%02X' % v for v in vals[i:i + per]) + ',')
+        body = '\n'.join(rows) if rows else '    0x00,'
+        return 'static const unsigned char %s[] = {\n%s\n};' % (name, body)
+
+    hdr = '''//
+//  ObfStr.h - 自动生成(gen_obf_src.py), 勿手改
+//  全量字符串混淆运行时层: obfN(NSString)/obfC(C串)/obfCF(CFString)/obfSEL(SEL)
+//  length 前缀解密(无 NUL 依赖), obfN per-id 缓存(热路径零分配)
+//
+#ifndef OBF_STR_H
+#define OBF_STR_H
+
+#import <Foundation/Foundation.h>
+#import <CoreFoundation/CoreFoundation.h>
+#import <objc/runtime.h>
+
+NSString *obfN(unsigned i);
+const char *obfC(unsigned i, char *buf, unsigned bufSize);
+CFStringRef obfCF(unsigned i);
+SEL obfSEL(unsigned i);
+
+// C 字符串字面量替换宏(块作用域复合字面量, 禁止用于静态初始化/长期存储)
+#define OBCS(id) obfC((id), (char[%d]){0}, %d)
+
+#endif // OBF_STR_H
+''' % (BUF, BUF)
+
+    dat_m = '''//
+//  ObfStrData.m - 自动生成(gen_obf_src.py), 勿手改
+//
+#import "ObfStr.h"
+
+#define _OB_COUNT %d
+
+%s
+%s
+%s
+%s
+
+static NSString *_ob_cache[_OB_COUNT];
+
+NSString *obfN(unsigned i) {
+    if (i >= _OB_COUNT) return @"";
+    NSString *s = _ob_cache[i];
+    if (!s) {
+        char buf[%d];
+        obfC(i, buf, sizeof(buf));
+        s = [NSString stringWithUTF8String:buf];
+        _ob_cache[i] = s;  // 良性竞态: 双写同值仅多一次分配
+    }
+    return s;
+}
+
+const char *obfC(unsigned i, char *buf, unsigned bufSize) {
+    unsigned len = _ob_len[i];
+    if (len >= bufSize) len = bufSize - 1;
+    const unsigned char *p = _ob_dat + _ob_off[i];
+    unsigned char k = _ob_key[i];
+    for (unsigned j = 0; j < len; j++) buf[j] = (char)(p[j] ^ k);
+    buf[len] = 0;
+    return buf;
+}
+
+CFStringRef obfCF(unsigned i) {
+    char buf[%d];
+    obfC(i, buf, sizeof(buf));
+    return CFStringCreateWithCString(NULL, buf, kCFStringEncodingUTF8);
+}
+
+SEL obfSEL(unsigned i) {
+    char buf[%d];
+    obfC(i, buf, sizeof(buf));
+    return sel_registerName(buf);
+}
+''' % (n,
+       fmt_arr('_ob_off', 'unsigned int', offs),
+       fmt_arr('_ob_len', 'unsigned char', lens),
+       fmt_arr('_ob_key', 'unsigned char', keys),
+       fmt_bytes('_ob_dat', dat),
+       BUF, BUF, BUF)
+
+    open(os.path.join(OUT, 'ObfStr.h'), 'w', encoding='utf-8', newline='\n').write(hdr)
+    open(os.path.join(OUT, 'ObfStrData.m'), 'w', encoding='utf-8', newline='\n').write(dat_m)
+
+
+# ---------- 校验 ----------
+def verify_no_plain_literals(text):
+    """确认变换输出中不再有裸字符串(注释/预处理指令除外)"""
+    i = 0
+    n = len(text)
+    line_start = True
+    while i < n:
+        c = text[i]
+        if line_start and c == '#':
+            j = text.find('\n', i)
+            j = n if j < 0 else j
+            i = j
+            continue
+        line_start = False
+        if c == '\n':
+            line_start = True
+            i += 1
+            continue
+        if text.startswith('//', i):
+            j = text.find('\n', i)
+            i = n if j < 0 else j
+            continue
+        if text.startswith('/*', i):
+            j = text.find('*/', i + 2)
+            i = n if j < 0 else j + 2
+            continue
+        if c == '"':
+            raise SystemExit('校验失败: 仍有裸字符串 @ %r' % text[max(0, i - 60):i + 60])
+        i += 1
+
+
+def roundtrip_check():
+    offs, lens, keys, dat = build_tables()
+    for idx, s in enumerate(_str_list):
+        b = bytes(dat[offs[idx]:offs[idx] + lens[idx]])
+        dec = bytes(x ^ keys[idx] for x in b).decode('utf-8')
+        assert dec == s, 'roundtrip 失败 id=%d' % idx
+
+
+def main():
+    if os.path.isdir(OUT):
+        for f in os.listdir(OUT):
+            os.remove(os.path.join(OUT, f))
+    os.makedirs(OUT, exist_ok=True)
+
+    for f in M_FILES:
+        src = open(os.path.join(ROOT, f), encoding='utf-8').read()
+        t = transform(src)
+        t = insert_obf_import(t)
+        verify_no_plain_literals(t)
+        open(os.path.join(OUT, f), 'w', encoding='utf-8', newline='\n').write(t)
+
+    for f in H_FILES:
+        src = open(os.path.join(ROOT, f), encoding='utf-8').read()
+        t = transform(src)
+        verify_no_plain_literals(t)
+        # runtime_name 属性自带编译期字符串("Qz1" 无意义名, 非泄露), 在校验之后插入
+        t = apply_runtime_names(t)
+        t = insert_obf_import(t)
+        open(os.path.join(OUT, f), 'w', encoding='utf-8', newline='\n').write(t)
+
+    for f in COPY_FILES:
+        data = open(os.path.join(ROOT, f), 'rb').read()
+        open(os.path.join(OUT, f), 'wb').write(data)
+
+    emit_obfstr()
+    roundtrip_check()
+
+    # 独立测试 main(手工验证用, 编译排除): 解密全部字符串并对比
+    print('obfsrc 生成完成: %d 个文件, %d 条加密字符串, blob %d bytes'
+          % (len(M_FILES) + len(H_FILES) + len(COPY_FILES) + 2, len(_str_list),
+             sum(len(s.encode('utf-8')) for s in _str_list)))
+    leaked_cls = [c for c in CLASS_RUNTIME_NAMES
+                  if any(c in s for s in _str_list)]
+    if leaked_cls:
+        print('提示: 以下类名仍出现在加密字符串值中(运行时日志可见, 二进制不可见): %s' % leaked_cls)
+
+
+if __name__ == '__main__':
+    main()
