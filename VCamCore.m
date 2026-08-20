@@ -532,6 +532,66 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
             if (nowT - lastCpuCheck > 0.8) {  // 2s→0.8s(2026-08-18): 响应提速, 旧 2s+EMA 滞后 4-6s 挡不住启动风暴
                 double cpuSec = [vcam_process_cpu_seconds() doubleValue];
                 double delta = cpuSec - lastCpuSec;
+                // ===== 自适应解码档位(2026-08-20 多流高压卡顿根治) =====
+                // 设备实证(微信等多流 App): 全分辨率解码 + 3 条 720p 流并行 →
+                // CPU 稳态 80-86% —— (1)远超 daemon 50% 红线有被杀风险;
+                // (2)降载(20fps)进入后稳态远高于退出线 62 永远退不出 = 用户
+                // "卡顿不流畅等很久也不恢复"。降载只压解码节拍, render 端
+                // 逐流转换才是 CPU 大头, 压不动。唯一有效手段 = 降解码档位:
+                // 720 档源端 s1/staging/CCW90 全变小, CPU 回 ~45-55%, 降载
+                // 自然退出恢复 24fps(画质 720p, 视频通话/多流场景可接受)。
+                // 防横跳: (a)降档快(>72 持续 3s)/升档慢(<55 持续 8s);
+                // (b)最小间隔 20s; (c)升档失败(升后 15s 内又降)会话内不再升
+                // —— 多流 App 本身就是高压, 反复试升只带来 rebuild 抖动
+                {
+                    static size_t activeEdge = 0;        // 当前生效档(0=plist 原生)
+                    static CFAbsoluteTime highSince = 0, lowSince = 0;
+                    static CFAbsoluteTime lastEdgeSwitch = 0;
+                    static CFAbsoluteTime upgradeAt = 0;  // 最近一次升档时刻
+                    static CFAbsoluteTime stickySession = 0;  // 升档失败标记所属会话
+                    // 新相机会话重置升档失败标记(场景换了值得再试)
+                    if (self->_camSessionStart > 0 && stickySession > 0 &&
+                        self->_camSessionStart != stickySession) {
+                        stickySession = 0;
+                    }
+                    if (emaPct > 72.0) { if (highSince == 0) highSince = nowT; } else highSince = 0;
+                    if (emaPct < 55.0) { if (lowSince == 0) lowSince = nowT; } else lowSince = 0;
+                    // 降档: 高压持续 3s(降档越快越好, 红线保护优先)
+                    if (activeEdge == 0 && highSince > 0 && (nowT - highSince) > 3.0 &&
+                        (nowT - lastEdgeSwitch) > 20.0) {
+                        activeEdge = 720;
+                        lastEdgeSwitch = nowT;
+                        // 升档后 15s 内又降 = 升档失败, 本会话粘滞 720 档
+                        if (upgradeAt > 0 && (nowT - upgradeAt) < 15.0) {
+                            stickySession = self->_camSessionStart;
+                        }
+                        self->_videoPlayer.dynamicMaxEdge = 720;
+                        NSString *rp = self->_videoPlayer.currentVideoPath;
+                        if (rp.length > 0) {
+                            LocalVideoPlayer *vp = self->_videoPlayer;
+                            dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+                                [vp loadVideoAtPath:rp completion:nil];
+                            });
+                        }
+                        vcam_core_log([NSString stringWithFormat:@"[vcam] CPU %.0f%% sustained, decode downgraded to 720 (heat guard)", emaPct]);
+                    }
+                    // 升档: 低压持续 8s 且非粘滞 && 距上次切换 >20s
+                    else if (activeEdge == 720 && lowSince > 0 && (nowT - lowSince) > 8.0 &&
+                             (nowT - lastEdgeSwitch) > 20.0 && stickySession == 0) {
+                        activeEdge = 0;
+                        lastEdgeSwitch = nowT;
+                        upgradeAt = nowT;
+                        self->_videoPlayer.dynamicMaxEdge = 0;
+                        NSString *rp = self->_videoPlayer.currentVideoPath;
+                        if (rp.length > 0) {
+                            LocalVideoPlayer *vp = self->_videoPlayer;
+                            dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+                                [vp loadVideoAtPath:rp completion:nil];
+                            });
+                        }
+                        vcam_core_log(@"[vcam] CPU low sustained, decode restored to native (quality)");
+                    }
+                }
                 if (lastCpuSec > 0 && nowT > lastCpuSample && delta >= 0) {
                     double pct = delta / (nowT - lastCpuSample) * 100.0;
                     emaPct = emaInit ? (emaPct * 0.5 + pct * 0.5) : pct;  // 0.6/0.4→0.5/0.5 更灵敏
