@@ -420,22 +420,76 @@ def roundtrip_check():
         assert dec == s, 'roundtrip 失败 id=%d' % idx
 
 
+CONST_DEF_RE = re.compile(r'NSString\s*\*\s*const\s+(\w+)\s*=\s*(obfN\(\d+\))\s*;')
+CONST_DECL_RE = re.compile(r'extern\s+NSString\s*\*\s*const\s+(\w+)\s*;')
+
+
+def convert_const_to_funcs(texts):
+    """文件级 `NSString *const X = obfN(n);` 编译不了(非常量初始化) ——
+    转为函数 getter: 定义/声明/全部使用点统一改名 X → X()"""
+    const_defs = {}
+    for f, t in texts.items():
+        if not f.endswith('.m'):
+            continue
+        for m in CONST_DEF_RE.finditer(t):
+            const_defs[m.group(1)] = m.group(2)
+    if not const_defs:
+        return
+    ph_map = {}
+    counter = [0]
+    for f in list(texts.keys()):
+        t = texts[f]
+
+        def _def_ph(m):
+            ph = '/*__OBC%d__*/' % counter[0]
+            counter[0] += 1
+            ph_map[ph] = ('def', m.group(1), m.group(2))
+            return ph
+
+        t = CONST_DEF_RE.sub(_def_ph, t)
+
+        def _decl_ph(m):
+            if m.group(1) not in const_defs:
+                return m.group(0)
+            ph = '/*__OBC%d__*/' % counter[0]
+            counter[0] += 1
+            ph_map[ph] = ('decl', m.group(1), const_defs[m.group(1)])
+            return ph
+
+        t = CONST_DECL_RE.sub(_decl_ph, t)
+        for name in const_defs:
+            t = re.sub(r'\b%s\b(?!\s*\()' % re.escape(name), name + '()', t)
+        for ph, (kind, name, call) in ph_map.items():
+            if kind == 'def':
+                t = t.replace(ph, 'NSString *%s(void) { return %s; }' % (name, call))
+            else:
+                t = t.replace(ph, 'NSString *%s(void);' % name)
+        texts[f] = t
+
+
 def main():
     if os.path.isdir(OUT):
         for f in os.listdir(OUT):
             os.remove(os.path.join(OUT, f))
     os.makedirs(OUT, exist_ok=True)
 
+    # Pass 1: 字符串/选择器/CFSTR 全量变换
+    texts = {}
     for f in M_FILES:
-        src = open(os.path.join(ROOT, f), encoding='utf-8').read()
-        t = transform(src)
-        t = insert_obf_import(t)
+        texts[f] = transform(open(os.path.join(ROOT, f), encoding='utf-8').read())
+    for f in H_FILES:
+        texts[f] = transform(open(os.path.join(ROOT, f), encoding='utf-8').read())
+
+    # Pass 2: 文件级 const 常量 → 函数 getter
+    convert_const_to_funcs(texts)
+
+    for f in M_FILES:
+        t = insert_obf_import(texts[f])
         verify_no_plain_literals(t)
         open(os.path.join(OUT, f), 'w', encoding='utf-8', newline='\n').write(t)
 
     for f in H_FILES:
-        src = open(os.path.join(ROOT, f), encoding='utf-8').read()
-        t = transform(src)
+        t = texts[f]
         verify_no_plain_literals(t)
         # runtime_name 属性自带编译期字符串("Qz1" 无意义名, 非泄露), 在校验之后插入
         t = apply_runtime_names(t)
@@ -449,7 +503,6 @@ def main():
     emit_obfstr()
     roundtrip_check()
 
-    # 独立测试 main(手工验证用, 编译排除): 解密全部字符串并对比
     print('obfsrc 生成完成: %d 个文件, %d 条加密字符串, blob %d bytes'
           % (len(M_FILES) + len(H_FILES) + len(COPY_FILES) + 2, len(_str_list),
              sum(len(s.encode('utf-8')) for s in _str_list)))
