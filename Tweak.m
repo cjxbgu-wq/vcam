@@ -497,7 +497,7 @@ static BOOL vcam_loaded_via_other_path(void) {
     const char *selfPath = info.dli_fname;
     const char *selfBase = strrchr(selfPath, '/');
     selfBase = selfBase ? selfBase + 1 : selfPath;
-    uint32_t n = _dyld_get_image_count();
+    uint32_t n = _dyld_image_count();
     for (uint32_t i = 0; i < n; i++) {
         const char *p = _dyld_get_image_name(i);
         if (!p || strcmp(p, selfPath) == 0) continue;
