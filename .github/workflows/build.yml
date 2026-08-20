@@ -30,6 +30,13 @@ jobs:
           echo "=== installed SDKs ==="
           ls -la "$HOME/theos/sdks/"
 
+      - name: Generate obfuscated sources
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          python3 gen_obf_src.py
+          echo "=== obfsrc ==="
+          ls -la obfsrc/
+
       - name: Build tweak
         env:
           THEOS: /Users/runner/theos
@@ -49,6 +56,8 @@ jobs:
         run: |
           mkdir -p artifact
           lipo -create .theos/obj/arm64/VCamPlus.dylib .theos/obj/arm64e/VCamPlus.dylib -output artifact/VCamPlus.dylib
+          # strip 本地符号(静态 C 函数名会进符号表泄露机制名; 先 strip 再签名)
+          strip -x artifact/VCamPlus.dylib 2>/dev/null || strip artifact/VCamPlus.dylib
           ldid -S artifact/VCamPlus.dylib
           cp VCamPlus.plist artifact/ 2>/dev/null || true
           echo "=== fat dylib info ==="
@@ -56,38 +65,51 @@ jobs:
           file artifact/VCamPlus.dylib
           ls -la artifact/
 
+      - name: Leak gate (obfuscation verification)
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          python3 check_leak.py artifact/VCamPlus.dylib
+
       - name: Build deb package (rootless)
         run: |
           cd "$GITHUB_WORKSPACE"
           mkdir -p debroot/DEBIAN
-          # 布局修复(2026-08-17 装完不替换根因): RootHide Bootstrap 的 ellekit/launchdhook
-          # 只扫描 /var/jb/usr/lib/TweakInject/, 不镜像 MobileSubstrate/DynamicLibraries
-          # (设备实证: DynamicLibraries 里的 dylib respring 后永不被加载; TweakInject 有
-          # 文件才加载)。deb 直接装 TweakInject。
-          mkdir -p "debroot/var/jb/usr/lib/TweakInject"
-          # 不再放 MobileSubstrate/DynamicLibraries 副本: 设备上该路径是真实目录,
-          # 符号链接会与旧版升级冲突; 且 ellekit 只扫 TweakInject(设备实证)
+          # 纯千面布局(2026-08-21, 1.3.19 SE2 修复): data.tar 只带
+          # ./Library/MobileSubstrate/DynamicLibraries 条目 —— 千面实证通用布局:
+          #   rootless: rootless-compat/bootstrap 重定向落 /var/jb/Library/...
+          #   rootful: 直写 /Library/...
+          # SE2 实证(1.3.17/1.3.18): /var/jb/usr/lib/TweakInject 链路破损,
+          # dpkg 直写该路径必失败(ENOENT), ./Library 条目则解包正常 —— 故不再
+          # 携带任何 var/jb 条目。TweakInject 副本(ellekit-only 设备加载点)由
+          # postinst 探测复制(可写才写); 双路径双加载由 Tweak.m
+          # vcam_loaded_via_other_path 防重入兜底。preinst mkdir 三候选父目录。
+          mkdir -p "debroot/Library/MobileSubstrate/DynamicLibraries"
 
-          cp artifact/VCamPlus.dylib "debroot/var/jb/usr/lib/TweakInject/VCamPlus.dylib"
-          cp artifact/VCamPlus.plist "debroot/var/jb/usr/lib/TweakInject/VCamPlus.plist" 2>/dev/null || true
+          cp artifact/VCamPlus.dylib "debroot/Library/MobileSubstrate/DynamicLibraries/VCamPlus.dylib"
+          cp artifact/VCamPlus.plist "debroot/Library/MobileSubstrate/DynamicLibraries/VCamPlus.plist" 2>/dev/null || true
+          ln -sf /usr/lib/DynamicPatches/AutoPatches.dylib "debroot/Library/MobileSubstrate/DynamicLibraries/VCamPlus.dylib.roothidepatch"
 
-          # control/postinst/postrm 来自仓库(装完即用: postinst 自动 trustcache+respring)
+          # control/preinst/postinst/postrm 来自仓库(装完即用: postinst 自动 trustcache+respring)
           cp control debroot/DEBIAN/control
+          cp preinst debroot/DEBIAN/preinst
           cp postinst debroot/DEBIAN/postinst
           cp postrm debroot/DEBIAN/postrm
 
           # 维护脚本必须 LF 行尾 + 可执行, 否则 dpkg 报 "bad interpreter" 或拒绝运行
-          sed -i '' $'s/\r$//' debroot/DEBIAN/postinst debroot/DEBIAN/postrm debroot/DEBIAN/control || true
+          sed -i '' $'s/\r$//' debroot/DEBIAN/preinst debroot/DEBIAN/postinst debroot/DEBIAN/postrm debroot/DEBIAN/control || true
           chmod 0755 debroot/DEBIAN
           chmod 0644 debroot/DEBIAN/control
+          chmod 0755 debroot/DEBIAN/preinst
           chmod 0755 debroot/DEBIAN/postinst
           chmod 0755 debroot/DEBIAN/postrm
-          chmod 0755 "debroot/var/jb/usr/lib/TweakInject/VCamPlus.dylib"
-          chmod 0644 "debroot/var/jb/usr/lib/TweakInject/VCamPlus.plist" 2>/dev/null || true
+          chmod 0755 "debroot/Library/MobileSubstrate/DynamicLibraries/VCamPlus.dylib"
+          chmod 0644 "debroot/Library/MobileSubstrate/DynamicLibraries/VCamPlus.plist" 2>/dev/null || true
 
           # gzip 打包(供 postprocess 用标准库处理), 再剥离目录条目
           # (2026-08-18 设备实证: /var/jb 是 patchloader 的符号链接,
           #  目录条目触发 dpkg overwrite 冲突, 装不上)
+          # preinst(2026-08-20 SE2 设备实证): 目录条目剥离后, 全新设备
+          # TweakInject 目录可能不存在 → 解包 ENOENT; preinst 先 mkdir 兜底
           fakeroot dpkg-deb -Zgzip -b debroot VCamPlus.deb
           python3 postprocess_deb.py VCamPlus.deb VCamPlus.deb
           cp VCamPlus.deb artifact/
