@@ -423,10 +423,19 @@ def roundtrip_check():
 CONST_DEF_RE = re.compile(r'NSString\s*\*\s*const\s+(\w+)\s*=\s*(obfN\(\d+\))\s*;')
 CONST_DECL_RE = re.compile(r'extern\s+NSString\s*\*\s*const\s+(\w+)\s*;')
 
+# 高危标识符改名(元数据/符号表泄露): 须无 @selector 引用(已验证);
+# 在字符串变换之后执行 —— 字面量已替换, 不会误伤字符串内容
+IDENT_RENAMES = {
+    'initializeInMediaserverd': 'stageInitA',   # 方法名含进程目标词
+    'initializeInSpringBoard': 'stageInitB',
+    'vcam_log_budget_take': 'qzbt0',            # 全局符号(strip -x 不删外部符号)
+}
+
 
 def convert_const_to_funcs(texts):
     """文件级 `NSString *const X = obfN(n);` 编译不了(非常量初始化) ——
-    转为函数 getter: 定义/声明/全部使用点统一改名 X → X()"""
+    转为函数 getter。函数名用无意义名 ovfN(全局符号会进符号表,
+    原名 VCamNotifyLiveChanged 等会泄露机制); 定义/声明/使用点统一改名"""
     const_defs = {}
     for f, t in texts.items():
         if not f.endswith('.m'):
@@ -435,6 +444,8 @@ def convert_const_to_funcs(texts):
             const_defs[m.group(1)] = m.group(2)
     if not const_defs:
         return
+    # 原名 -> 无意义函数名
+    func_names = {name: 'ovf%d' % i for i, name in enumerate(sorted(const_defs))}
     ph_map = {}
     counter = [0]
     for f in list(texts.keys()):
@@ -457,13 +468,24 @@ def convert_const_to_funcs(texts):
             return ph
 
         t = CONST_DECL_RE.sub(_decl_ph, t)
-        for name in const_defs:
-            t = re.sub(r'\b%s\b(?!\s*\()' % re.escape(name), name + '()', t)
+        for name, fn in func_names.items():
+            t = re.sub(r'\b%s\b(?!\s*\()' % re.escape(name), fn + '()', t)
         for ph, (kind, name, call) in ph_map.items():
             if kind == 'def':
-                t = t.replace(ph, 'NSString *%s(void) { return %s; }' % (name, call))
+                t = t.replace(ph, 'NSString *%s(void) { return %s; }'
+                              % (func_names[name], call))
             else:
-                t = t.replace(ph, 'NSString *%s(void);' % name)
+                t = t.replace(ph, 'NSString *%s(void);' % func_names[name])
+        texts[f] = t
+
+
+def apply_ident_renames(texts):
+    """字符串变换之后做标识符改名(此时字面量已是 obfN()/OBCS() 调用,
+    词边界正则只命中代码标识符, 不会破坏字符串值/选择器密文)"""
+    for f in list(texts.keys()):
+        t = texts[f]
+        for old, new in IDENT_RENAMES.items():
+            t = re.sub(r'\b%s\b' % re.escape(old), new, t)
         texts[f] = t
 
 
@@ -480,8 +502,11 @@ def main():
     for f in H_FILES:
         texts[f] = transform(open(os.path.join(ROOT, f), encoding='utf-8').read())
 
-    # Pass 2: 文件级 const 常量 → 函数 getter
+    # Pass 2: 文件级 const 常量 → 无意义名函数 getter
     convert_const_to_funcs(texts)
+
+    # Pass 3: 高危标识符改名(方法名/全局符号)
+    apply_ident_renames(texts)
 
     for f in M_FILES:
         t = insert_obf_import(texts[f])
