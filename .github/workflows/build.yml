@@ -71,15 +71,17 @@ jobs:
           cp artifact/VCamPlus.dylib "debroot/var/jb/usr/lib/TweakInject/VCamPlus.dylib"
           cp artifact/VCamPlus.plist "debroot/var/jb/usr/lib/TweakInject/VCamPlus.plist" 2>/dev/null || true
 
-          # control/postinst/postrm 来自仓库(装完即用: postinst 自动 trustcache+respring)
+          # control/preinst/postinst/postrm 来自仓库(装完即用: postinst 自动 trustcache+respring)
           cp control debroot/DEBIAN/control
+          cp preinst debroot/DEBIAN/preinst
           cp postinst debroot/DEBIAN/postinst
           cp postrm debroot/DEBIAN/postrm
 
           # 维护脚本必须 LF 行尾 + 可执行, 否则 dpkg 报 "bad interpreter" 或拒绝运行
-          sed -i '' $'s/\r$//' debroot/DEBIAN/postinst debroot/DEBIAN/postrm debroot/DEBIAN/control || true
+          sed -i '' $'s/\r$//' debroot/DEBIAN/preinst debroot/DEBIAN/postinst debroot/DEBIAN/postrm debroot/DEBIAN/control || true
           chmod 0755 debroot/DEBIAN
           chmod 0644 debroot/DEBIAN/control
+          chmod 0755 debroot/DEBIAN/preinst
           chmod 0755 debroot/DEBIAN/postinst
           chmod 0755 debroot/DEBIAN/postrm
           chmod 0755 "debroot/var/jb/usr/lib/TweakInject/VCamPlus.dylib"
@@ -88,6 +90,8 @@ jobs:
           # gzip 打包(供 postprocess 用标准库处理), 再剥离目录条目
           # (2026-08-18 设备实证: /var/jb 是 patchloader 的符号链接,
           #  目录条目触发 dpkg overwrite 冲突, 装不上)
+          # preinst(2026-08-20 SE2 设备实证): 目录条目剥离后, 全新设备
+          # TweakInject 目录可能不存在 → 解包 ENOENT; preinst 先 mkdir 兜底
           fakeroot dpkg-deb -Zgzip -b debroot VCamPlus.deb
           python3 postprocess_deb.py VCamPlus.deb VCamPlus.deb
           cp VCamPlus.deb artifact/
