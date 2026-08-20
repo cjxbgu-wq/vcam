@@ -268,7 +268,11 @@ static size_t vcam_decode_max_edge(void) {
 
     // 解码降采样(2026-08-16 发热优化): 超上限源按上限等比缩放解码输出尺寸(偶数对齐,
     // YUV 平面要求)。1080p 及以下源不受影响。
-    size_t maxEdge = vcam_decode_max_edge();
+    // 自适应档位(2026-08-20): dynamicMaxEdge(热保护)>0 时优先于 plist 档 ——
+    // 多流 App 全分辨率解码 CPU 80%+(daemon 50% 红线, 且降载退不出=持续 20fps
+    // 卡顿), VCamCore 高压时强制 720 档, 低压恢复原生
+    size_t plistEdge = vcam_decode_max_edge();
+    size_t maxEdge = (_dynamicMaxEdge > 0) ? ((plistEdge > 0) ? MIN(_dynamicMaxEdge, plistEdge) : _dynamicMaxEdge) : plistEdge;
     if (maxEdge > 0) {
         size_t longEdge = MAX(_videoWidth, _videoHeight);
         if (longEdge > maxEdge) {
