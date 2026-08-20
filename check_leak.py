@@ -20,8 +20,9 @@ KEYWORDS = [
     'emitSampleBuffer', 'renderSampleBuffer',
     # 进程判定/过滤
     'mediaserverd', 'SpringBoard',
-    # 配置契约与路径
-    'vc.plist', 'vcam.mp4', 'logEnabled', 'activePlaybackPath',
+    # 配置契约与路径(activePlaybackPath 是 ObjC 属性名会留在元数据,
+    # 属已接受范围 —— plist 键本身已加密, 故不入 gate)
+    'vc.plist', 'vcam.mp4', 'logEnabled',
     'decodeMaxEdge', 'restartToken', 'manualRotation',
     # 队列/通知名
     'com.vcam',
