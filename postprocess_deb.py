@@ -51,19 +51,23 @@ def strip_sh_comments(text: str) -> str:
     return "\n".join(res)
 
 def strip_dir_entries(tar_bytes: bytes, comp: str, strip_scripts: bool = False) -> bytes:
-    # 仅剥离会冲突的目录条目: 根 "." 与 "./var/jb"(RootHide 上是 patchloader
-    # 拥有的符号链接, 目录条目触发 overwrite 冲突 —— 2026-08-18 设备实证)。
-    # 深层目录(var/jb/usr/... 等)保留: dpkg 目录共享无冲突(磁盘上是真实目录),
-    # 且 Sileo"软件包内容"树靠目录条目构建(千面对比: 全目录条目 → 完整路径树;
-    # 旧版全剥离 → 只剩 jbroot 根节点, 纯显示问题)。
-    CONFLICT_DIRS = {".", "./var/jb", "var/jb"}
+    # 剥离全部目录条目(2026-08-21, 1.3.17 SE2 升级失败教训):
+    # 1.3.16 保留深层目录条目(./var/jb/usr/...)全新安装成功, 但 1.3.17 新增
+    # ./var/jb/Library/MobileSubstrate/DynamicLibraries 目录条目后 SE2 升级
+    # 失败(unable to open .dpkg-new: ENOENT) —— bootstrap 内部符号链接结构
+    # 与目录条目冲突面不可预知。千面带全目录条目能装是因其走 rootless-compat
+    # 重定向(./Library 前缀), 我们混合布局不具该条件。
+    # 纯文件+symlink 条目 + preinst mkdir 兜底 = 无论磁盘符号链接结构如何
+    # 都不会触发目录条目冲突(Sileo 内容树少目录节点是纯显示问题)。
+    # symlink 条目(.roothidepatch 标记, 千面同款)必须原样保留 —— 空文件标记
+    # 是 1.3.17 的自创写法, 千面实证是符号链接 -> AutoPatches.dylib。
     entries = []
     with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:") as tf:
         for m in tf.getmembers():
             if m.isdir():
-                if m.name.rstrip("/") in CONFLICT_DIRS or not m.name.split("/")[-1]:
-                    continue  # 仅跳过冲突目录条目
-                entries.append((m, b""))
+                continue  # 全部目录条目剥离
+            if m.issym() or m.islnk():
+                entries.append((m, None))  # symlink: 无内容, linkname 在 member 里
                 continue
             content = tf.extractfile(m).read()
             if strip_scripts and m.name.rsplit("/", 1)[-1] in SCRIPT_MEMBERS:
@@ -73,8 +77,9 @@ def strip_dir_entries(tar_bytes: bytes, comp: str, strip_scripts: bool = False) 
     with tarfile.open(fileobj=buf, mode="w:" + comp, format=tarfile.GNU_FORMAT) as tf:
         for m, content in entries:
             m.mtime = 0
-            if m.isdir():
-                tf.addfile(m)
+            if content is None:
+                m.size = 0
+                tf.addfile(m)  # symlink 条目: 只写 header(linkname 已在 member)
             else:
                 m.size = len(content)  # 注释剥离后长度变化, 必须同步 tar size
                 tf.addfile(m, io.BytesIO(content))
