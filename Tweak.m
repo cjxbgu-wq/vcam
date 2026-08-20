@@ -508,11 +508,38 @@ static BOOL vcam_loaded_via_other_path(void) {
     return NO;
 }
 
+// 无条件加载信标(2026-08-21, 1.3.21): 注入排查专用 —— 不受 logEnabled 影响
+// (roothide 新视图下进程内 /var/mobile 与 /rootfs 双路径读取可能都失败导致
+// 日志静默, 无法区分"没加载"与"加载了但日志被吞"); 每进程加载只写一次
+// (~100B, 无磁盘配额风险), 写多个候选路径覆盖 shell/daemon/app 不同视图的
+// /tmp 语义(DCIM 媒体目录路径 SSH 必可读)。
+static void vcam_load_beacon(NSString *processName) {
+    NSString *line = [NSString stringWithFormat:@"[%@] loaded in %@ (pid %d)\n",
+                      [NSDate date], processName, getpid()];
+    NSArray *paths = @[@"/var/mobile/Media/DCIM/vcam_load.txt",
+                       @"/tmp/vcam_load.txt",
+                       @"/private/tmp/vcam_load.txt",
+                       @"/var/tmp/vcam_load.txt"];
+    for (NSString *p in paths) {
+        @try {
+            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
+            if (!fh) {
+                [line writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            } else {
+                [fh seekToEndOfFile];
+                [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+                [fh closeFile];
+            }
+        } @catch (NSException *e) {}
+    }
+}
+
 __attribute__((constructor))
 static void vcamInit(void) {
     @autoreleasepool {
         if (vcam_loaded_via_other_path()) return;  // 双布局防重入
         NSString *processName = [[NSProcessInfo processInfo] processName];
+        vcam_load_beacon(processName);  // 无条件信标: 注入可见性诊断
         vcam_tweak_log([NSString stringWithFormat:@"[vcam] Loading in process: %@", processName]);
 
         if ([processName isEqualToString:@"mediaserverd"]) {
