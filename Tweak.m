@@ -32,6 +32,8 @@
 #import <unistd.h>
 #import <time.h>
 #import <string.h>
+#import <dlfcn.h>
+#import <mach-o/dyld.h>
 
 #import "VCamCore.h"
 #import "VCamFloatingBall.h"
@@ -482,9 +484,34 @@ static void vcam_install_crash_handler(void) {
     sigaction(SIGILL, &sa, NULL);
 }
 
+// 双布局加载防重入(2026-08-20, SE2 兼容): deb 同时落 TweakInject 与
+// DynamicLibraries(千面布局, roothidepatch 标记) 两处, 不同 loader 扫描
+// 机制不同 —— 若某设备两条路径都被加载, 同一 dylib 会以两个镜像身份进入
+// 进程(不同真实路径 dyld 不去重) → 双重 hook + 双悬浮球 + 双解码管线。
+// 后到的镜像在 constructor 检测到"同 basename 不同路径"的已加载镜像即退出。
+static void vcamInit(void);
+
+static BOOL vcam_loaded_via_other_path(void) {
+    Dl_info info;
+    if (!dladdr((void *)&vcamInit, &info) || !info.dli_fname) return NO;
+    const char *selfPath = info.dli_fname;
+    const char *selfBase = strrchr(selfPath, '/');
+    selfBase = selfBase ? selfBase + 1 : selfPath;
+    uint32_t n = _dyld_get_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const char *p = _dyld_get_image_name(i);
+        if (!p || strcmp(p, selfPath) == 0) continue;
+        const char *base = strrchr(p, '/');
+        base = base ? base + 1 : p;
+        if (strcmp(base, selfBase) == 0) return YES;  // 同名 dylib 已从另一路径加载
+    }
+    return NO;
+}
+
 __attribute__((constructor))
 static void vcamInit(void) {
     @autoreleasepool {
+        if (vcam_loaded_via_other_path()) return;  // 双布局防重入
         NSString *processName = [[NSProcessInfo processInfo] processName];
         vcam_tweak_log([NSString stringWithFormat:@"[vcam] Loading in process: %@", processName]);
 
