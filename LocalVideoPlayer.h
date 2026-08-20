@@ -58,6 +58,10 @@ typedef NS_ENUM(NSInteger, VCamMediaType) {
 // CPU 降载(VCamCore 设置, 2026-08-16): YES 时解码节拍降为 1/3(~10fps),
 // 替换内容低帧率更新但连续(render 端冻结帧机制保证不闪)
 @property (nonatomic, assign) BOOL lowPowerDecode;
+// 自适应解码档位(2026-08-20 多流高压热保护, VCamCore 设置): 0=plist 默认档
+// (decodeMaxEdge, 当前 0=原生全画质); >0=强制上限(热保护降档, 如 720)。
+// loadVideo 时取 min 生效档。切档后 VCamCore 触发 reload 重建 reader
+@property (nonatomic, assign) size_t dynamicMaxEdge;
 
 // 输出尺寸/格式
 @property (nonatomic, assign) size_t outputWidth;
