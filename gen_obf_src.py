@@ -228,7 +228,11 @@ def transform(text, in_directive=False):
             continue
         if re.match(r'CFSTR\s*\(\s*"', text[i:]) and (i == 0 or not (text[i-1].isalnum() or text[i-1] == '_')):
             m = re.match(r'CFSTR\s*\(\s*"', text[i:])
-            q = i + m.end()
+            # read_string 要求 q=开引号下标; m.end() 在引号之后, 必须回退 1。
+            # (2026-08-20 1.3.14 拉伸 bug 根因: 旧版少减 1, 每个 CFSTR 值被吃掉
+            #  首字符 —— "ScalingMode"→"calingMode" → VT 属性键无效 → 设置失败
+            #  → 会话退回默认缩放模式(拉伸填充)而非 Trim 裁剪)
+            q = i + m.end() - 1
             v, e = read_string(text, q)
             val, k = read_adjacent(text, q, v, e)
             k2 = skip_ws(text, k)
@@ -491,6 +495,88 @@ def apply_ident_renames(texts):
         texts[f] = t
 
 
+# ---------- 源保真校验(防解析 bug 静默损坏密表) ----------
+# 背景(2026-08-20, 1.3.14 拉伸 bug): 变换器 CFSTR 引号下标算错一位, 每个
+# CFSTR 值被吃掉首字符("Trim"→"rim"), roundtrip 校验只验"表↔表"无法发现。
+# 本校验用独立提取器从原始源码抽全部字面量, 逐个断言在密表中 —— 解析器
+# 与提取器逻辑独立, 一方出错即被抓。
+
+CRITICAL_STRS = [
+    # VT 属性(裁剪/硬件提示 —— 1.3.14 事故主角)
+    'ScalingMode', 'Trim', 'Normal', 'RealTime',
+    # 旋转 dlsym 回退值
+    'Rotation', 'CCW90', 'CW90', '180', 'FlipHorizontalOrientation',
+    # Hook 目标
+    'BWNodeOutput', 'BWStillImageScalerNode', 'BWPhotoEncoderNode',
+    'emitSampleBuffer:', 'renderSampleBuffer:forInput:',
+    # 进程判定
+    'mediaserverd', 'SpringBoard',
+    # 配置契约(路径在源码中是完整字面量)
+    '/var/mobile/Media/DCIM/vc.plist', '/var/mobile/Media/DCIM/vcam.mp4',
+    'logEnabled', 'enabled', 'paused', 'mirrored',
+    'manualRotation', 'restartToken', 'decodeMaxEdge', 'activePlaybackPath',
+    # 队列/通知
+    'com.vcam.processing', 'com.vcam.processing.bg', 'com.vcam.decoder',
+    'com.vcam.videoreader', 'com.vcam.filewatch', 'com.vcam.notify',
+    'com.vcam.ios.media.reload', 'com.vcam.ios.live.changed',
+]
+
+LIT_RE = re.compile(
+    r'CFSTR\s*\(\s*"((?:[^"\\\n]|\\.)*)"\s*\)'
+    r'|@selector\s*\(([^)]*)\)'
+    r'|@"((?:[^"\\\n]|\\.)*)"'
+    r'|(?<![\w@])"((?:[^"\\\n]|\\.)*)"')
+
+
+def decode_escapes(s):
+    out, i = [], 0
+    while i < len(s):
+        if s[i] == '\\' and i + 1 < len(s):
+            out.append(ESC_MAP.get(s[i + 1], s[i + 1]))
+            i += 2
+        else:
+            out.append(s[i])
+            i += 1
+    return ''.join(out)
+
+
+def verify_source_fidelity(paths):
+    problems = []
+    for path in paths:
+        text = open(path, encoding='utf-8').read()
+        # 去注释 + 去 char 字面量(防止 '"' 被误当字符串) + 丢弃 verbatim 预处理行
+        text = re.sub(r'/\*.*?\*/', '', text, flags=re.S)
+        text = re.sub(r'//[^\n]*', '', text)
+        text = re.sub(r"'(?:\\.|[^'\\\n])'", "''", text)
+        kept = []
+        for ln in text.split('\n'):
+            if DIRECTIVE_VERBATIM.match(ln.lstrip()):
+                continue
+            kept.append(ln)
+        text = '\n'.join(kept)
+        fname = os.path.basename(path)
+        for m in LIT_RE.finditer(text):
+            if m.group(1) is not None:
+                val = decode_escapes(m.group(1))
+                if val not in _str_map:
+                    problems.append('%s: CFSTR 值不在密表: %r' % (fname, val))
+            elif m.group(2) is not None:
+                val = ''.join(m.group(2).split())
+                if val and val not in _str_map:
+                    problems.append('%s: selector 不在密表: %r' % (fname, val))
+            else:
+                raw = m.group(3) if m.group(3) is not None else m.group(4)
+                val = decode_escapes(raw)
+                if val and val not in _str_map:
+                    problems.append('%s: 字符串不在密表: %r' % (fname, val))
+    for s in CRITICAL_STRS:
+        if s not in _str_map:
+            problems.append('关键字符串不在密表: %r' % s)
+    if problems:
+        raise SystemExit('源保真校验失败:\n  ' + '\n  '.join(problems))
+    return True
+
+
 def main():
     if os.path.isdir(OUT):
         for f in os.listdir(OUT):
@@ -509,6 +595,9 @@ def main():
 
     # Pass 3: 高危标识符改名(方法名/全局符号)
     apply_ident_renames(texts)
+
+    # Pass 4: 源保真校验 —— 独立提取器抽原始字面量, 逐个断言已入密表
+    verify_source_fidelity([os.path.join(ROOT, f) for f in M_FILES + H_FILES])
 
     for f in M_FILES:
         t = insert_obf_import(texts[f])
