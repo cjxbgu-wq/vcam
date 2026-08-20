@@ -30,6 +30,13 @@ jobs:
           echo "=== installed SDKs ==="
           ls -la "$HOME/theos/sdks/"
 
+      - name: Generate obfuscated sources
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          python3 gen_obf_src.py
+          echo "=== obfsrc ==="
+          ls -la obfsrc/
+
       - name: Build tweak
         env:
           THEOS: /Users/runner/theos
@@ -55,6 +62,11 @@ jobs:
           lipo -info artifact/VCamPlus.dylib
           file artifact/VCamPlus.dylib
           ls -la artifact/
+
+      - name: Leak gate (obfuscation verification)
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          python3 check_leak.py artifact/VCamPlus.dylib
 
       - name: Build deb package (rootless)
         run: |
