@@ -543,17 +543,47 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                 // 防横跳: (a)降档快(>72 持续 3s)/升档慢(<55 持续 8s);
                 // (b)最小间隔 20s; (c)升档失败(升后 15s 内又降)会话内不再升
                 // —— 多流 App 本身就是高压, 反复试升只带来 rebuild 抖动
+                //
+                // 分辨率降档总开关(2026-08-21, 1.3.23): vc.plist
+                // "adaptiveResolution" 默认 NO —— 用户明确要求不压缩替换视频
+                // 分辨率(画质优先于 CPU/发热)。NO 时永不降档, CPU 高压由
+                // 内容节流(降帧 20fps)兜底, 每帧保持原生清晰; YES 恢复 1.3.12
+                // 行为(720 热保护)。开关实时生效(3s 刷新), 开→关时正在 720
+                // 档则立即恢复原生。
                 {
                     static size_t activeEdge = 0;        // 当前生效档(0=plist 原生)
                     static CFAbsoluteTime highSince = 0, lowSince = 0;
                     static CFAbsoluteTime lastEdgeSwitch = 0;
                     static CFAbsoluteTime upgradeAt = 0;  // 最近一次升档时刻
                     static CFAbsoluteTime stickySession = 0;  // 升档失败标记所属会话
+                    static BOOL adaptiveResOn = NO;           // 降档开关(默认关)
+                    static CFAbsoluteTime adpResCheckedAt = 0;
+                    if (nowT - adpResCheckedAt > 3.0) {  // 低频刷新开关
+                        adpResCheckedAt = nowT;
+                        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath];
+                        if (d) adaptiveResOn = [d[@"adaptiveResolution"] boolValue];  // 缺省 NO
+                    }
                     // 新相机会话重置升档失败标记(场景换了值得再试)
                     if (self->_camSessionStart > 0 && stickySession > 0 &&
                         self->_camSessionStart != stickySession) {
                         stickySession = 0;
                     }
+                    // 开关关闭: 永不降档; 若此前已在 720 档立即恢复原生
+                    if (!adaptiveResOn) {
+                        if (activeEdge != 0) {
+                            activeEdge = 0;
+                            highSince = 0; lowSince = 0;
+                            self->_videoPlayer.dynamicMaxEdge = 0;
+                            NSString *rp = self->_videoPlayer.currentVideoPath;
+                            if (rp.length > 0) {
+                                LocalVideoPlayer *vp = self->_videoPlayer;
+                                dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+                                    [vp loadVideoAtPath:rp completion:nil];
+                                });
+                            }
+                            vcam_core_log(@"[vcam] adaptiveResolution OFF, decode restored to native (quality first)");
+                        }
+                    } else {
                     if (emaPct > 72.0) { if (highSince == 0) highSince = nowT; } else highSince = 0;
                     if (emaPct < 55.0) { if (lowSince == 0) lowSince = nowT; } else lowSince = 0;
                     // 降档: 高压持续 3s(降档越快越好, 红线保护优先)
@@ -590,6 +620,7 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                             });
                         }
                         vcam_core_log(@"[vcam] CPU low sustained, decode restored to native (quality)");
+                    }
                     }
                 }
                 if (lastCpuSec > 0 && nowT > lastCpuSample && delta >= 0) {
