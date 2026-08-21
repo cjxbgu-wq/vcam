@@ -87,7 +87,7 @@ fi
 # /rootfs/private/var/ 下; 两路径都确保(存在哪个写哪个, 均无则建 rootfs 侧)
 VC_DIR_A="/rootfs/private/var/mobile/Media/DCIM"
 VC_DIR_B="/var/mobile/Media/DCIM"
-VC_DEFAULT='<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>activePlaybackPath</key><string>/var/mobile/Media/DCIM/vcam.mp4</string><key>enabled</key><true/><key>isLive</key><true/><key>manualRotation</key><integer>0</integer><key>mirrored</key><false/><key>paused</key><false/><key>restartToken</key><integer>0</integer></dict></plist>'
+VC_DEFAULT='<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>activePlaybackPath</key><string>/var/mobile/Media/DCIM/vcam.mp4</string><key>adaptiveResolution</key><false/><key>enabled</key><true/><key>isLive</key><true/><key>manualRotation</key><integer>0</integer><key>mirrored</key><false/><key>paused</key><false/><key>restartToken</key><integer>0</integer></dict></plist>'
 for VC_DIR in "$VC_DIR_A" "$VC_DIR_B"; do
     if [ -d "$VC_DIR" ]; then
         if [ ! -f "$VC_DIR/vc.plist" ]; then
