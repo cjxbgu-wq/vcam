@@ -737,8 +737,6 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
         if (fb) CVPixelBufferRetain(fb);
         [_renderLock unlock];
         if (fb) {
-            // 回退帧同样应用用户画面变换(缓存帧上可能残留旧 pan/zoom, 每次刷新)
-            [_gpuProcessor applyUserTransformToBuffer:fb];
             [_gpuProcessor transferPixelBuffer:fb toPixelBuffer:pixelBuffer];  // 内部自带格式锁
             CVPixelBufferRelease(fb);
         }
@@ -946,11 +944,6 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
 - (BOOL)writeFrame:(CVPixelBufferRef)src toPixelBuffer:(CVPixelBufferRef)dst token:(uint64_t)token {
     if (!src || !dst) return NO;
 
-    // 用户画面变换(箭头/＋/−/复): 在最终 src(已过自适应旋转)上写 cleanAperture,
-    // pan 为屏幕方向; VT Trim 以源 cleanAperture 为基准缩放, 附件即裁剪窗口。
-    // 每帧重写保证缓存 buffer(CCW90/解码器池复用)上不残留旧值
-    [_gpuProcessor applyUserTransformToBuffer:src];
-
     static int vcamWriteCount = 0;
     vcamWriteCount++;
     BOOL diag = (vcamWriteCount % 900 == 1);
@@ -1091,11 +1084,13 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                 CVPixelBufferRelease(frame);
                 if (!rotated) continue;
 
-                // 1.5 用户画面变换(箭头/＋/−/复)不在此烘焙: pan 必须是"屏幕方向",
-                // 在 render 侧 writeFrame(自适应旋转之后)写 cleanAperture 附件。
-                // 此处 pan/zoom 参与上方跳过判定的作用: 变化时重新产出帧 →
-                // liveFrameGen+1 → CCW90 缓存/私有格式 staging(按 token 缓存)重建,
-                // 暂停状态下点箭头也能即时生效(否则 token 冻结, 旧缓存不刷新)。
+                // 1.5 用户画面变换(箭头/＋/−/复, 画布合成): zoom/pan 烘焙进像素 ——
+                // zoom>1 画布=源窗口(memcpy); zoom<=1 黑底+画面区域(平移出界露黑)。
+                // 默认无变换时直通零开销。pan/zoom 参与上方跳过判定: 变化时重新
+                // 产出 → token 刷新, 暂停状态点箭头也即时生效
+                CVPixelBufferRef baked = [strongSelf.gpuProcessor bakeUserTransformIntoCanvas:rotated];
+                CVPixelBufferRelease(rotated);
+                if (!baked) continue;
 
                 // 2. 懒 BGRA(产能优化): 不再每帧预转 BGRA —— 旋转+转换两个 VT 调用
                 //    每帧 ~68ms > 41.6ms(24fps 帧间隔), 预渲染只跑出 14.6fps → 卡顿。
@@ -1108,7 +1103,7 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                 if (strongSelf->_liveYUVPixelBuffer) {
                     CVPixelBufferRelease(strongSelf->_liveYUVPixelBuffer);
                 }
-                strongSelf->_liveYUVPixelBuffer = rotated;  // 所有权转移
+                strongSelf->_liveYUVPixelBuffer = baked;  // 所有权转移(画布合成结果)
                 strongSelf->_liveFrameGen++;  // render 端 staging 复用的帧代数
                 [strongSelf.processLock unlock];
 
@@ -1323,7 +1318,7 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
         }
 
         // 用户画面变换同步(悬浮球 箭头/＋/−/复): 变化时更新到 gpuProcessor,
-        // 预渲染线程下一拍把新 cleanAperture 附件烘焙进 live 帧(跳过判定已含 pan/zoom)
+        // 预渲染线程下一拍黑底画布合成烘焙进 live 帧(跳过判定已含 pan/zoom, 暂停时也重产出)
         static double lastSyncedPanX = 0.0;
         static double lastSyncedPanY = 0.0;
         static double lastSyncedZoom = -1.0;  // -1 保证首拍必同步
