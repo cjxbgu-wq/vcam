@@ -415,6 +415,7 @@ static void vcam_ball_log(NSString *msg) {
         GridCellType type;
         NSString *repr;      // CellText=标题 / CellSymbol=SF Symbol 名
         UIImage *icon;       // CellIcon 图像
+        UIEdgeInsets insets; // CellIcon 内边距(控制图标大小)
         SEL action;
     };
     UIImage *iconPlay    = vcamDecodeBtnIcon(vcam_btn_play_enc, vcam_btn_play_len, kPlayKey);
@@ -431,23 +432,24 @@ static void vcam_ball_log(NSString *msg) {
     iconRotate  = [iconRotate  imageWithRenderingMode:UIImageRenderingModeAlwaysOriginal];
 
     // 1.3.26 修复: 播图标此前漏绑(icon=nil → 空白按钮), "左上角图标没显示"的根因
+    // 1.3.28 图标按需调大小: 播放大(insets 2), 复缩小(insets 8), 其余中等(insets 4)
     struct GridCell cells[4][4] = {
-        { {CellIcon, nil, iconPlay, @selector(restartVideoTapped)},
-          {CellSymbol, @"arrow.up", nil, @selector(placeholderTapped)},
-          {CellIcon, nil, iconRestore, @selector(placeholderTapped)},
-          {CellText, @"1", nil, @selector(placeholderTapped)} },
-        { {CellSymbol, @"arrow.left", nil, @selector(placeholderTapped)},
-          {CellSymbol, @"arrow.down", nil, @selector(placeholderTapped)},
-          {CellSymbol, @"arrow.right", nil, @selector(placeholderTapped)},
-          {CellText, @"2", nil, @selector(placeholderTapped)} },
-        { {CellSymbol, @"minus", nil, @selector(placeholderTapped)},
-          {CellSymbol, @"play.fill", nil, @selector(playPauseTapped)},
-          {CellSymbol, @"plus", nil, @selector(placeholderTapped)},
-          {CellText, @"3", nil, @selector(placeholderTapped)} },
-        { {CellIcon, nil, iconRotate, @selector(rotateRightTapped)},
-          {CellIcon, nil, iconMirror, @selector(mirrorTapped)},
-          {CellIcon, nil, iconReplace, @selector(toggleReplacementTapped)},
-          {CellText, @"4", nil, @selector(placeholderTapped)} },
+        { {CellIcon, nil, iconPlay, {2, 2, 2, 2}, @selector(restartVideoTapped)},
+          {CellSymbol, @"arrow.up", nil, {0, 0, 0, 0}, @selector(placeholderTapped)},
+          {CellIcon, nil, iconRestore, {8, 8, 8, 8}, @selector(placeholderTapped)},
+          {CellText, @"1", nil, {0, 0, 0, 0}, @selector(placeholderTapped)} },
+        { {CellSymbol, @"arrow.left", nil, {0, 0, 0, 0}, @selector(placeholderTapped)},
+          {CellSymbol, @"arrow.down", nil, {0, 0, 0, 0}, @selector(placeholderTapped)},
+          {CellSymbol, @"arrow.right", nil, {0, 0, 0, 0}, @selector(placeholderTapped)},
+          {CellText, @"2", nil, {0, 0, 0, 0}, @selector(placeholderTapped)} },
+        { {CellSymbol, @"minus", nil, {0, 0, 0, 0}, @selector(placeholderTapped)},
+          {CellSymbol, @"play.fill", nil, {0, 0, 0, 0}, @selector(playPauseTapped)},
+          {CellSymbol, @"plus", nil, {0, 0, 0, 0}, @selector(placeholderTapped)},
+          {CellText, @"3", nil, {0, 0, 0, 0}, @selector(placeholderTapped)} },
+        { {CellIcon, nil, iconRotate, {4, 4, 4, 4}, @selector(rotateRightTapped)},
+          {CellIcon, nil, iconMirror, {4, 4, 4, 4}, @selector(mirrorTapped)},
+          {CellIcon, nil, iconReplace, {4, 4, 4, 4}, @selector(toggleReplacementTapped)},
+          {CellText, @"4", nil, {0, 0, 0, 0}, @selector(placeholderTapped)} },
     };
     for (int r = 0; r < 4; r++) {
         for (int c = 0; c < 4; c++) {
@@ -456,11 +458,11 @@ static void vcam_ball_log(NSString *msg) {
             VCamPanelButton *btn;
             if (cell.type == CellIcon) {
                 // 自定义图标按钮: 灰白 PNG 居中(AlwaysOriginal 免 tint 染色)
-                // (1.3.27 边距 7→4, 复/播等图标放大)
+                // (1.3.28 内边距按图标单独配置: 播 2 大 / 复 8 小 / 其余 4 中)
                 btn = [self makeButton:@"" frame:f selector:cell.action];
                 [btn setImage:cell.icon forState:UIControlStateNormal];
                 btn.imageView.contentMode = UIViewContentModeScaleAspectFit;
-                btn.imageEdgeInsets = UIEdgeInsetsMake(4, 4, 4, 4);
+                btn.imageEdgeInsets = cell.insets;
             } else if (cell.type == CellSymbol) {
                 // SF Symbol 按钮: template 矢量图, tintColor 染白贴合灰色主题
                 // (1.3.27: 17pt Regular → 14pt Semibold, 箭头/加减缩小且加粗,
