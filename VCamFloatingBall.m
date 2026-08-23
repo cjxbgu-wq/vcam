@@ -142,6 +142,7 @@ static void vcam_ball_log(NSString *msg) {
 // 需要动态状态视觉的按钮(图标按钮, 用边框高亮表达开/关)
 @property (nonatomic, strong) VCamPanelButton *replaceBtn;    // 替(图标, 边框=替换开启)
 @property (nonatomic, strong) VCamPanelButton *mirrorBtn;     // 镜(图标, 边框=镜像开启)
+@property (nonatomic, strong) VCamPanelButton *frontFixBtn;   // 设置页: 前置方向修正开关
 @property (nonatomic, strong) VCamPanelButton *playPauseBtn;  // ▶ ↔ ⏸
 @property (nonatomic, assign) BOOL panelVisible;
 @property (nonatomic, assign) BOOL isFloating;
@@ -322,8 +323,8 @@ static void vcam_ball_log(NSString *msg) {
     CGFloat cellH = 44;
     CGFloat gridGap = 7;
     CGFloat controlH = cellH * 4 + gridGap * 3;          // 197
-    // 设置页内容高度: 选择视频 + 预设2 + 预设3 + 岐盛相机 4 整宽(38*4 + 8*3) + 10 + 水印(16)
-    CGFloat settingsH = rowH * 4 + gap * 3 + 10 + 16;    // 202
+    // 设置页内容高度: 选择视频 + 预设2 + 预设3 + 前置修正 + 岐盛相机 5 整宽(38*5 + 8*4) + 10 + 水印(16)
+    CGFloat settingsH = rowH * 5 + gap * 4 + 10 + 16;    // 248
     // 打光页内容高度: 占位(功能后续版本接入)
     CGFloat lightH = 60;
     CGFloat panelH = pageTop + MAX(controlH, MAX(settingsH, lightH)) + pad;
@@ -528,16 +529,26 @@ static void vcam_ball_log(NSString *msg) {
     preset3.titleLabel.font = [UIFont boldSystemFontOfSize:14];
     [_settingsPageView addSubview:preset3];
 
+    // 前置方向修正(2026-08-23): 前置摄像头流显示旋转与后置差 180°(箭头方向双反),
+    // mediaserverd 无法自动判别前后置 —— 手动开关: 用前置时开, 用后置时关。
+    // 开启时 pan 应用 X/Y 同时取反
+    _frontFixBtn = [self makeButton:@"前置方向修正: 关"
+                              frame:CGRectMake(pad, (rowH + gap) * 3, contentW, rowH)
+                            selector:@selector(frontPanFixTapped)];
+    _frontFixBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    [_settingsPageView addSubview:_frontFixBtn];
+    [self refreshFrontFixButton];
+
     // 岐盛相机: 隐藏频道链接按钮(跳转 Telegram)。
     // 2026-08-18: 品牌/签名/频道字符串混淆存储(VCamStr.h), 二进制无明文
     VCamPanelButton *channel = [self makeButton:VCS(qisheng)
-                                          frame:CGRectMake(pad, (rowH + gap) * 3, contentW, rowH)
+                                          frame:CGRectMake(pad, (rowH + gap) * 4, contentW, rowH)
                                         selector:@selector(channelLinkTapped)];
     channel.titleLabel.font = [UIFont boldSystemFontOfSize:14];
     [_settingsPageView addSubview:channel];
 
     // 水印
-    UILabel *mark = [[UILabel alloc] initWithFrame:CGRectMake(pad, (rowH + gap) * 3 + rowH + 10, contentW, 16)];
+    UILabel *mark = [[UILabel alloc] initWithFrame:CGRectMake(pad, (rowH + gap) * 4 + rowH + 10, contentW, 16)];
     mark.text = VCS(mark);
     mark.textColor = [UIColor colorWithRed:0.72 green:0.73 blue:0.75 alpha:1.0];
     mark.textAlignment = NSTextAlignmentCenter;
@@ -698,6 +709,24 @@ static void vcam_ball_log(NSString *msg) {
     self.mirrorBtn.layer.borderWidth = 2;
     self.mirrorBtn.layer.borderColor = mi ? [UIColor whiteColor].CGColor
                                           : [UIColor clearColor].CGColor;
+}
+
+// 前置方向修正开关视觉: 标题文案 + 白边高亮(开)
+- (void)refreshFrontFixButton {
+    BOOL on = [VCamNotify plistFrontPanFix];
+    [self.frontFixBtn setTitle:(on ? @"前置方向修正: 开" : @"前置方向修正: 关")
+                      forState:UIControlStateNormal];
+    self.frontFixBtn.layer.borderWidth = 2;
+    self.frontFixBtn.layer.borderColor = on ? [UIColor whiteColor].CGColor
+                                            : [UIColor clearColor].CGColor;
+}
+
+// 前置方向修正: 前置流 pan 双反 180°, 开启后 mediaserverd 应用 pan 时 X/Y 取反
+- (void)frontPanFixTapped {
+    BOOL nv = ![VCamNotify plistFrontPanFix];
+    [VCamNotify setPlistFrontPanFix:nv];
+    [self refreshFrontFixButton];
+    vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] front pan fix -> %d (synced)", nv]);
 }
 
 // 占位按钮(↑←↓→ − ＋ 复 1/2/3/4): 功能待后续版本定义, 仅记录点击
