@@ -185,6 +185,11 @@ static void vcam_core_log(NSString *msg) {
 @property (nonatomic, assign) uint64_t lastPrerenderSrcGen;
 @property (nonatomic, assign) int lastPrerenderRot;
 @property (nonatomic, assign) BOOL lastPrerenderMirror;
+// 用户画面变换(箭头/＋/−/复)也纳入跳过判定: 暂停/图片模式下 frameCount 不变,
+// 但悬浮球改了 pan/zoom 时必须重新产出(把新 cleanAperture 附件烘焙进 live 帧)
+@property (nonatomic, assign) double lastPrerenderPanX;
+@property (nonatomic, assign) double lastPrerenderPanY;
+@property (nonatomic, assign) double lastPrerenderZoom;
 
 // ===== 相机空闲门控(2026-08-16 发热优化) =====
 // 根因: 替换开启期间解码+预渲染按视频帧率 30fps 常转, 而相机流只在 App 打开相机时
@@ -1054,21 +1059,34 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                 strongSelf.gpuProcessor.sourceRotation = strongSelf.videoPlayer.preferredRotation;
                 int curRot = (strongSelf.gpuProcessor.sourceRotation + strongSelf.gpuProcessor.rotationAngle) % 360;
                 BOOL curMirror = strongSelf.gpuProcessor.mirrored;
+                double curPanX = strongSelf.gpuProcessor.userPanX;
+                double curPanY = strongSelf.gpuProcessor.userPanY;
+                double curZoom = strongSelf.gpuProcessor.userZoom;
                 uint64_t curCount = strongSelf.videoPlayer.frameCount;
                 if (curCount == strongSelf->_lastPrerenderSrcGen &&
                     curRot == strongSelf->_lastPrerenderRot &&
-                    curMirror == strongSelf->_lastPrerenderMirror) {
+                    curMirror == strongSelf->_lastPrerenderMirror &&
+                    curPanX == strongSelf->_lastPrerenderPanX &&
+                    curPanY == strongSelf->_lastPrerenderPanY &&
+                    curZoom == strongSelf->_lastPrerenderZoom) {
                     CVPixelBufferRelease(frame);
                     continue;
                 }
                 strongSelf->_lastPrerenderSrcGen = curCount;
                 strongSelf->_lastPrerenderRot = curRot;
                 strongSelf->_lastPrerenderMirror = curMirror;
+                strongSelf->_lastPrerenderPanX = curPanX;
+                strongSelf->_lastPrerenderPanY = curPanY;
+                strongSelf->_lastPrerenderZoom = curZoom;
 
                 // 1. 旋转/镜像（如需要, 视频原尺寸; 解码帧为 420f, 旋转保持 420f）
                 CVPixelBufferRef rotated = [strongSelf.gpuProcessor rotateAndMirrorIfNeeded:frame];
                 CVPixelBufferRelease(frame);
                 if (!rotated) continue;
+
+                // 1.5 用户画面变换(箭头/＋/−/复): 把 pan/zoom 写入 cleanAperture 附件,
+                // render 侧 VT transfer(Trim + 默认 CropSourceToCleanAperture)裁剪时生效
+                [strongSelf.gpuProcessor applyUserTransformToBuffer:rotated];
 
                 // 2. 懒 BGRA(产能优化): 不再每帧预转 BGRA —— 旋转+转换两个 VT 调用
                 //    每帧 ~68ms > 41.6ms(24fps 帧间隔), 预渲染只跑出 14.6fps → 卡顿。
@@ -1295,6 +1313,26 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
             vcam_core_log([NSString stringWithFormat:@"[vcam] mirror synced: %d", plistMirrored]);
         }
 
+        // 用户画面变换同步(悬浮球 箭头/＋/−/复): 变化时更新到 gpuProcessor,
+        // 预渲染线程下一拍把新 cleanAperture 附件烘焙进 live 帧(跳过判定已含 pan/zoom)
+        static double lastSyncedPanX = 0.0;
+        static double lastSyncedPanY = 0.0;
+        static double lastSyncedZoom = -1.0;  // -1 保证首拍必同步
+        double plistPanX = [pl[@"userPanX"] doubleValue];
+        double plistPanY = [pl[@"userPanY"] doubleValue];
+        double plistZoom = [pl[@"userZoom"] doubleValue];
+        if (plistZoom <= 0.0) plistZoom = 1.0;  // 缺失/非法回退原始
+        if (plistPanX != lastSyncedPanX || plistPanY != lastSyncedPanY || plistZoom != lastSyncedZoom) {
+            strongSelf.gpuProcessor.userPanX = plistPanX;
+            strongSelf.gpuProcessor.userPanY = plistPanY;
+            strongSelf.gpuProcessor.userZoom = plistZoom;
+            lastSyncedPanX = plistPanX;
+            lastSyncedPanY = plistPanY;
+            lastSyncedZoom = plistZoom;
+            vcam_core_log([NSString stringWithFormat:
+                @"[vcam] transform synced: pan(%.2f,%.2f) zoom=%.2f", plistPanX, plistPanY, plistZoom]);
+        }
+
         // 视频源切换(悬浮球 1/2/3 键): activePlaybackPath 变化 → 自动重载新视频
         // (无需 toggle enabled, 轮询 0.15s 内生效; 路径写入由悬浮球完成)
         static NSString *lastSyncedPath = nil;
@@ -1307,12 +1345,20 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                 // 切视频重置手动旋转/镜像: 残留的手动角度会与新视频自带的 preferredRotation
                 // 叠加, 产生意外的 180° 等翻转(换视频后画面倒立的根因)。
                 // 新视频按其自身元数据从干净起点显示
+                // 1.3.30: 画面变换(pan/zoom)一并重置, 新视频从原始全幅位置显示
                 strongSelf.gpuProcessor.rotationAngle = 0;
                 strongSelf.gpuProcessor.mirrored = NO;
+                strongSelf.gpuProcessor.userPanX = 0.0;
+                strongSelf.gpuProcessor.userPanY = 0.0;
+                strongSelf.gpuProcessor.userZoom = 1.0;
                 [VCamNotify setPlistRotation:0];
                 [VCamNotify setPlistMirrored:NO];
+                [VCamNotify resetPlistTransform];
                 lastSyncedRotation = 0;
                 lastSyncedMirrored = NO;
+                lastSyncedPanX = 0.0;
+                lastSyncedPanY = 0.0;
+                lastSyncedZoom = 1.0;
                 // 异步重载(同步加载阻塞轮询线程 → watchdog 崩溃)
                 __weak typeof(strongSelf) wSelf = strongSelf;
                 dispatch_async(strongSelf.processingQueue, ^{
