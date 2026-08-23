@@ -192,8 +192,10 @@ static void vcam_gpu_log(NSString *msg) {
 @property (nonatomic, assign) CVPixelBufferRef userCanvasPool1;
 @property (nonatomic, assign) CVPixelBufferRef userCanvasPool2;
 @property (nonatomic, assign) int userCanvasSlot;
-// zoom<1 缩小中转(VT 下采样目标, 预渲染线程同步用, 无跨帧持有)
+// 变换中间 piece(预渲染线程同步用, 无跨帧持有):
+// userShrinkBuffer = pieceA(源裁剪 1:1), userPieceBuffer = pieceB(VT 缩放后)
 @property (nonatomic, assign) CVPixelBufferRef userShrinkBuffer;
+@property (nonatomic, assign) CVPixelBufferRef userPieceBuffer;
 
 // CIContext（软件渲染，mediaserverd 没有 GPU 上下文）
 // 两个独立 CIContext: 预渲染线程用 preprocessContext, render 线程回退用 renderContext（CIContext 非线程安全）
@@ -518,6 +520,10 @@ static void vcamLaneMemoInvalidate(uint32_t fmt, BOOL off) {
     if (_userShrinkBuffer) {
         CVPixelBufferRelease(_userShrinkBuffer);
         _userShrinkBuffer = NULL;
+    }
+    if (_userPieceBuffer) {
+        CVPixelBufferRelease(_userPieceBuffer);
+        _userPieceBuffer = NULL;
     }
     // 释放所有缓冲池
     for (id key in _bgraBufferPoolMap) {
@@ -1150,6 +1156,19 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
     else _userCanvasPool2 = buf;
 }
 
+// 按需取/建中间 buffer(piece: 同步用 1 槽, 尺寸/格式不符时重建; 返回池持有的引用)
+- (CVPixelBufferRef)userPieceBuffer:(CVPixelBufferRef *)slot
+                              width:(size_t)w height:(size_t)h format:(OSType)fmt {
+    if (*slot && CVPixelBufferGetWidth(*slot) == w && CVPixelBufferGetHeight(*slot) == h &&
+        CVPixelBufferGetPixelFormatType(*slot) == fmt) {
+        return *slot;
+    }
+    if (*slot) CVPixelBufferRelease(*slot);
+    *slot = NULL;
+    CVPixelBufferCreate(kCFAllocatorDefault, w, h, fmt, NULL, slot);
+    return *slot;
+}
+
 // 双平面 YUV(420f/420v) 区域拷贝: 从 src 的 (srcX,srcY,w,h) 矩形拷到 dst 的
 // (dstX,dstY)。坐标/尺寸必须偶数对齐(UV 平面半分辨率)。调用方保证矩形在
 // 两个 buffer 边界内(相交裁剪由调用方完成)。
@@ -1191,24 +1210,29 @@ static void vcamClearBiPlanarBlack(CVPixelBufferRef buf, OSType fmt) {
     if (uvb) for (size_t y = 0; y < h / 2; y++) memset(uvb + y * uvbpr, 128, w);
 }
 
-// 用户画面变换烘焙(箭头/＋/−/复, 2026-08-23 v2 画布合成, 取代 cleanAperture 方案):
-// 把 zoom/pan 烘焙进像素 —— zoom>1 时画布=源窗口(纯 memcpy, 下游 Trim 放大);
-// zoom<=1 时画布=黑底+画面区域(平移自由, 出界部分露黑)。
-// 旧附件方案的三个致命缺陷(设备实证):
-//   1. 窗口出不了源帧边界 → zoom=1 无法平移(用户核心诉求)
-//   2. 附件经旋转 session/staging 传播后坐标系错乱 → 按钮方向错(→变上移)
-//   3. 偏移量语义依赖 VT 内部解释, 多流组合行为不可预测
-// 方向语义(直通映射, 实测校准点): panX 正=画面屏幕右移, panY 正=画面屏幕下移。
-// 若设备实测方向错(如 → 变 ↑), 只需翻转下方 offX/offY 计算的符号或交换。
-// 性能: zoom>1 ~1ms(区域 memcpy); zoom=1 ~2ms(清黑+拷贝); zoom<1 ~5ms(VT 缩小);
+// 用户画面变换烘焙(箭头/＋/−/复, 2026-08-23 v3 统一裁剪窗口模型, 对齐安卓 Vcam):
+// 模型(借鉴安卓 vc.c replace_yuv_buffer):
+//   窗口 = 视频尺寸/z(等比, z>1 缩小窗口=放大 / z<1 窗口大于视频=缩小黑边),
+//   窗口位置 = 居中基准 + pan×W(两轴统一用源宽做基数, 上下左右移动幅度一致);
+//   窗口可与视频出界相交 → 出界部分=黑(平移/缩小的黑边统一由此产生);
+//   画布(恒为 W×H 固定尺寸) = 窗口内容(含出界黑区)缩放到全幅。
+// 统一性: 缩放恒以画面正中心为锚(pan=0 时窗口正对中心, 向四周均匀变化);
+//         平移自由(z=1 也可移出画面, 露黑)。
+// 固定画布尺寸的意义: 不随 zoom 重建(无闪烁), 色彩附件稳定(见下)。
+// 色彩附件(变色 bug 修复): 新建 CVPixelBuffer 不带解码帧的 range/矩阵附件,
+//   下游 VT 用默认色彩空间 → 画面偏色/过曝。每帧复制 input 的
+//   ShouldPropagate 附件到画布, 保证 YUV→私有格式转换 range 正确。
+// 实现: 交集 srcRect(窗口∩视频) → memcpy 裁剪到 pieceA → VT 等比缩放到
+//   pieceB(srcRect×z, 与 srcRect 同宽高比 → Trim 完整缩放无裁剪) → 贴到画布
+//   对应位置(canvasRect = (srcRect−窗口原点)×z) + 清黑其余区域。
+// 性能: VT 一次 ~3ms + 区域 memcpy×2 ~2ms + 清黑 ~1ms(预渲染 41ms 预算内);
 //       默认(无变换)直通零开销。仅预渲染线程调用(池无锁)。
 - (CVPixelBufferRef)bakeUserTransformIntoCanvas:(CVPixelBufferRef)input CF_RETURNS_RETAINED {
     if (!input) return NULL;
     double z = _userZoom;
     if (z < 0.5) z = 0.5;
     if (z > 4.0) z = 4.0;
-    BOOL zoomOne = fabs(z - 1.0) < 0.001;
-    if (zoomOne && _userPanX == 0.0 && _userPanY == 0.0) {
+    if (fabs(z - 1.0) < 0.001 && _userPanX == 0.0 && _userPanY == 0.0) {
         return (CVPixelBufferRef)CVPixelBufferRetain(input);  // 默认直通零开销
     }
 
@@ -1224,102 +1248,96 @@ static void vcamClearBiPlanarBlack(CVPixelBufferRef buf, OSType fmt) {
         return (CVPixelBufferRef)CVPixelBufferRetain(input);
     }
 
-    // 画布尺寸: zoom>1 = 源窗口 W/z(下游 Trim 放大); zoom<=1 = 源原尺寸(黑底)
-    size_t cw, ch;
-    if (!zoomOne && z > 1.0) {
-        cw = ((size_t)lround((double)W / z)) & ~(size_t)1;
-        ch = ((size_t)lround((double)H / z)) & ~(size_t)1;
-        if (cw < 16) cw = 16;
-        if (ch < 16) ch = 16;
-    } else {
-        cw = W;
-        ch = H;
-    }
-
-    // 画布(3 槽轮转): 尺寸/格式变化时重建(缩放档位变化才发生, 罕见)
+    // 画布(3 槽轮转, 恒 W×H 固定尺寸): live/snapshot/render 持有期与写入错开
     int slot = _userCanvasSlot;
     _userCanvasSlot = (slot + 1) % 3;
     CVPixelBufferRef canvas = [self userCanvasAtSlot:slot];
-    if (!canvas || CVPixelBufferGetWidth(canvas) != cw || CVPixelBufferGetHeight(canvas) != ch ||
+    if (!canvas || CVPixelBufferGetWidth(canvas) != W || CVPixelBufferGetHeight(canvas) != H ||
         CVPixelBufferGetPixelFormatType(canvas) != fmt) {
         if (canvas) CVPixelBufferRelease(canvas);
         canvas = NULL;
-        if (CVPixelBufferCreate(kCFAllocatorDefault, cw, ch, fmt, NULL, &canvas) != noErr || !canvas) {
+        if (CVPixelBufferCreate(kCFAllocatorDefault, W, H, fmt, NULL, &canvas) != noErr || !canvas) {
             [self setUserCanvas:NULL atSlot:slot];
             return (CVPixelBufferRef)CVPixelBufferRetain(input);  // 建不出画布: 直通保底
         }
         [self setUserCanvas:canvas atSlot:slot];
     }
 
+    // 色彩附件复制(变色修复): range/矩阵等 ShouldPropagate 附件从解码帧带到画布,
+    // 下游 VT 转换色彩语义才正确(教训: BGRA 源缺 range 信息 → 照片过曝)
+    CFDictionaryRef colorAtts = CVBufferCopyAttachments(input, kCVAttachmentMode_ShouldPropagate);
+    if (colorAtts) {
+        CVBufferSetAttachments(canvas, colorAtts, kCVAttachmentMode_ShouldPropagate);
+        CFRelease(colorAtts);
+    }
+
+    // ===== 窗口(等比, 可出界; 对齐安卓: 两轴 pan 基数统一用源宽 W) =====
+    // 窗口与画面反向移动(画面右移 = 窗口向源左侧取, 显示源更左的内容):
+    // wx = 居中基准 − panX·W; 画布映射 canvasRect = (srcRect−wx)·z → 窗口恒映射满幅
+    double ww = (double)W / z;
+    double wh = (double)H / z;
+    double wx = ((double)W - ww) / 2.0 - _userPanX * (double)W;  // pan 正=画面右移
+    double wy = ((double)H - wh) / 2.0 - _userPanY * (double)W;  // pan 正=画面下移(基数同为 W)
+
+    // 交集 srcRect(窗口∩视频), 偶对齐
+    long sx0 = (long)MAX(wx, 0.0), sy0 = (long)MAX(wy, 0.0);
+    long sx1 = (long)MIN(wx + ww, (double)W), sy1 = (long)MIN(wy + wh, (double)H);
+    sx0 &= ~1L; sy0 &= ~1L;
+    sx1 &= ~1L; sy1 &= ~1L;
+
     CVPixelBufferLockBaseAddress(input, kCVPixelBufferLock_ReadOnly);
     CVPixelBufferLockBaseAddress(canvas, 0);
 
-    if (!zoomOne && z > 1.0) {
-        // ===== zoom>1: 源窗口拷进画布(画布=窗口, 全幅覆盖, 无黑边) =====
-        // 窗口位置 = 居中基准 (W-cw)/2 + pan 偏移(pan 正=画面右移=窗口向源左侧取):
-        // pan=0 时窗口正对源中心 → 缩放始终以画面正中心为锚(向四周均匀放大)
-        double mx = ((double)W - (double)cw) / 2.0;
-        double my = ((double)H - (double)ch) / 2.0;
-        long ox = lround(mx - _userPanX * mx) & ~1L;
-        long oy = lround(my - _userPanY * my) & ~1L;
-        if (ox < 0) ox = 0; else if (ox > (long)(W - cw)) ox = (long)(W - cw);
-        if (oy < 0) oy = 0; else if (oy > (long)(H - ch)) oy = (long)(H - ch);
-        vcamCopyRegionBiPlanar(canvas, input, 0, 0, (size_t)ox, (size_t)oy, cw, ch);
+    if (sx1 <= sx0 || sy1 <= sy0) {
+        vcamClearBiPlanarBlack(canvas, fmt);  // 窗口完全出界: 全黑
     } else {
-        // ===== zoom<=1: 黑底画布 + 画面区域 =====
-        vcamClearBiPlanarBlack(canvas, fmt);
+        size_t sw = (size_t)(sx1 - sx0), sh = (size_t)(sy1 - sy0);
 
-        if (zoomOne) {
-            // zoom=1: 整帧平移拷贝(自由平移, 出界裁剪, 露黑)
-            long ox = lround(_userPanX * ((double)W / 2.0)) & ~1L;   // pan 正=画面右移
-            long oy = lround(_userPanY * ((double)H / 2.0)) & ~1L;   // pan 正=画面下移
-            // 目标矩形 [ox, ox+W)×[oy, oy+H) 与画布相交 → 源/目标同步裁剪
-            long dx0 = (ox < 0) ? 0 : ox, dy0 = (oy < 0) ? 0 : oy;
-            long dx1 = (ox + (long)W > (long)cw) ? (long)cw : ox + (long)W;
-            long dy1 = (oy + (long)H > (long)ch) ? (long)ch : oy + (long)H;
-            if (dx1 > dx0 && dy1 > dy0) {
-                size_t w = (size_t)(dx1 - dx0), h = (size_t)(dy1 - dy0);
-                size_t sx0 = (size_t)(dx0 - ox), sy0 = (size_t)(dy0 - oy);
-                vcamCopyRegionBiPlanar(canvas, input, (size_t)dx0, (size_t)dy0, sx0, sy0, w, h);
-            }
-        } else {
-            // zoom<1: VT 缩小整帧 → 画布中央+pan 偏移位置(自由平移, 出界裁剪, 露黑)
-            size_t pw = ((size_t)lround((double)W * z)) & ~(size_t)1;
-            size_t ph = ((size_t)lround((double)H * z)) & ~(size_t)1;
-            if (pw < 16) pw = 16;
-            if (ph < 16) ph = 16;
-            if (!_userShrinkBuffer ||
-                CVPixelBufferGetWidth(_userShrinkBuffer) != pw ||
-                CVPixelBufferGetHeight(_userShrinkBuffer) != ph ||
-                CVPixelBufferGetPixelFormatType(_userShrinkBuffer) != fmt) {
-                if (_userShrinkBuffer) CVPixelBufferRelease(_userShrinkBuffer);
-                _userShrinkBuffer = NULL;
-                CVPixelBufferCreate(kCFAllocatorDefault, pw, ph, fmt, NULL, &_userShrinkBuffer);
-            }
-            if (_userShrinkBuffer) {
-                if (!_prerenderTransferSession) {
-                    [self setupPrerenderTransferSession];
-                }
-                // 画布锁定期间 VT 写 shrink buffer(不同 buffer, 无别名冲突)
-                if (_prerenderTransferSession &&
-                    VTPixelTransferSessionTransferImage(_prerenderTransferSession,
-                                                        input, _userShrinkBuffer) == noErr) {
-                    // 目标矩形(画布中央 + pan 偏移, 可出界)
-                    long ox = lround((double)((long)cw - (long)pw) / 2.0 + _userPanX * ((double)W / 2.0)) & ~1L;
-                    long oy = lround((double)((long)ch - (long)ph) / 2.0 + _userPanY * ((double)H / 2.0)) & ~1L;
-                    long dx0 = (ox < 0) ? 0 : ox, dy0 = (oy < 0) ? 0 : oy;
-                    long dx1 = (ox + (long)pw > (long)cw) ? (long)cw : ox + (long)pw;
-                    long dy1 = (oy + (long)ph > (long)ch) ? (long)ch : oy + (long)ph;
-                    if (dx1 > dx0 && dy1 > dy0) {
-                        size_t w = (size_t)(dx1 - dx0), h = (size_t)(dy1 - dy0);
-                        size_t sx0 = (size_t)(dx0 - ox), sy0 = (size_t)(dy0 - oy);
-                        CVPixelBufferLockBaseAddress(_userShrinkBuffer, kCVPixelBufferLock_ReadOnly);
-                        vcamCopyRegionBiPlanar(canvas, _userShrinkBuffer,
-                                               (size_t)dx0, (size_t)dy0, sx0, sy0, w, h);
-                        CVPixelBufferUnlockBaseAddress(_userShrinkBuffer, kCVPixelBufferLock_ReadOnly);
+        // canvasRect = (srcRect − 窗口原点) × z(等比, 同宽高比), 偶对齐 + clamp 画布内
+        double kx = (double)W / ww;   // = z
+        long dx0 = lround(((double)sx0 - wx) * kx) & ~1L;
+        long dy0 = lround(((double)sy0 - wy) * kx) & ~1L;
+        long dx1 = lround(((double)sx1 - wx) * kx) & ~1L;
+        long dy1 = lround(((double)sy1 - wy) * kx) & ~1L;
+        if (dx0 < 0) dx0 = 0; if (dy0 < 0) dy0 = 0;
+        if (dx1 > (long)W) dx1 = (long)W;
+        if (dy1 > (long)H) dy1 = (long)H;
+        if (dx1 > dx0 && dy1 > dy0) {
+            size_t dw = (size_t)(dx1 - dx0), dh = (size_t)(dy1 - dy0);
+
+            vcamClearBiPlanarBlack(canvas, fmt);  // 先清黑(其余区域=黑边)
+
+            if (fabs(kx - 1.0) < 0.001) {
+                // z=1(纯平移): 源区域直接贴到画布(零缩放开销)
+                vcamCopyRegionBiPlanar(canvas, input, (size_t)dx0, (size_t)dy0,
+                                       (size_t)sx0, (size_t)sy0, dw, dh);
+            } else {
+                // 通用: memcpy 裁剪 srcRect → pieceA, VT 等比缩放 pieceA → pieceB(×z)
+                CVPixelBufferRef pieceA = [self userPieceBuffer:&_userShrinkBuffer
+                                                          width:sw height:sh format:fmt];
+                if (pieceA) {
+                    CVPixelBufferLockBaseAddress(pieceA, 0);
+                    vcamCopyRegionBiPlanar(pieceA, input, 0, 0, (size_t)sx0, (size_t)sy0, sw, sh);
+                    CVPixelBufferUnlockBaseAddress(pieceA, 0);
+                    if (!_prerenderTransferSession) {
+                        [self setupPrerenderTransferSession];
+                    }
+                    if (_prerenderTransferSession) {
+                        CVPixelBufferRef pieceB = [self userPieceBuffer:&_userPieceBuffer
+                                                                  width:dw height:dh format:fmt];
+                        if (pieceB &&
+                            VTPixelTransferSessionTransferImage(_prerenderTransferSession,
+                                                                pieceA, pieceB) == noErr) {
+                            CVPixelBufferLockBaseAddress(pieceB, kCVPixelBufferLock_ReadOnly);
+                            vcamCopyRegionBiPlanar(canvas, pieceB, (size_t)dx0, (size_t)dy0,
+                                                   0, 0, dw, dh);
+                            CVPixelBufferUnlockBaseAddress(pieceB, kCVPixelBufferLock_ReadOnly);
+                        }
                     }
                 }
             }
+        } else {
+            vcamClearBiPlanarBlack(canvas, fmt);
         }
     }
 
@@ -2165,6 +2183,11 @@ static const NSUInteger kVcamMaxStreamKeys = 6;
         if (_userShrinkBuffer) {
             CVPixelBufferRelease(_userShrinkBuffer);
             _userShrinkBuffer = NULL;
+            released++;
+        }
+        if (_userPieceBuffer) {
+            CVPixelBufferRelease(_userPieceBuffer);
+            _userPieceBuffer = NULL;
             released++;
         }
         for (id key in _bgraBufferPoolMap) {
