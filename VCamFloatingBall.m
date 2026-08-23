@@ -147,6 +147,12 @@ static void vcam_ball_log(NSString *msg) {
 @property (nonatomic, assign) BOOL panelVisible;
 @property (nonatomic, assign) BOOL isFloating;
 @property (nonatomic, assign) BOOL isPaused;
+// 面板动态高度(2026-08-23): 高度跟随当前激活页签, 消除短页下方的空白
+@property (nonatomic, assign) CGFloat panelPageTop;    // 页签行下方内容起始 y
+@property (nonatomic, assign) CGFloat panelPad;        // 面板内边距
+@property (nonatomic, assign) CGFloat controlPageH;    // 控制页内容高度
+@property (nonatomic, assign) CGFloat settingsPageH;   // 设置页内容高度
+@property (nonatomic, assign) CGFloat lightPageH;      // 打光页内容高度
 @property (nonatomic, assign) NSInteger pickerSlot;      // 0=选择视频(vcam.mp4) 2/3=预设槽位
 @end
 
@@ -327,7 +333,14 @@ static void vcam_ball_log(NSString *msg) {
     CGFloat settingsH = rowH * 5 + gap * 4 + 10 + 16;    // 248
     // 打光页内容高度: 占位(功能后续版本接入)
     CGFloat lightH = 60;
-    CGFloat panelH = pageTop + MAX(controlH, MAX(settingsH, lightH)) + pad;
+    // 面板高度跟随激活页签(2026-08-23): 初始=控制页(默认页), 切页动态动画调整,
+    // 消除"设置页加高后控制页下方多出空白一行"
+    CGFloat panelH = pageTop + controlH + pad;
+    _panelPageTop = pageTop;
+    _panelPad = pad;
+    _controlPageH = controlH;
+    _settingsPageH = settingsH;
+    _lightPageH = lightH;
 
     _panelView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, panelW, panelH)];
     _panelView.backgroundColor = [self vcPanelBgColor];
@@ -579,12 +592,26 @@ static void vcam_ball_log(NSString *msg) {
 
 #pragma mark - 页签切换
 
+// 面板高度跟随激活页签(2026-08-23): 高度动画到 pageTop+内容高+pad,
+// 垂直位置随新高度重新以球为中心(updatePanelPosition 读新尺寸)
+- (void)applyPanelContentHeight:(CGFloat)contentH {
+    CGFloat targetH = _panelPageTop + contentH + _panelPad;
+    if (fabs(_panelView.frame.size.height - targetH) < 0.5) return;
+    [UIView animateWithDuration:0.18 animations:^{
+        CGRect f = self.panelView.frame;
+        f.size.height = targetH;
+        self.panelView.frame = f;
+        [self updatePanelPosition];
+    }];
+}
+
 - (void)controlTabTapped {
     vcam_ball_log(@"[vcam][tab] control");
     _controlPageView.hidden = NO;
     _lightPageView.hidden = YES;
     _settingsPageView.hidden = YES;
     [self refreshTabStyles];
+    [self applyPanelContentHeight:_controlPageH];
 }
 
 - (void)lightTabTapped {
@@ -593,6 +620,7 @@ static void vcam_ball_log(NSString *msg) {
     _lightPageView.hidden = NO;
     _settingsPageView.hidden = YES;
     [self refreshTabStyles];
+    [self applyPanelContentHeight:_lightPageH];
 }
 
 - (void)settingsTabTapped {
@@ -601,6 +629,7 @@ static void vcam_ball_log(NSString *msg) {
     _lightPageView.hidden = YES;
     _settingsPageView.hidden = NO;
     [self refreshTabStyles];
+    [self applyPanelContentHeight:_settingsPageH];
 }
 
 #pragma mark - 交互
@@ -783,12 +812,12 @@ static void vcam_ball_log(NSString *msg) {
 
 #pragma mark - 用户画面变换(箭头/＋/−/复, 1.3.30)
 // 语义: 箭头移动替换后的画面 —— 不需要先放大, 未放大也可自由移动,
-// 画面移出的区域显示黑色; ＋放大/−缩小(0.5..4.0, 步进 0.25, 缩小时四周露黑边);
+// 画面移出的区域显示黑色; ＋放大/−缩小(0.5..4.0, 每次固定 5%, 缩小时四周露黑边);
 // 复还原为未移动未缩放的原始画面。
 // 通道: vc.plist userPanX/userPanY/userZoom → mediaserverd 轮询同步到 GPU 管线
 // (预渲染黑底画布合成, 方向为屏幕语义: panX 正=画面右移, panY 正=画面下移)
 static const double kVcamPanStep  = 0.10;   // 每次点击移动 10% 半幅距离
-static const double kVcamZoomStep = 0.25;   // 每次点击缩放档位
+static const double kVcamZoomStep = 0.05;   // 每次点击固定缩放 5%(细腻步进)
 static const double kVcamZoomMin  = 0.5;    // 最小缩小到一半(四周黑边)
 static const double kVcamZoomMax  = 4.0;
 
