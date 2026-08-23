@@ -328,6 +328,19 @@ static void vcam_darwin_callback(CFNotificationCenterRef center, void *observer,
     [dict writeToFile:VCamPlistPath atomically:YES];
 }
 
+// 前置方向修正: 前置流显示旋转与后置差 180°, pan 应用时 X/Y 同时取反(设置页开关)
++ (BOOL)plistFrontPanFix {
+    NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath];
+    return [dict[@"frontPanFix"] boolValue];
+}
+
++ (void)setPlistFrontPanFix:(BOOL)fix {
+    NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithDictionary:
+        [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath] ?: @{}];
+    dict[@"frontPanFix"] = @(fix);
+    [dict writeToFile:VCamPlistPath atomically:YES];
+}
+
 #pragma mark - 播放控制（跨进程: 悬浮球写, mediaserverd 轮询应用）
 
 + (BOOL)plistPaused {
