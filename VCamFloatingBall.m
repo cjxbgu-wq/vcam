@@ -456,17 +456,19 @@ static void vcam_ball_log(NSString *msg) {
             VCamPanelButton *btn;
             if (cell.type == CellIcon) {
                 // 自定义图标按钮: 灰白 PNG 居中(AlwaysOriginal 免 tint 染色)
+                // (1.3.27 边距 7→4, 复/播等图标放大)
                 btn = [self makeButton:@"" frame:f selector:cell.action];
                 [btn setImage:cell.icon forState:UIControlStateNormal];
                 btn.imageView.contentMode = UIViewContentModeScaleAspectFit;
-                btn.imageEdgeInsets = UIEdgeInsetsMake(7, 7, 7, 7);
+                btn.imageEdgeInsets = UIEdgeInsetsMake(4, 4, 4, 4);
             } else if (cell.type == CellSymbol) {
                 // SF Symbol 按钮: template 矢量图, tintColor 染白贴合灰色主题
-                // (1.3.26 字号还原: 20pt 偏大, 与文字按钮 16pt 视觉平衡)
+                // (1.3.27: 17pt Regular → 14pt Semibold, 箭头/加减缩小且加粗,
+                // 与放大的自定义图标形成主次层级)
                 btn = [self makeButton:@"" frame:f selector:cell.action];
                 UIImageSymbolConfiguration *cfg =
-                    [UIImageSymbolConfiguration configurationWithPointSize:17
-                                                                   weight:UIImageSymbolWeightRegular];
+                    [UIImageSymbolConfiguration configurationWithPointSize:14
+                                                                   weight:UIImageSymbolWeightSemibold];
                 UIImage *sym = [UIImage systemImageNamed:cell.repr withConfiguration:cfg];
                 if (sym) {
                     [btn setImage:sym forState:UIControlStateNormal];
@@ -662,8 +664,8 @@ static void vcam_ball_log(NSString *msg) {
     _isPaused = !_isPaused;
     [VCamNotify setPlistPaused:_isPaused];
     UIImageSymbolConfiguration *cfg =
-        [UIImageSymbolConfiguration configurationWithPointSize:17
-                                                       weight:UIImageSymbolWeightRegular];
+        [UIImageSymbolConfiguration configurationWithPointSize:14
+                                                       weight:UIImageSymbolWeightSemibold];
     UIImage *sym = [UIImage systemImageNamed:(_isPaused ? @"pause.fill" : @"play.fill")
                             withConfiguration:cfg];
     [self.playPauseBtn setImage:sym forState:UIControlStateNormal];
