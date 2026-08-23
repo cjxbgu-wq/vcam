@@ -196,6 +196,13 @@ static void vcam_gpu_log(NSString *msg) {
 // userShrinkBuffer = pieceA(源裁剪 1:1), userPieceBuffer = pieceB(VT 缩放后)
 @property (nonatomic, assign) CVPixelBufferRef userShrinkBuffer;
 @property (nonatomic, assign) CVPixelBufferRef userPieceBuffer;
+// bake 专用 VT session(2026-08-24 视频模式黑屏根治): 绝不能复用
+// _prerenderTransferSession —— render 线程的懒 BGRA 回退(convertFormat:)与
+// 预渲染线程 bake 并发调用同一 session(VT session 非线程安全) → IOFence
+// 死锁 → backboardd GPU 崩溃(实测 "blocked by IOFence" ×4) → mediaserverd
+// 挂死 → 相机全黑。视频模式(encoder 私有格式流)必触发懒回退, 照片模式不触发,
+// 与"仅视频模式黑屏"现象完全吻合
+@property (nonatomic, assign) VTPixelTransferSessionRef userTransferSession;
 
 // CIContext（软件渲染，mediaserverd 没有 GPU 上下文）
 // 两个独立 CIContext: 预渲染线程用 preprocessContext, render 线程回退用 renderContext（CIContext 非线程安全）
@@ -428,6 +435,10 @@ static void vcamLaneMemoInvalidate(uint32_t fmt, BOOL off) {
     if (_prerenderTransferSession) {
         InvalidateFunc invalidate = (InvalidateFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionInvalidate");
         if (invalidate) invalidate(_prerenderTransferSession);
+    }
+    if (_userTransferSession) {
+        InvalidateFunc invalidate = (InvalidateFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionInvalidate");
+        if (invalidate) invalidate(_userTransferSession);
     }
     if (_privateTransferSession) {
         InvalidateFunc invalidate = (InvalidateFunc)dlsym(RTLD_DEFAULT, "VTPixelTransferSessionInvalidate");
@@ -1319,20 +1330,34 @@ static void vcamClearBiPlanarBlack(CVPixelBufferRef buf, OSType fmt) {
                     CVPixelBufferLockBaseAddress(pieceA, 0);
                     vcamCopyRegionBiPlanar(pieceA, input, 0, 0, (size_t)sx0, (size_t)sy0, sw, sh);
                     CVPixelBufferUnlockBaseAddress(pieceA, 0);
-                    if (!_prerenderTransferSession) {
-                        [self setupPrerenderTransferSession];
+                    // bake 专用 session(线程冲突修复, 见属性注释): 懒建一次
+                    if (!_userTransferSession) {
+                        if (VTPixelTransferSessionCreate(kCFAllocatorDefault, &_userTransferSession) == noErr) {
+                            VTSessionSetProperty(_userTransferSession, CFSTR("ScalingMode"), CFSTR("Trim"));
+                            VTSessionSetProperty(_userTransferSession, CFSTR("RealTime"), kCFBooleanTrue);
+                            vcam_gpu_log(@"[vcam] user-transform VT session created (Trim)");
+                        }
                     }
-                    if (_prerenderTransferSession) {
+                    if (_userTransferSession) {
                         CVPixelBufferRef pieceB = [self userPieceBuffer:&_userPieceBuffer
                                                                   width:dw height:dh format:fmt];
-                        if (pieceB &&
-                            VTPixelTransferSessionTransferImage(_prerenderTransferSession,
-                                                                pieceA, pieceB) == noErr) {
-                            CVPixelBufferLockBaseAddress(pieceB, kCVPixelBufferLock_ReadOnly);
-                            vcamCopyRegionBiPlanar(canvas, pieceB, (size_t)dx0, (size_t)dy0,
-                                                   0, 0, dw, dh);
-                            CVPixelBufferUnlockBaseAddress(pieceB, kCVPixelBufferLock_ReadOnly);
+                        if (pieceB) {
+                            if (VTPixelTransferSessionTransferImage(_userTransferSession,
+                                                                    pieceA, pieceB) == noErr) {
+                                CVPixelBufferLockBaseAddress(pieceB, kCVPixelBufferLock_ReadOnly);
+                                vcamCopyRegionBiPlanar(canvas, pieceB, (size_t)dx0, (size_t)dy0,
+                                                       0, 0, dw, dh);
+                                CVPixelBufferUnlockBaseAddress(pieceB, kCVPixelBufferLock_ReadOnly);
+                            } else {
+                                // VT 失败(罕见): pieceA 1:1 贴画布左上角保底 —— 画面位置/
+                                // 缩放不对但绝不全黑, 下一帧重试
+                                vcamCopyRegionBiPlanar(canvas, pieceA, 0, 0, 0, 0,
+                                                       MIN(sw, W), MIN(sh, H));
+                            }
                         }
+                    } else {
+                        // session 建不出: 1:1 贴左上角保底
+                        vcamCopyRegionBiPlanar(canvas, pieceA, 0, 0, 0, 0, MIN(sw, W), MIN(sh, H));
                     }
                 }
             }
