@@ -31,7 +31,7 @@ M_FILES = ['Tweak.m', 'VCamCore.m', 'GPUImageProcessor.m', 'LocalVideoPlayer.m',
 H_FILES = ['VCamCore.h', 'GPUImageProcessor.h', 'LocalVideoPlayer.h',
            'NSQueue.h', 'VCamNotify.h', 'VCamFloatingBall.h']
 # 原样拷贝(已是密文数组/图标字节, 无字面量)
-COPY_FILES = ['VCamStr.h', 'ball_icon.h']
+COPY_FILES = ['VCamStr.h', 'ball_icon.h', 'btn_icons.h']
 
 # 运行时类名映射(class-dump 只能看到这些)
 CLASS_RUNTIME_NAMES = {
