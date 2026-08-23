@@ -34,6 +34,13 @@
 @property (nonatomic, assign) BOOL mirrored;
 @property (nonatomic, readonly) BOOL rotationApiAvailable;
 
+// 用户画面变换(悬浮球 箭头/＋/−/复, 2026-08-23): 经 vc.plist 跨进程同步,
+// 预渲染线程烘焙进 live buffer 的 cleanAperture 附件 —— VT 车道默认
+// CropSourceToCleanAperture, 预览/照片/录像/私有格式两步法统一生效
+@property (nonatomic, assign) double userPanX;  // -1..1 归一化水平平移(相对可移动余量; 正=画面左移)
+@property (nonatomic, assign) double userPanY;  // -1..1 归一化垂直平移(正=画面上移)
+@property (nonatomic, assign) double userZoom;  // >=1.0 放大系数(1=原始等比填充, 上限 4.0)
+
 // 当前源帧代数(VCamCore 每帧设置, 单调递增): 私有格式两步法的 staging BGRA
 // 按 (代数, 目标尺寸) 复用 —— 同一源帧被相机多条流重复渲染时缩放只做一次,
 // 第二条流起只做格式转换, render CPU 减半(管线饱和 → 卡顿/黑屏优化)
@@ -52,6 +59,10 @@
 
 // 预渲染用: 需要旋转/镜像时做变换(输出 BGRA), 否则原帧 retain 返回
 - (CVPixelBufferRef)rotateAndMirrorIfNeeded:(CVPixelBufferRef)input CF_RETURNS_RETAINED;
+
+// 预渲染用: 把 userPanX/userPanY/userZoom 烘焙为 buffer 的 cleanAperture 附件
+// (zoom=1 且 pan=0 时移除附件复位; render 侧 VT 车道裁剪时生效, 零渲染开销)
+- (void)applyUserTransformToBuffer:(CVPixelBufferRef)buf;
 
 // 预渲染用: 同尺寸格式转换(如 BGRA -> 420f), VT 主路径 + CoreImage 回退
 - (CVPixelBufferRef)convertFormat:(CVPixelBufferRef)input toFormat:(OSType)format CF_RETURNS_RETAINED;
