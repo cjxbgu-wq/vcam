@@ -55,8 +55,8 @@ typedef void(^VCamNotifyCallback)(NSString *name);
 + (BOOL)plistMirrored;
 + (void)setPlistMirrored:(BOOL)mirrored;
 
-// 用户画面变换(悬浮球 箭头/＋/−/复): pan 归一化 -1..1(相对可移动余量),
-// zoom >=1.0(1=原始等比填充); mediaserverd 轮询读 → cleanAperture 烘焙
+// 用户画面变换(悬浮球 箭头/＋/−/复): pan 归一化 -1..1(自由平移),
+// zoom 0.5..4.0(1=原始); mediaserverd 轮询读 → 黑底画布合成
 + (double)plistPanX;
 + (void)setPlistPanX:(double)panX;
 + (double)plistPanY;
@@ -64,6 +64,10 @@ typedef void(^VCamNotifyCallback)(NSString *name);
 + (double)plistZoom;
 + (void)setPlistZoom:(double)zoom;
 + (void)resetPlistTransform;
+// 前置方向修正(2026-08-23): 前置摄像头流的显示旋转与后置差 180°(实测 pan 双反),
+// mediaserverd 无法自动判别前后置 —— 设置页手动开关, 开启时 pan 应用时 X/Y 同时取反
++ (BOOL)plistFrontPanFix;
++ (void)setPlistFrontPanFix:(BOOL)fix;
 
 // 播放控制（跨进程: 悬浮球写, mediaserverd 轮询应用）
 // paused: 暂停/继续视频解码(暂停时预渲染冻结在最后一帧)
