@@ -1116,14 +1116,20 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
     return work;
 }
 
-// 用户画面变换烘焙(箭头/＋/−/复, 2026-08-23): 把 pan/zoom 写入 buffer 的
-// cleanAperture 附件。VT 车道(Trim + 默认 CropSourceToCleanAperture)会先裁剪到
-// cleanAperture 再等比填充目标 —— 预览/照片/录像/私有格式两步法全部统一生效,
-// 零额外转换开销(纯附件写入)。
+// 用户画面变换(render 时应用, 箭头/＋/−/复, 2026-08-23): 把 pan/zoom 写入
+// src buffer 的 cleanAperture 附件。VT 车道 ScalingMode=Trim 的语义是
+// "源 cleanAperture 等比填满目标", 附件写入即生效 —— 预览/照片/录像/私有格式
+// 两步法全部统一, 零渲染开销(纯附件写入, 无像素拷贝)。
+// 在 render 侧 writeFrame(自适应旋转之后)调用: pan 是"屏幕方向" —— 用户按 ←
+// 画面向左, 不受 90° 自适应旋转/手动旋转影响(在预渲染旋转前烘焙会导致
+// 横竖流方向错乱 + 旋转输出 buffer 丢附件)。
 //   zoom: 裁剪窗口 = buffer / zoom (zoom>=1, 放大画面)
 //   pan:  归一化 -1..1 映射到 ±(buffer-裁剪窗口)/2 可移动余量
 // 方向语义(CoreVideo): HorizontalOffset 正 = 窗口右移 = 画面内容左移;
 //                      VerticalOffset 正 = 窗口下移 = 画面内容上移。
+// 线程安全: 多条相机流并发 render 可能共享同一 src(CCW90 缓存/快照),
+// 附件变更用全局锁串行; 值变更只发生在用户点按钮(人频级), 与 VT transfer
+// 读取附件的微秒级窗口实际不相交。
 // (CI 回退路径不读 cleanAperture, pan/zoom 不生效 —— 罕见路径, 已接受)
 - (void)applyUserTransformToBuffer:(CVPixelBufferRef)buf {
     if (!buf) return;
@@ -1131,15 +1137,29 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
     if (zoom < 1.0) zoom = 1.0;
     if (zoom > 4.0) zoom = 4.0;
 
+    static NSLock *transformLock = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        transformLock = [[NSLock alloc] init];
+    });
+
+    [transformLock lock];
     if (zoom == 1.0 && _userPanX == 0.0 && _userPanY == 0.0) {
-        // 复位: 移除附件回到原始全幅行为(不动色彩等其他附件)
-        CVBufferRemoveAttachment(buf, kCVBufferCleanApertureKey);
+        // 复位: 移除附件回到原始全幅行为(不动色彩等其他附件)。
+        // 缓存 buffer(CCW90/回退帧)残留旧裁剪窗口时必须清除; 无附件时跳过免多余调用
+        if (CVBufferGetAttachment(buf, kCVImageBufferCleanApertureKey, NULL)) {
+            CVBufferRemoveAttachment(buf, kCVImageBufferCleanApertureKey);
+        }
+        [transformLock unlock];
         return;
     }
 
     size_t bufW = CVPixelBufferGetWidth(buf);
     size_t bufH = CVPixelBufferGetHeight(buf);
-    if (bufW == 0 || bufH == 0) return;
+    if (bufW == 0 || bufH == 0) {
+        [transformLock unlock];
+        return;
+    }
 
     double cropW = (double)bufW / zoom;
     double cropH = (double)bufH / zoom;
@@ -1152,13 +1172,14 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
     if (offY > maxOffY) offY = maxOffY; else if (offY < -maxOffY) offY = -maxOffY;
 
     NSDictionary *dict = @{
-        (id)kCVBufferCleanApertureWidthKey:            @(cropW),
-        (id)kCVBufferCleanApertureHeightKey:           @(cropH),
-        (id)kCVBufferCleanApertureHorizontalOffsetKey: @(offX),
-        (id)kCVBufferCleanApertureVerticalOffsetKey:   @(offY),
+        (id)kCVImageBufferCleanApertureWidthKey:            @(cropW),
+        (id)kCVImageBufferCleanApertureHeightKey:           @(cropH),
+        (id)kCVImageBufferCleanApertureHorizontalOffsetKey: @(offX),
+        (id)kCVImageBufferCleanApertureVerticalOffsetKey:   @(offY),
     };
-    CVBufferSetAttachment(buf, kCVBufferCleanApertureKey,
+    CVBufferSetAttachment(buf, kCVImageBufferCleanApertureKey,
                           (__bridge CFDictionaryRef)dict, kCVAttachmentMode_ShouldPropagate);
+    [transformLock unlock];
 }
 
 // 预渲染用: 同尺寸格式转换(如 BGRA -> 420f), VT 主路径 + CoreImage 回退
