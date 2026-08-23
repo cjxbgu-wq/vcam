@@ -816,9 +816,10 @@ static void vcam_ball_log(NSString *msg) {
 // 复还原为未移动未缩放的原始画面。
 // 通道: vc.plist userPanX/userPanY/userZoom → mediaserverd 轮询同步到 GPU 管线
 // (预渲染黑底画布合成, 方向为屏幕语义: panX 正=画面右移, panY 正=画面下移)
-static const double kVcamPanStep  = 0.05;   // 每次点击移动 5% 源宽(对齐安卓统一基数)
-static const double kVcamZoomStep = 0.05;   // 每次点击固定缩放 5%(细腻步进)
-static const double kVcamZoomMin  = 0.5;    // 最小缩小到一半(四周黑边)
+static const double kVcamPanStep   = 0.05;   // 每次点击移动 5% 源宽(对齐安卓统一基数)
+static const double kVcamZoomFactor = 1.05;  // 每次点击相对缩放 5%(乘法步进: 感知等幅,
+                                             // 加法步进在高倍率时相对变化衰减 → "越放大越少")
+static const double kVcamZoomMin  = 0.5;     // 最小缩小到一半(四周黑边)
 static const double kVcamZoomMax  = 4.0;
 
 static double vcamClamp(double v, double lo, double hi) {
@@ -842,13 +843,13 @@ static double vcamClamp(double v, double lo, double hi) {
 - (void)panDownTapped  { [self panByX:0 Y: kVcamPanStep]; }  // 画面下移
 
 - (void)zoomInTapped {
-    double nz = vcamClamp([VCamNotify plistZoom] + kVcamZoomStep, kVcamZoomMin, kVcamZoomMax);
+    double nz = vcamClamp([VCamNotify plistZoom] * kVcamZoomFactor, kVcamZoomMin, kVcamZoomMax);
     [VCamNotify setPlistZoom:nz];
     vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] zoom in -> %.2f (synced)", nz]);
 }
 
 - (void)zoomOutTapped {
-    double nz = vcamClamp([VCamNotify plistZoom] - kVcamZoomStep, kVcamZoomMin, kVcamZoomMax);
+    double nz = vcamClamp([VCamNotify plistZoom] / kVcamZoomFactor, kVcamZoomMin, kVcamZoomMax);
     [VCamNotify setPlistZoom:nz];
     vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] zoom out -> %.2f (synced)", nz]);
 }
