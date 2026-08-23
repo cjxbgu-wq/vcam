@@ -278,6 +278,56 @@ static void vcam_darwin_callback(CFNotificationCenterRef center, void *observer,
     [dict writeToFile:VCamPlistPath atomically:YES];
 }
 
+#pragma mark - 用户画面变换(箭头/＋/−/复)
+
++ (double)plistPanX {
+    NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath];
+    NSNumber *v = dict[@"userPanX"];
+    return v ? [v doubleValue] : 0.0;
+}
+
++ (void)setPlistPanX:(double)panX {
+    NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithDictionary:
+        [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath] ?: @{}];
+    dict[@"userPanX"] = @(panX);
+    [dict writeToFile:VCamPlistPath atomically:YES];
+}
+
++ (double)plistPanY {
+    NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath];
+    NSNumber *v = dict[@"userPanY"];
+    return v ? [v doubleValue] : 0.0;
+}
+
++ (void)setPlistPanY:(double)panY {
+    NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithDictionary:
+        [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath] ?: @{}];
+    dict[@"userPanY"] = @(panY);
+    [dict writeToFile:VCamPlistPath atomically:YES];
+}
+
++ (double)plistZoom {
+    NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath];
+    NSNumber *v = dict[@"userZoom"];
+    return v ? [v doubleValue] : 1.0;  // 缺失时 1.0(原始等比填充)
+}
+
++ (void)setPlistZoom:(double)zoom {
+    NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithDictionary:
+        [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath] ?: @{}];
+    dict[@"userZoom"] = @(zoom);
+    [dict writeToFile:VCamPlistPath atomically:YES];
+}
+
++ (void)resetPlistTransform {
+    NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithDictionary:
+        [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath] ?: @{}];
+    dict[@"userPanX"] = @0.0;
+    dict[@"userPanY"] = @0.0;
+    dict[@"userZoom"] = @1.0;
+    [dict writeToFile:VCamPlistPath atomically:YES];
+}
+
 #pragma mark - 播放控制（跨进程: 悬浮球写, mediaserverd 轮询应用）
 
 + (BOOL)plistPaused {
