@@ -314,6 +314,9 @@ static void vcamLaneMemoInvalidate(uint32_t fmt, BOOL off) {
     if (self) {
         _rotationAngle = 0;
         _mirrored = NO;
+        _userPanX = 0.0;
+        _userPanY = 0.0;
+        _userZoom = 1.0;
         _rotationApiAvailable = NO;
         _bgraTransferSession = NULL;
         _yuvTransferSession = NULL;
@@ -1111,6 +1114,51 @@ static BOOL vcamCopyPlanes(CVPixelBufferRef src, CVPixelBufferRef dst) {
     }
     // 复制失败(罕见): 返回未镜像帧, 不崩溃
     return work;
+}
+
+// 用户画面变换烘焙(箭头/＋/−/复, 2026-08-23): 把 pan/zoom 写入 buffer 的
+// cleanAperture 附件。VT 车道(Trim + 默认 CropSourceToCleanAperture)会先裁剪到
+// cleanAperture 再等比填充目标 —— 预览/照片/录像/私有格式两步法全部统一生效,
+// 零额外转换开销(纯附件写入)。
+//   zoom: 裁剪窗口 = buffer / zoom (zoom>=1, 放大画面)
+//   pan:  归一化 -1..1 映射到 ±(buffer-裁剪窗口)/2 可移动余量
+// 方向语义(CoreVideo): HorizontalOffset 正 = 窗口右移 = 画面内容左移;
+//                      VerticalOffset 正 = 窗口下移 = 画面内容上移。
+// (CI 回退路径不读 cleanAperture, pan/zoom 不生效 —— 罕见路径, 已接受)
+- (void)applyUserTransformToBuffer:(CVPixelBufferRef)buf {
+    if (!buf) return;
+    double zoom = _userZoom;
+    if (zoom < 1.0) zoom = 1.0;
+    if (zoom > 4.0) zoom = 4.0;
+
+    if (zoom == 1.0 && _userPanX == 0.0 && _userPanY == 0.0) {
+        // 复位: 移除附件回到原始全幅行为(不动色彩等其他附件)
+        CVBufferRemoveAttachment(buf, kCVBufferCleanApertureKey);
+        return;
+    }
+
+    size_t bufW = CVPixelBufferGetWidth(buf);
+    size_t bufH = CVPixelBufferGetHeight(buf);
+    if (bufW == 0 || bufH == 0) return;
+
+    double cropW = (double)bufW / zoom;
+    double cropH = (double)bufH / zoom;
+    double maxOffX = ((double)bufW - cropW) / 2.0;   // 可移动余量(半宽)
+    double maxOffY = ((double)bufH - cropH) / 2.0;
+    double offX = _userPanX * maxOffX;   // pan 正 = 窗口右移 = 画面左移
+    double offY = _userPanY * maxOffY;   // pan 正 = 窗口下移 = 画面上移
+    // clamp(保险: plist 手改越界值时不露边)
+    if (offX > maxOffX) offX = maxOffX; else if (offX < -maxOffX) offX = -maxOffX;
+    if (offY > maxOffY) offY = maxOffY; else if (offY < -maxOffY) offY = -maxOffY;
+
+    NSDictionary *dict = @{
+        (id)kCVBufferCleanApertureWidthKey:            @(cropW),
+        (id)kCVBufferCleanApertureHeightKey:           @(cropH),
+        (id)kCVBufferCleanApertureHorizontalOffsetKey: @(offX),
+        (id)kCVBufferCleanApertureVerticalOffsetKey:   @(offY),
+    };
+    CVBufferSetAttachment(buf, kCVBufferCleanApertureKey,
+                          (__bridge CFDictionaryRef)dict, kCVAttachmentMode_ShouldPropagate);
 }
 
 // 预渲染用: 同尺寸格式转换(如 BGRA -> 420f), VT 主路径 + CoreImage 回退
