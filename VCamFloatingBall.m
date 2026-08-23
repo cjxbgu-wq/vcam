@@ -753,12 +753,14 @@ static void vcam_ball_log(NSString *msg) {
 }
 
 #pragma mark - 用户画面变换(箭头/＋/−/复, 1.3.30)
-// 语义: 箭头移动替换后的画面(先＋放大获得移动余量, zoom=1 时画面全幅无余量不动);
-// ＋放大/−缩小(1.0..4.0, 步进 0.25); 复还原为未移动未缩放的原始画面。
+// 语义: 箭头移动替换后的画面 —— 不需要先放大, 未放大也可自由移动,
+// 画面移出的区域显示黑色; ＋放大/−缩小(0.5..4.0, 步进 0.25, 缩小时四周露黑边);
+// 复还原为未移动未缩放的原始画面。
 // 通道: vc.plist userPanX/userPanY/userZoom → mediaserverd 轮询同步到 GPU 管线
-static const double kVcamPanStep  = 0.10;   // 每次点击移动 10% 可用余量
+// (预渲染黑底画布合成, 方向为屏幕语义: panX 正=画面右移, panY 正=画面下移)
+static const double kVcamPanStep  = 0.10;   // 每次点击移动 10% 半幅距离
 static const double kVcamZoomStep = 0.25;   // 每次点击缩放档位
-static const double kVcamZoomMin  = 1.0;
+static const double kVcamZoomMin  = 0.5;    // 最小缩小到一半(四周黑边)
 static const double kVcamZoomMax  = 4.0;
 
 static double vcamClamp(double v, double lo, double hi) {
@@ -767,8 +769,7 @@ static double vcamClamp(double v, double lo, double hi) {
     return v;
 }
 
-// dx/dy 归一化增量: CoreVideo 偏移语义下 pan 正=窗口右/下移=画面左/上移,
-// 用户语义"画面向左移" = panX 增; "画面向上移" = panY 增
+// dx/dy 归一化增量(屏幕语义): dx 正=画面右移, dy 正=画面下移
 - (void)panByX:(double)dx Y:(double)dy {
     double nx = vcamClamp([VCamNotify plistPanX] + dx, -1.0, 1.0);
     double ny = vcamClamp([VCamNotify plistPanY] + dy, -1.0, 1.0);
@@ -777,10 +778,10 @@ static double vcamClamp(double v, double lo, double hi) {
     vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] pan -> (%.2f, %.2f) (synced)", nx, ny]);
 }
 
-- (void)panLeftTapped  { [self panByX: kVcamPanStep Y:0]; }  // 画面左移
-- (void)panRightTapped { [self panByX:-kVcamPanStep Y:0]; }  // 画面右移
-- (void)panUpTapped    { [self panByX:0 Y: kVcamPanStep]; }  // 画面上移
-- (void)panDownTapped  { [self panByX:0 Y:-kVcamPanStep]; }  // 画面下移
+- (void)panLeftTapped  { [self panByX:-kVcamPanStep Y:0]; }  // 画面左移
+- (void)panRightTapped { [self panByX: kVcamPanStep Y:0]; }  // 画面右移
+- (void)panUpTapped    { [self panByX:0 Y:-kVcamPanStep]; }  // 画面上移
+- (void)panDownTapped  { [self panByX:0 Y: kVcamPanStep]; }  // 画面下移
 
 - (void)zoomInTapped {
     double nz = vcamClamp([VCamNotify plistZoom] + kVcamZoomStep, kVcamZoomMin, kVcamZoomMax);
@@ -790,12 +791,6 @@ static double vcamClamp(double v, double lo, double hi) {
 
 - (void)zoomOutTapped {
     double nz = vcamClamp([VCamNotify plistZoom] - kVcamZoomStep, kVcamZoomMin, kVcamZoomMax);
-    // 缩回 1.0 时同步清 pan: 全幅画面无移动余量, 残留 pan 会在再放大时突跳
-    if (nz <= kVcamZoomMin) {
-        [VCamNotify resetPlistTransform];
-        vcam_ball_log(@"[vcam][btn] zoom out -> 1.00, pan reset (synced)");
-        return;
-    }
     [VCamNotify setPlistZoom:nz];
     vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] zoom out -> %.2f (synced)", nz]);
 }
