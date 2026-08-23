@@ -816,7 +816,7 @@ static void vcam_ball_log(NSString *msg) {
 // 复还原为未移动未缩放的原始画面。
 // 通道: vc.plist userPanX/userPanY/userZoom → mediaserverd 轮询同步到 GPU 管线
 // (预渲染黑底画布合成, 方向为屏幕语义: panX 正=画面右移, panY 正=画面下移)
-static const double kVcamPanStep  = 0.10;   // 每次点击移动 10% 半幅距离
+static const double kVcamPanStep  = 0.05;   // 每次点击移动 5% 源宽(对齐安卓统一基数)
 static const double kVcamZoomStep = 0.05;   // 每次点击固定缩放 5%(细腻步进)
 static const double kVcamZoomMin  = 0.5;    // 最小缩小到一半(四周黑边)
 static const double kVcamZoomMax  = 4.0;
