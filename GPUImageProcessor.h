@@ -60,8 +60,10 @@
 // 预渲染用: 需要旋转/镜像时做变换(输出 BGRA), 否则原帧 retain 返回
 - (CVPixelBufferRef)rotateAndMirrorIfNeeded:(CVPixelBufferRef)input CF_RETURNS_RETAINED;
 
-// 预渲染用: 把 userPanX/userPanY/userZoom 烘焙为 buffer 的 cleanAperture 附件
-// (zoom=1 且 pan=0 时移除附件复位; render 侧 VT 车道裁剪时生效, 零渲染开销)
+// render 用(writeFrame/回退路径, 自适应旋转之后): 把 userPanX/userPanY/userZoom
+// 写为 src buffer 的 cleanAperture 附件 —— VT Trim 缩放以源 cleanAperture 为基准,
+// 附件即裁剪窗口; pan 为屏幕方向(旋转后应用)。多流并发调用内部已串行。
+// zoom=1 且 pan=0 时移除附件复位(缓存 buffer 残留旧窗口也一并清除)
 - (void)applyUserTransformToBuffer:(CVPixelBufferRef)buf;
 
 // 预渲染用: 同尺寸格式转换(如 BGRA -> 420f), VT 主路径 + CoreImage 回退
