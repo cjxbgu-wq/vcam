@@ -1256,11 +1256,12 @@ static void vcamClearBiPlanarBlack(CVPixelBufferRef buf, OSType fmt) {
 
     if (!zoomOne && z > 1.0) {
         // ===== zoom>1: 源窗口拷进画布(画布=窗口, 全幅覆盖, 无黑边) =====
-        // 窗口位置: pan 正=画面右移=窗口向源左侧取 → offX = -panX*(W-cw)/2, clamp 源内
+        // 窗口位置 = 居中基准 (W-cw)/2 + pan 偏移(pan 正=画面右移=窗口向源左侧取):
+        // pan=0 时窗口正对源中心 → 缩放始终以画面正中心为锚(向四周均匀放大)
         double mx = ((double)W - (double)cw) / 2.0;
         double my = ((double)H - (double)ch) / 2.0;
-        long ox = lround(-_userPanX * mx) & ~1L;
-        long oy = lround(-_userPanY * my) & ~1L;
+        long ox = lround(mx - _userPanX * mx) & ~1L;
+        long oy = lround(my - _userPanY * my) & ~1L;
         if (ox < 0) ox = 0; else if (ox > (long)(W - cw)) ox = (long)(W - cw);
         if (oy < 0) oy = 0; else if (oy > (long)(H - ch)) oy = (long)(H - ch);
         vcamCopyRegionBiPlanar(canvas, input, 0, 0, (size_t)ox, (size_t)oy, cw, ch);
