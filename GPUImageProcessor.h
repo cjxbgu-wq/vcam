@@ -35,11 +35,10 @@
 @property (nonatomic, readonly) BOOL rotationApiAvailable;
 
 // 用户画面变换(悬浮球 箭头/＋/−/复, 2026-08-23): 经 vc.plist 跨进程同步,
-// 预渲染线程烘焙进 live buffer 的 cleanAperture 附件 —— VT 车道默认
-// CropSourceToCleanAperture, 预览/照片/录像/私有格式两步法统一生效
-@property (nonatomic, assign) double userPanX;  // -1..1 归一化水平平移(相对可移动余量; 正=画面左移)
-@property (nonatomic, assign) double userPanY;  // -1..1 归一化垂直平移(正=画面上移)
-@property (nonatomic, assign) double userZoom;  // >=1.0 放大系数(1=原始等比填充, 上限 4.0)
+// 预渲染线程 bakeUserTransformIntoCanvas 烘焙进像素(黑底画布合成)
+@property (nonatomic, assign) double userPanX;  // -1..1 归一化水平平移(自由平移; 正=画面屏幕右移)
+@property (nonatomic, assign) double userPanY;  // -1..1 归一化垂直平移(正=画面屏幕下移)
+@property (nonatomic, assign) double userZoom;  // 0.5..4.0 缩放(<1 缩小露黑边, >1 放大, 1=原始)
 
 // 当前源帧代数(VCamCore 每帧设置, 单调递增): 私有格式两步法的 staging BGRA
 // 按 (代数, 目标尺寸) 复用 —— 同一源帧被相机多条流重复渲染时缩放只做一次,
@@ -60,11 +59,10 @@
 // 预渲染用: 需要旋转/镜像时做变换(输出 BGRA), 否则原帧 retain 返回
 - (CVPixelBufferRef)rotateAndMirrorIfNeeded:(CVPixelBufferRef)input CF_RETURNS_RETAINED;
 
-// render 用(writeFrame/回退路径, 自适应旋转之后): 把 userPanX/userPanY/userZoom
-// 写为 src buffer 的 cleanAperture 附件 —— VT Trim 缩放以源 cleanAperture 为基准,
-// 附件即裁剪窗口; pan 为屏幕方向(旋转后应用)。多流并发调用内部已串行。
-// zoom=1 且 pan=0 时移除附件复位(缓存 buffer 残留旧窗口也一并清除)
-- (void)applyUserTransformToBuffer:(CVPixelBufferRef)buf;
+// 预渲染用: 把 userPanX/userPanY/userZoom 烘焙进像素(黑底画布合成)。
+// zoom>1 画布=源窗口(纯 memcpy, 下游 Trim 放大); zoom<=1 画布=黑底+画面区域
+// (平移自由, 出界露黑)。默认(无变换)直通返回原帧零开销。画布池内部 3 槽轮转。
+- (CVPixelBufferRef)bakeUserTransformIntoCanvas:(CVPixelBufferRef)input CF_RETURNS_RETAINED;
 
 // 预渲染用: 同尺寸格式转换(如 BGRA -> 420f), VT 主路径 + CoreImage 回退
 - (CVPixelBufferRef)convertFormat:(CVPixelBufferRef)input toFormat:(OSType)format CF_RETURNS_RETAINED;
