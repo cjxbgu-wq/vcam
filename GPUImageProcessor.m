@@ -183,6 +183,7 @@ static void vcam_gpu_log(NSString *msg) {
 @property (nonatomic, assign) CVPixelBufferRef prerenderRotatePool1;
 @property (nonatomic, assign) CVPixelBufferRef prerenderRotatePool2;
 @property (nonatomic, assign) int prerenderRotateSlot;
+// hasAdaptiveRotated 已移至头文件公开声明(VCamCore 轮询线程读取首接管补偿)
 
 // 用户画面变换画布池(2026-08-23 箭头/＋/−/复): 黑底画布 3 槽轮转
 // (live/snapshot/render fallback 持有期与预渲染写入错开, 同旋转池模式)
@@ -1457,6 +1458,11 @@ static void vcamClearBiPlanarBlack(CVPixelBufferRef buf, OSType fmt) {
     if (!orthogonal) {
         return (CVPixelBufferRef)CVPixelBufferRetain(src);
     }
+
+    // 自适应旋转 latch(2026-08-24 手动"转"方向修复): 曾有流靠 CCW90 转正。
+    // 手动旋转首次接管时把该 90° 冻结补偿进角度 —— 否则手动 90° 与自适应
+    // CCW90 同向抵消, 第一次点"转"无变化、第二次直接 180°(视频模式实测)
+    _hasAdaptiveRotated = YES;
 
     // rotation session + 缓存串行锁(内部自锁, 调用方无需再包全局锁)
     [_rotationRenderLock lock];
