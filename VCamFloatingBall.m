@@ -396,45 +396,83 @@ static void vcam_ball_log(NSString *msg) {
         VCS_BTN_VCAM_BTN_RESTORE_KEY6, VCS_BTN_VCAM_BTN_RESTORE_KEY7,
     };
 
-    // 宫格布局: (标题 or 图标, selector, 图标或 nil)
+    // 宫格布局: 文字 / SF Symbol / 自定义图标 三类按钮
     // 播图标 → 从头重播; 复图标 → 占位; 镜图标 → 镜像; 替图标 → 替换开关
+    // 箭头/加减/播放暂停/旋转 = SF Symbol(系统矢量图标, 渲染正常无 Unicode 字形超界问题;
+    // 1.3.24 实测 ↷ 字形下缘超出按钮)。1/2/3/4 = 文字占位
+    typedef NS_ENUM(int, GridCellType) {
+        CellText,    // 文字按钮
+        CellIcon,    // 自定义加密 PNG 图标(btn_icons.h)
+        CellSymbol,  // SF Symbol 按钮
+    };
     struct GridCell {
-        NSString *title;       // 文字按钮标题(nil=图标按钮)
-        UIImage *icon;         // 图标按钮图像(nil=文字按钮)
-        SEL action;            // 事件(占位=placeholderTapped)
+        GridCellType type;
+        NSString *repr;      // CellText=标题 / CellSymbol=SF Symbol 名
+        UIImage *icon;       // CellIcon 图像
+        SEL action;
     };
     UIImage *iconPlay    = vcamDecodeBtnIcon(vcam_btn_play_enc, vcam_btn_play_len, kPlayKey);
     UIImage *iconMirror  = vcamDecodeBtnIcon(vcam_btn_mirror_enc, vcam_btn_mirror_len, kMirrorKey);
     UIImage *iconReplace = vcamDecodeBtnIcon(vcam_btn_replace_enc, vcam_btn_replace_len, kReplaceKey);
     UIImage *iconRestore = vcamDecodeBtnIcon(vcam_btn_restore_enc, vcam_btn_restore_len, kRestoreKey);
+    // AlwaysOriginal: UIButtonTypeSystem 会把 image tint 染成系统蓝
+    // (1.3.24 实测图标全蓝的根因), 固定原始灰白像素免染色
+    iconPlay    = [iconPlay    imageWithRenderingMode:UIImageRenderingModeAlwaysOriginal];
+    iconMirror  = [iconMirror  imageWithRenderingMode:UIImageRenderingModeAlwaysOriginal];
+    iconReplace = [iconReplace imageWithRenderingMode:UIImageRenderingModeAlwaysOriginal];
+    iconRestore = [iconRestore imageWithRenderingMode:UIImageRenderingModeAlwaysOriginal];
 
     struct GridCell cells[4][4] = {
-        { {@"", nil, @selector(restartVideoTapped)},      {@"↑", nil, @selector(placeholderTapped)},
-          {@"", iconRestore, @selector(placeholderTapped)}, {@"1", nil, @selector(placeholderTapped)} },
-        { {@"←", nil, @selector(placeholderTapped)},      {@"↓", nil, @selector(placeholderTapped)},
-          {@"→", nil, @selector(placeholderTapped)},      {@"2", nil, @selector(placeholderTapped)} },
-        { {@"−", nil, @selector(placeholderTapped)},      {@"▶", nil, @selector(playPauseTapped)},
-          {@"＋", nil, @selector(placeholderTapped)},     {@"3", nil, @selector(placeholderTapped)} },
-        { {@"↷", nil, @selector(rotateRightTapped)},      {@"", iconMirror, @selector(mirrorTapped)},
-          {@"", iconReplace, @selector(toggleReplacementTapped)}, {@"4", nil, @selector(placeholderTapped)} },
+        { {CellIcon, nil, nil, @selector(restartVideoTapped)},
+          {CellSymbol, @"arrow.up", nil, @selector(placeholderTapped)},
+          {CellIcon, nil, iconRestore, @selector(placeholderTapped)},
+          {CellText, @"1", nil, @selector(placeholderTapped)} },
+        { {CellSymbol, @"arrow.left", nil, @selector(placeholderTapped)},
+          {CellSymbol, @"arrow.down", nil, @selector(placeholderTapped)},
+          {CellSymbol, @"arrow.right", nil, @selector(placeholderTapped)},
+          {CellText, @"2", nil, @selector(placeholderTapped)} },
+        { {CellSymbol, @"minus", nil, @selector(placeholderTapped)},
+          {CellSymbol, @"play.fill", nil, @selector(playPauseTapped)},
+          {CellSymbol, @"plus", nil, @selector(placeholderTapped)},
+          {CellText, @"3", nil, @selector(placeholderTapped)} },
+        { {CellSymbol, @"arrow.clockwise", nil, @selector(rotateRightTapped)},
+          {CellIcon, nil, iconMirror, @selector(mirrorTapped)},
+          {CellIcon, nil, iconReplace, @selector(toggleReplacementTapped)},
+          {CellText, @"4", nil, @selector(placeholderTapped)} },
     };
     for (int r = 0; r < 4; r++) {
         for (int c = 0; c < 4; c++) {
             struct GridCell cell = cells[r][c];
             CGRect f = CGRectMake(pad + c * (cellW + gridGap), r * (cellH + gridGap), cellW, cellH);
             VCamPanelButton *btn;
-            if (cell.icon) {
-                // 图标按钮: 图标居中显示(无标题), 图标缩到 30pt 内边距
+            if (cell.type == CellIcon) {
+                // 自定义图标按钮: 灰白 PNG 居中(AlwaysOriginal 免 tint 染色)
                 btn = [self makeButton:@"" frame:f selector:cell.action];
                 [btn setImage:cell.icon forState:UIControlStateNormal];
                 btn.imageView.contentMode = UIViewContentModeScaleAspectFit;
                 btn.imageEdgeInsets = UIEdgeInsetsMake(7, 7, 7, 7);
+            } else if (cell.type == CellSymbol) {
+                // SF Symbol 按钮: template 矢量图, tintColor 染白贴合灰色主题
+                btn = [self makeButton:@"" frame:f selector:cell.action];
+                UIImageSymbolConfiguration *cfg =
+                    [UIImageSymbolConfiguration configurationWithPointSize:20
+                                                                   weight:UIImageSymbolWeightSemibold];
+                UIImage *sym = [UIImage systemImageNamed:cell.repr withConfiguration:cfg];
+                if (sym) {
+                    [btn setImage:sym forState:UIControlStateNormal];
+                    btn.tintColor = [UIColor whiteColor];
+                    btn.imageEdgeInsets = UIEdgeInsetsMake(9, 9, 9, 9);
+                } else {
+                    // 兜底: 极老系统无 SF Symbol 时显示文字
+                    btn = [self makeButton:@"·" frame:f selector:cell.action];
+                    btn.titleLabel.font = [UIFont boldSystemFontOfSize:17];
+                }
             } else {
-                btn = [self makeButton:cell.title frame:f selector:cell.action];
+                btn = [self makeButton:cell.repr frame:f selector:cell.action];
                 btn.titleLabel.font = [UIFont boldSystemFontOfSize:17];
             }
             [_controlPageView addSubview:btn];
-            if (r == 2 && c == 1) _playPauseBtn = btn;         // ▶ ↔ ⏸
+            if (r == 2 && c == 1) _playPauseBtn = btn;         // ▶ ↔ ⏸ (play.fill/pause.fill)
             if (r == 3 && c == 1) _mirrorBtn = btn;             // 镜(图标)
             if (r == 3 && c == 2) _replaceBtn = btn;            // 替(图标)
         }
@@ -609,11 +647,16 @@ static void vcam_ball_log(NSString *msg) {
     [VCamNotify bumpRestartToken];
 }
 
-// ▶/⏸: 暂停/继续
+// ▶/⏸: 暂停/继续(SF Symbol play.fill ↔ pause.fill)
 - (void)playPauseTapped {
     _isPaused = !_isPaused;
     [VCamNotify setPlistPaused:_isPaused];
-    [self.playPauseBtn setTitle:_isPaused ? @"⏸" : @"▶" forState:UIControlStateNormal];
+    UIImageSymbolConfiguration *cfg =
+        [UIImageSymbolConfiguration configurationWithPointSize:20
+                                                       weight:UIImageSymbolWeightSemibold];
+    UIImage *sym = [UIImage systemImageNamed:(_isPaused ? @"pause.fill" : @"play.fill")
+                            withConfiguration:cfg];
+    [self.playPauseBtn setImage:sym forState:UIControlStateNormal];
     vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] playPause -> %@", _isPaused ? @"paused" : @"playing"]);
 }
 
@@ -738,54 +781,121 @@ static void vcam_ball_log(NSString *msg) {
     });
 }
 
+// 宽视频类型判定(1.3.25 修复"picked item is not a video"误拒):
+// (1)public.movie / public.audiovisual-content(视频父类型) conforms 判定;
+// (2)registeredTypeIdentifiers 里含 movie/video/mpeg-4/quicktime 的容器类型。
+// PHPicker 的 itemProvider 拿到瞬间类型可能尚未异步注册完(hasItemConforming 返回 NO),
+// 配合 caller 的延迟重查兜底
+- (BOOL)providerLooksLikeVideo:(NSItemProvider *)provider {
+    if ([provider hasItemConformingToTypeIdentifier:@"public.movie"]) return YES;
+    if ([provider hasItemConformingToTypeIdentifier:@"public.audiovisual-content"]) return YES;
+    for (NSString *tid in provider.registeredTypeIdentifiers) {
+        if ([tid containsString:@"movie"] || [tid containsString:@"video"] ||
+            [tid containsString:@"mpeg-4"] || [tid containsString:@"quicktime"]) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+// 按候选类型顺序加载 provider 文件表示: 前一类型失败(返回 nil url)自动尝试下一个
+- (void)loadVideoFromProvider:(NSItemProvider *)provider candidates:(NSArray<NSString *> *)cands slot:(NSInteger)slot {
+    __weak typeof(self) weakSelf = self;
+    NSString *tid = cands.firstObject;
+    [provider loadFileRepresentationForTypeIdentifier:tid
+                                completionHandler:^(NSURL *url, NSError *error) {
+        VCamFloatingBall *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if (!url) {
+            vcam_ball_log([NSString stringWithFormat:@"[vcam] load type %@ failed: %@ (cands left %lu)",
+                           tid, error, (unsigned long)(cands.count - 1)]);
+            if (cands.count > 1) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [strongSelf loadVideoFromProvider:provider
+                                           candidates:[cands subarrayWithRange:NSMakeRange(1, cands.count - 1)]
+                                                   slot:slot];
+                });
+            }
+            return;
+        }
+        [strongSelf savePickedVideoAt:url toSlot:slot];
+    }];
+}
+
+// copy 选中视频到目标槽位 + 槽位 0 时切为当前源
+- (void)savePickedVideoAt:(NSURL *)srcUrl toSlot:(NSInteger)slot {
+    // 目标路径: 0=vcam.mp4(当前选择) 2/3=6/N.mp4(预设槽位)
+    // (SpringBoard 进程内写入, pathhook 重定向到 mediaserverd 实读的 /rootfs 路径)
+    NSString *dest = (slot == 0) ? @"/var/mobile/Media/DCIM/vcam.mp4"
+                   : [NSString stringWithFormat:@"/var/mobile/Media/DCIM/6/%ld.mp4", (long)slot];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    [fm createDirectoryAtPath:dest.stringByDeletingLastPathComponent
+   withIntermediateDirectories:YES attributes:nil error:nil];
+    [fm removeItemAtPath:dest error:nil];
+    NSError *copyErr = nil;
+    BOOL ok = [fm copyItemAtPath:srcUrl.path toPath:dest error:&copyErr];
+    vcam_ball_log([NSString stringWithFormat:@"[vcam] picker copy slot=%ld %@ -> %@ (%@)",
+                   (long)slot, srcUrl.path, dest, ok ? @"OK" : [copyErr localizedDescription]]);
+
+    // 选择视频(槽位 0): 切为当前源立即播放(路径变化由 mediaserverd 轮询检测重载)
+    if (ok && slot == 0) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [VCamNotify setActivePlaybackPath:dest];
+            [self resetOrientationState];  // 换源重置旋转/镜像(防残留角度叠加翻转)
+            if (![VCamNotify isPlistEnabled]) {
+                [VCamNotify setPlistEnabled:YES];
+                [[VCamCore sharedInstance] setEnabled:YES];
+                [self updateReplaceButtonVisual];
+            }
+            vcam_ball_log([NSString stringWithFormat:@"[vcam] active source switched: %@", dest]);
+        });
+    }
+    // 预设槽位(2/3): 只存储, 由设置页预设按钮/控制页槽位键播放
+}
+
 - (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
     [picker dismissViewControllerAnimated:YES completion:nil];
     if (results.count == 0) return;
 
     NSItemProvider *provider = results.firstObject.itemProvider;
-    if (![provider hasItemConformingToTypeIdentifier:@"public.movie"]) {
-        vcam_ball_log(@"[vcam] picked item is not a video");
+    NSInteger slot = _pickerSlot;
+
+    if (![self providerLooksLikeVideo:provider]) {
+        // 类型注册竞态兜底: provider 拿到瞬间类型标识可能未注册完,
+        // 0.6s 后重查一次(1.3.25 前直接拒绝导致选视频"没反应")
+        __weak typeof(self) weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            VCamFloatingBall *strongSelf = weakSelf;
+            if (!strongSelf) return;
+            if ([strongSelf providerLooksLikeVideo:provider]) {
+                vcam_ball_log(@"[vcam] video type appeared after retry (async registration race)");
+                [strongSelf startVideoLoadFromProvider:provider slot:slot];
+            } else {
+                vcam_ball_log([NSString stringWithFormat:@"[vcam] picked item is not a video (types: %@)",
+                               provider.registeredTypeIdentifiers]);
+            }
+        });
         return;
     }
+    [self startVideoLoadFromProvider:provider slot:slot];
+}
 
-    NSInteger slot = _pickerSlot;
-    __weak typeof(self) weakSelf = self;
-    [provider loadFileRepresentationForTypeIdentifier:@"public.movie"
-                                completionHandler:^(NSURL *url, NSError *error) {
-        VCamFloatingBall *strongSelf = weakSelf;
-        if (!strongSelf) return;
-        if (!url) {
-            vcam_ball_log([NSString stringWithFormat:@"[vcam] load video representation failed: %@", error]);
-            return;
+// 构造候选类型列表并开始加载(标准 movie 优先, 其余已注册 av 类型逐个兜底)
+- (void)startVideoLoadFromProvider:(NSItemProvider *)provider slot:(NSInteger)slot {
+    NSMutableArray<NSString *> *cands = [NSMutableArray array];
+    if ([provider hasItemConformingToTypeIdentifier:@"public.movie"]) {
+        [cands addObject:@"public.movie"];
+    }
+    for (NSString *tid in provider.registeredTypeIdentifiers) {
+        if ([cands containsObject:tid]) continue;
+        if ([tid containsString:@"movie"] || [tid containsString:@"video"] ||
+            [tid containsString:@"mpeg-4"] || [tid containsString:@"quicktime"]) {
+            [cands addObject:tid];
         }
-        // 目标路径: 0=vcam.mp4(当前选择) 2/3=6/N.mp4(预设槽位)
-        // (SpringBoard 进程内写入, pathhook 重定向到 mediaserverd 实读的 /rootfs 路径)
-        NSString *dest = (slot == 0) ? @"/var/mobile/Media/DCIM/vcam.mp4"
-                       : [NSString stringWithFormat:@"/var/mobile/Media/DCIM/6/%ld.mp4", (long)slot];
-        NSFileManager *fm = [NSFileManager defaultManager];
-        [fm createDirectoryAtPath:dest.stringByDeletingLastPathComponent
-       withIntermediateDirectories:YES attributes:nil error:nil];
-        [fm removeItemAtPath:dest error:nil];
-        NSError *copyErr = nil;
-        BOOL ok = [fm copyItemAtPath:url.path toPath:dest error:&copyErr];
-        vcam_ball_log([NSString stringWithFormat:@"[vcam] picker copy slot=%ld %@ -> %@ (%@)",
-                       (long)slot, url.path, dest, ok ? @"OK" : [copyErr localizedDescription]]);
-
-        // 选择视频(槽位 0): 切为当前源立即播放(路径变化由 mediaserverd 轮询检测重载)
-        if (ok && slot == 0) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [VCamNotify setActivePlaybackPath:dest];
-                [strongSelf resetOrientationState];  // 换源重置旋转/镜像(防残留角度叠加翻转)
-                if (![VCamNotify isPlistEnabled]) {
-                    [VCamNotify setPlistEnabled:YES];
-                    [[VCamCore sharedInstance] setEnabled:YES];
-                    [strongSelf updateReplaceButtonVisual];
-                }
-                vcam_ball_log([NSString stringWithFormat:@"[vcam] active source switched: %@", dest]);
-            });
-        }
-        // 预设槽位(2/3): 只存储, 由控制页 2/3 键播放
-    }];
+    }
+    if (cands.count == 0) [cands addObject:@"public.movie"];
+    [self loadVideoFromProvider:provider candidates:cands slot:slot];
 }
 
 #pragma mark - 频道链接
