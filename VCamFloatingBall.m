@@ -447,7 +447,7 @@ static void vcam_ball_log(NSString *msg) {
           {CellSymbol, @"plus", nil, {0, 0, 0, 0}, @selector(placeholderTapped)},
           {CellText, @"3", nil, {0, 0, 0, 0}, @selector(placeholderTapped)} },
         { {CellIcon, nil, iconRotate, {4, 4, 4, 4}, @selector(rotateRightTapped)},
-          {CellIcon, nil, iconMirror, {4, 4, 4, 4}, @selector(mirrorTapped)},
+          {CellIcon, nil, iconMirror, {7, 7, 7, 7}, @selector(mirrorTapped)},
           {CellIcon, nil, iconReplace, {4, 4, 4, 4}, @selector(toggleReplacementTapped)},
           {CellText, @"4", nil, {0, 0, 0, 0}, @selector(placeholderTapped)} },
     };
@@ -684,10 +684,12 @@ static void vcam_ball_log(NSString *msg) {
 }
 
 - (void)updateReplaceButtonVisual {
+    // 语义(1.3.29 用户要求反转): 默认(替换中)无边框 = 干净状态;
+    // 点击还原(未替换)显示白边 = 提醒当前是真实摄像头画面
     BOOL en = [VCamNotify isPlistEnabled];
     self.replaceBtn.layer.borderWidth = 2;
-    self.replaceBtn.layer.borderColor = en ? [UIColor whiteColor].CGColor
-                                           : [UIColor clearColor].CGColor;
+    self.replaceBtn.layer.borderColor = en ? [UIColor clearColor].CGColor
+                                           : [UIColor whiteColor].CGColor;
 }
 
 // 镜: 镜像翻转(图标按钮, 白色边框=镜像开启)
