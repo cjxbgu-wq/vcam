@@ -55,6 +55,16 @@ typedef void(^VCamNotifyCallback)(NSString *name);
 + (BOOL)plistMirrored;
 + (void)setPlistMirrored:(BOOL)mirrored;
 
+// 用户画面变换(悬浮球 箭头/＋/−/复): pan 归一化 -1..1(相对可移动余量),
+// zoom >=1.0(1=原始等比填充); mediaserverd 轮询读 → cleanAperture 烘焙
++ (double)plistPanX;
++ (void)setPlistPanX:(double)panX;
++ (double)plistPanY;
++ (void)setPlistPanY:(double)panY;
++ (double)plistZoom;
++ (void)setPlistZoom:(double)zoom;
++ (void)resetPlistTransform;
+
 // 播放控制（跨进程: 悬浮球写, mediaserverd 轮询应用）
 // paused: 暂停/继续视频解码(暂停时预渲染冻结在最后一帧)
 + (BOOL)plistPaused;
