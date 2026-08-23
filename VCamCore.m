@@ -1322,28 +1322,20 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
         NSDictionary *pl = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath] ?: @{};
         static NSInteger lastSyncedRotation = -1;
         static BOOL lastSyncedMirrored = NO;
-        // 手动"转"补偿(2026-08-24 首次点击无反应修复): 无手动时竖流靠自适应 CCW90
-        // 转正; 手动首次接管瞬间若自适应在生效, 把这 90° 冻结补偿进角度 ——
-        // 否则手动 90° 与自适应 CCW90 同向抵消(第一次点无变化, 第二次直接 180°)。
-        // 补偿在接管瞬间冻结, 之后每次 +90 显示恰好转 90°, m 循环回 0 时
-        // 显示 = source+90 与原始正常显示重合(循环闭合)。切视频/复时重置。
-        static BOOL manualTaken = NO;
-        static int manualComp = 0;
+        // 手动旋转直接透传(2026-08-24 回滚 manualComp 补偿): 曾以为自适应 CCW90 与
+        // 手动角度同向抵消而加 90° 冻结补偿 —— 实证错误: adaptiveRotateIfNeeded 在
+        // rotationAngle!=0 时本就直接跳过(无抵消发生), 且 hasAdaptiveRotated latch 是
+        // 被录制流(横目标)置位的, 用户看的预览流(竖目标)并未被自适应旋转 → 补偿被
+        // 错误叠加: 点一次"转"显示 90+90=180°(实测), m=270 时算出 0°、m 回 0 时算出
+        // 90°, 循环全乱。透传后: 每次点击角度恰好 +90, 自适应已被 guard 禁用,
+        // 显示 = 手动角度, 线性无跳变。
         NSInteger plistRotation = [pl[@"manualRotation"] integerValue];
         BOOL plistMirrored = [pl[@"mirrored"] boolValue];
         if (plistRotation != lastSyncedRotation) {
-            if (plistRotation != 0 && !manualTaken && lastSyncedRotation == 0) {
-                // 首次接管(manual 从 0 变非 0): 冻结当前自适应状态为补偿
-                manualComp = strongSelf.gpuProcessor.hasAdaptiveRotated ? 90 : 0;
-                manualTaken = YES;
-                vcam_core_log([NSString stringWithFormat:
-                    @"[vcam] manual rotation takes over, adaptive comp=%d", manualComp]);
-            }
-            strongSelf.gpuProcessor.rotationAngle = (int)((plistRotation + manualComp) % 360);
+            strongSelf.gpuProcessor.rotationAngle = (int)(plistRotation % 360);
             lastSyncedRotation = plistRotation;
             vcam_core_log([NSString stringWithFormat:
-                @"[vcam] rotation synced: plist=%ld applied=%ld", (long)plistRotation,
-                (long)((plistRotation + manualComp) % 360)]);
+                @"[vcam] rotation synced: plist=%ld", (long)plistRotation]);
         }
         if (plistMirrored != lastSyncedMirrored) {
             strongSelf.gpuProcessor.mirrored = plistMirrored;
@@ -1390,10 +1382,8 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                 // 叠加, 产生意外的 180° 等翻转(换视频后画面倒立的根因)。
                 // 新视频按其自身元数据从干净起点显示
                 // 1.3.30: 画面变换(pan/zoom)一并重置, 新视频从原始全幅位置显示
-                // 手动"转"补偿一并重置(新视频从自适应 CCW90 干净起点重新接管)
                 strongSelf.gpuProcessor.rotationAngle = 0;
                 strongSelf.gpuProcessor.mirrored = NO;
-                strongSelf.gpuProcessor.hasAdaptiveRotated = NO;
                 strongSelf.gpuProcessor.userPanX = 0.0;
                 strongSelf.gpuProcessor.userPanY = 0.0;
                 strongSelf.gpuProcessor.userZoom = 1.0;
@@ -1405,8 +1395,6 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                 lastSyncedPanX = 0.0;
                 lastSyncedPanY = 0.0;
                 lastSyncedZoom = 1.0;
-                manualTaken = NO;   // 手动"转"补偿随切视频重置
-                manualComp = 0;
                 // 异步重载(同步加载阻塞轮询线程 → watchdog 崩溃)
                 __weak typeof(strongSelf) wSelf = strongSelf;
                 dispatch_async(strongSelf.processingQueue, ^{
