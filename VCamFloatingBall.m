@@ -2,15 +2,20 @@
 //  VCamFloatingBall.m
 //  VCamPlus
 //
-//  悬浮球 + 双页签面板(控制/设置), 灰色主题
+//  悬浮球 + 三页签面板(控制/打光/设置), 灰色主题
 //  只在 SpringBoard 中使用（需要 UIKit）
 //
-//  控制页: 选择视频 | 3x3 宫格(播 替/原 1 / ▶ 关 2 / 转 镜 3)
-//  设置页: 预设视频2 / 预设视频3 / 岐盛相机(频道链接) / @QuGenttx 水印
+//  控制页 4x4 宫格:
+//   播(图标)  ↑(占位)  复(图标)  1(占位)
+//   ←(占位)   ↓(占位)  →(占位)   2(占位)
+//   −(占位)   ▶        ＋(占位)  3(占位)
+//   ↷(旋转)   镜(图标)  替(图标)  4(占位)
+//  打光页: 占位(功能后续版本接入)
+//  设置页: 选择视频 / 预设视频2 / 预设视频3 / 岐盛相机(频道链接) / @QuGenttx 水印
 //
 //  跨进程控制(球在 SpringBoard, 播放器在 mediaserverd): 全部经 vc.plist
 //    enabled(替/原) / activePlaybackPath(1/2/3) / paused(▶) /
-//    restartToken(播) / manualRotation(转) / mirrored(镜)
+//    restartToken(播) / manualRotation(↷) / mirrored(镜)
 //  mediaserverd 每秒轮询应用(VCamCore startStatePolling)
 //
 
@@ -18,9 +23,20 @@
 #import "VCamCore.h"
 #import "VCamNotify.h"
 #import "ball_icon.h"
+#import "btn_icons.h"
 #import "VCamStr.h"
 #import <UIKit/UIKit.h>
 #import <PhotosUI/PhotosUI.h>
+
+// 按钮图标解码(与悬浮球品牌图标同机制): btn_icons.h 内 XOR 8字节 rolling key
+// 加密 PNG 字节, 此处运行时解密后 imageWithData —— 二进制内无 PNG 魔数, 防提取
+static UIImage *vcamDecodeBtnIcon(const unsigned char *enc, NSUInteger len,
+                                  const unsigned char key[8]) {
+    NSMutableData *d = [NSMutableData dataWithLength:len];
+    unsigned char *dst = (unsigned char *)d.mutableBytes;
+    for (NSUInteger i = 0; i < len; i++) dst[i] = enc[i] ^ key[i & 7];
+    return [UIImage imageWithData:d];
+}
 
 static void vcam_ball_log(NSString *msg) {
     @try {
@@ -118,11 +134,14 @@ static void vcam_ball_log(NSString *msg) {
 @property (nonatomic, strong) UIView *panelView;
 // 页签
 @property (nonatomic, strong) UIButton *tabControlBtn;
+@property (nonatomic, strong) UIButton *tabLightBtn;
 @property (nonatomic, strong) UIButton *tabSettingsBtn;
 @property (nonatomic, strong) UIView *controlPageView;
+@property (nonatomic, strong) UIView *lightPageView;
 @property (nonatomic, strong) UIView *settingsPageView;
-// 需要动态改标题的按钮
-@property (nonatomic, strong) VCamPanelButton *replaceBtn;    // 替 ↔ 原
+// 需要动态状态视觉的按钮(图标按钮, 用边框高亮表达开/关)
+@property (nonatomic, strong) VCamPanelButton *replaceBtn;    // 替(图标, 边框=替换开启)
+@property (nonatomic, strong) VCamPanelButton *mirrorBtn;     // 镜(图标, 边框=镜像开启)
 @property (nonatomic, strong) VCamPanelButton *playPauseBtn;  // ▶ ↔ ⏸
 @property (nonatomic, assign) BOOL panelVisible;
 @property (nonatomic, assign) BOOL isFloating;
@@ -287,22 +306,27 @@ static void vcam_ball_log(NSString *msg) {
     }];
 }
 
-#pragma mark - 面板创建（双页签 + 灰色主题, 紧凑尺寸）
+#pragma mark - 面板创建（三页签 + 灰色主题, 4x4 宫格控制页）
 
 - (void)createPanel {
-    CGFloat panelW = 198;
+    CGFloat panelW = 241;
     CGFloat pad = 10;
-    CGFloat contentW = panelW - pad * 2;                 // 178
+    CGFloat contentW = panelW - pad * 2;                 // 221
     CGFloat tabH = 30;
     CGFloat pageTop = pad + tabH + 6;                    // 页面内容起始 y
     CGFloat rowH = 38;                                   // 整宽按钮高度
     CGFloat gap = 8;
 
-    // 控制页内容高度: 选择视频(38) + 8 + 3 行宫格(40*3 + 7*2)
-    CGFloat controlH = rowH + gap + 40 * 3 + 7 * 2;      // 174
-    // 设置页内容高度: 3 个整宽按钮(38*3 + 8*2) + 10 + 水印(16)
-    CGFloat settingsH = rowH * 3 + gap * 2 + 10 + 16;    // 154
-    CGFloat panelH = pageTop + MAX(controlH, settingsH) + pad;
+    // 控制页内容高度: 4x4 宫格(44*4 + 7*3)
+    CGFloat cellW = 50;
+    CGFloat cellH = 44;
+    CGFloat gridGap = 7;
+    CGFloat controlH = cellH * 4 + gridGap * 3;          // 197
+    // 设置页内容高度: 选择视频 + 预设2 + 预设3 + 岐盛相机 4 整宽(38*4 + 8*3) + 10 + 水印(16)
+    CGFloat settingsH = rowH * 4 + gap * 3 + 10 + 16;    // 202
+    // 打光页内容高度: 占位(功能后续版本接入)
+    CGFloat lightH = 60;
+    CGFloat panelH = pageTop + MAX(controlH, MAX(settingsH, lightH)) + pad;
 
     _panelView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, panelW, panelH)];
     _panelView.backgroundColor = [self vcPanelBgColor];
@@ -311,76 +335,143 @@ static void vcam_ball_log(NSString *msg) {
     _panelView.alpha = 0;
     _panelView.hidden = YES;
 
-    // ===== 页签行: 控制 | 设置 =====
-    CGFloat tabW = 76;
+    // ===== 页签行: 控制 | 打光 | 设置 =====
+    CGFloat tabW = 64;
     CGFloat tabGap = 8;
-    CGFloat tabX0 = (panelW - (tabW * 2 + tabGap)) / 2;
+    CGFloat tabX0 = (panelW - (tabW * 3 + tabGap * 2)) / 2;
     _tabControlBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     _tabControlBtn.frame = CGRectMake(tabX0, pad, tabW, tabH);
-    [_tabControlBtn setTitle:@"控制" forState:UIControlStateNormal];  // 之前漏 setTitle 导致文字不显示
+    [_tabControlBtn setTitle:@"控制" forState:UIControlStateNormal];
     _tabControlBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
     _tabControlBtn.layer.cornerRadius = 7;
     [_tabControlBtn addTarget:self action:@selector(controlTabTapped) forControlEvents:UIControlEventTouchUpInside];
     [_panelView addSubview:_tabControlBtn];
 
+    _tabLightBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    _tabLightBtn.frame = CGRectMake(tabX0 + tabW + tabGap, pad, tabW, tabH);
+    [_tabLightBtn setTitle:@"打光" forState:UIControlStateNormal];
+    _tabLightBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    _tabLightBtn.layer.cornerRadius = 7;
+    [_tabLightBtn addTarget:self action:@selector(lightTabTapped) forControlEvents:UIControlEventTouchUpInside];
+    [_panelView addSubview:_tabLightBtn];
+
     _tabSettingsBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    _tabSettingsBtn.frame = CGRectMake(tabX0 + tabW + tabGap, pad, tabW, tabH);
+    _tabSettingsBtn.frame = CGRectMake(tabX0 + (tabW + tabGap) * 2, pad, tabW, tabH);
     [_tabSettingsBtn setTitle:@"设置" forState:UIControlStateNormal];
     _tabSettingsBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
     _tabSettingsBtn.layer.cornerRadius = 7;
     [_tabSettingsBtn addTarget:self action:@selector(settingsTabTapped) forControlEvents:UIControlEventTouchUpInside];
     [_panelView addSubview:_tabSettingsBtn];
 
-    // ===== 控制页 =====
+    // ===== 控制页: 4x4 宫格 =====
+    // 图标按钮(播/复/镜/替) = btn_icons.h 加密 PNG;
+    // ↷=旋转(顺时针90°) ▶=播放/暂停;
+    // ↑←↓→ − ＋ 1/2/3/4 = 占位(功能后续版本定义)
     _controlPageView = [[UIView alloc] initWithFrame:CGRectMake(0, pageTop, panelW, controlH)];
     _controlPageView.backgroundColor = [UIColor clearColor];
     [_panelView addSubview:_controlPageView];
 
-    // 选择视频(整宽)
-    VCamPanelButton *selectBtn = [self makeButton:@"选择视频"
-                                            frame:CGRectMake(pad, 0, contentW, rowH)
-                                          selector:@selector(selectVideoTapped)];
-    selectBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
-    [_controlPageView addSubview:selectBtn];
+    static const unsigned char kPlayKey[8] = {
+        VCS_BTN_VCAM_BTN_PLAY_KEY0, VCS_BTN_VCAM_BTN_PLAY_KEY1,
+        VCS_BTN_VCAM_BTN_PLAY_KEY2, VCS_BTN_VCAM_BTN_PLAY_KEY3,
+        VCS_BTN_VCAM_BTN_PLAY_KEY4, VCS_BTN_VCAM_BTN_PLAY_KEY5,
+        VCS_BTN_VCAM_BTN_PLAY_KEY6, VCS_BTN_VCAM_BTN_PLAY_KEY7,
+    };
+    static const unsigned char kMirrorKey[8] = {
+        VCS_BTN_VCAM_BTN_MIRROR_KEY0, VCS_BTN_VCAM_BTN_MIRROR_KEY1,
+        VCS_BTN_VCAM_BTN_MIRROR_KEY2, VCS_BTN_VCAM_BTN_MIRROR_KEY3,
+        VCS_BTN_VCAM_BTN_MIRROR_KEY4, VCS_BTN_VCAM_BTN_MIRROR_KEY5,
+        VCS_BTN_VCAM_BTN_MIRROR_KEY6, VCS_BTN_VCAM_BTN_MIRROR_KEY7,
+    };
+    static const unsigned char kReplaceKey[8] = {
+        VCS_BTN_VCAM_BTN_REPLACE_KEY0, VCS_BTN_VCAM_BTN_REPLACE_KEY1,
+        VCS_BTN_VCAM_BTN_REPLACE_KEY2, VCS_BTN_VCAM_BTN_REPLACE_KEY3,
+        VCS_BTN_VCAM_BTN_REPLACE_KEY4, VCS_BTN_VCAM_BTN_REPLACE_KEY5,
+        VCS_BTN_VCAM_BTN_REPLACE_KEY6, VCS_BTN_VCAM_BTN_REPLACE_KEY7,
+    };
+    static const unsigned char kRestoreKey[8] = {
+        VCS_BTN_VCAM_BTN_RESTORE_KEY0, VCS_BTN_VCAM_BTN_RESTORE_KEY1,
+        VCS_BTN_VCAM_BTN_RESTORE_KEY2, VCS_BTN_VCAM_BTN_RESTORE_KEY3,
+        VCS_BTN_VCAM_BTN_RESTORE_KEY4, VCS_BTN_VCAM_BTN_RESTORE_KEY5,
+        VCS_BTN_VCAM_BTN_RESTORE_KEY6, VCS_BTN_VCAM_BTN_RESTORE_KEY7,
+    };
 
-    // 3x3 宫格
-    CGFloat cellW = (contentW - gap * 2) / 3;            // 54
-    CGFloat cellH = 40;
-    CGFloat gridY0 = rowH + gap;
-    NSString *gridTitles[3][3] = {
-        { @"播", @"替", @"1" },
-        { @"▶", @"关", @"2" },
-        { @"转", @"镜", @"3" },
+    // 宫格布局: (标题 or 图标, selector, 图标或 nil)
+    // 播图标 → 从头重播; 复图标 → 占位; 镜图标 → 镜像; 替图标 → 替换开关
+    struct GridCell {
+        NSString *title;       // 文字按钮标题(nil=图标按钮)
+        UIImage *icon;         // 图标按钮图像(nil=文字按钮)
+        SEL action;            // 事件(占位=placeholderTapped)
     };
-    SEL gridSels[3][3] = {
-        { @selector(restartVideoTapped), @selector(toggleReplacementTapped), @selector(slot1Tapped) },
-        { @selector(playPauseTapped),     @selector(closePanelTapped),       @selector(slot2Tapped) },
-        { @selector(rotateRightTapped),   @selector(mirrorTapped),           @selector(slot3Tapped) },
+    UIImage *iconPlay    = vcamDecodeBtnIcon(vcam_btn_play_enc, vcam_btn_play_len, kPlayKey);
+    UIImage *iconMirror  = vcamDecodeBtnIcon(vcam_btn_mirror_enc, vcam_btn_mirror_len, kMirrorKey);
+    UIImage *iconReplace = vcamDecodeBtnIcon(vcam_btn_replace_enc, vcam_btn_replace_len, kReplaceKey);
+    UIImage *iconRestore = vcamDecodeBtnIcon(vcam_btn_restore_enc, vcam_btn_restore_len, kRestoreKey);
+
+    struct GridCell cells[4][4] = {
+        { {@"", nil, @selector(restartVideoTapped)},      {@"↑", nil, @selector(placeholderTapped)},
+          {@"", iconRestore, @selector(placeholderTapped)}, {@"1", nil, @selector(placeholderTapped)} },
+        { {@"←", nil, @selector(placeholderTapped)},      {@"↓", nil, @selector(placeholderTapped)},
+          {@"→", nil, @selector(placeholderTapped)},      {@"2", nil, @selector(placeholderTapped)} },
+        { {@"−", nil, @selector(placeholderTapped)},      {@"▶", nil, @selector(playPauseTapped)},
+          {@"＋", nil, @selector(placeholderTapped)},     {@"3", nil, @selector(placeholderTapped)} },
+        { {@"↷", nil, @selector(rotateRightTapped)},      {@"", iconMirror, @selector(mirrorTapped)},
+          {@"", iconReplace, @selector(toggleReplacementTapped)}, {@"4", nil, @selector(placeholderTapped)} },
     };
-    for (int r = 0; r < 3; r++) {
-        for (int c = 0; c < 3; c++) {
-            CGRect f = CGRectMake(pad + c * (cellW + gap), gridY0 + r * (cellH + 7), cellW, cellH);
-            VCamPanelButton *btn = [self makeButton:gridTitles[r][c] frame:f selector:gridSels[r][c]];
-            btn.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+    for (int r = 0; r < 4; r++) {
+        for (int c = 0; c < 4; c++) {
+            struct GridCell cell = cells[r][c];
+            CGRect f = CGRectMake(pad + c * (cellW + gridGap), r * (cellH + gridGap), cellW, cellH);
+            VCamPanelButton *btn;
+            if (cell.icon) {
+                // 图标按钮: 图标居中显示(无标题), 图标缩到 30pt 内边距
+                btn = [self makeButton:@"" frame:f selector:cell.action];
+                [btn setImage:cell.icon forState:UIControlStateNormal];
+                btn.imageView.contentMode = UIViewContentModeScaleAspectFit;
+                btn.imageEdgeInsets = UIEdgeInsetsMake(7, 7, 7, 7);
+            } else {
+                btn = [self makeButton:cell.title frame:f selector:cell.action];
+                btn.titleLabel.font = [UIFont boldSystemFontOfSize:17];
+            }
             [_controlPageView addSubview:btn];
-            if (r == 0 && c == 1) _replaceBtn = btn;    // 替 ↔ 原
-            if (r == 1 && c == 0) _playPauseBtn = btn;  // ▶ ↔ ⏸
+            if (r == 2 && c == 1) _playPauseBtn = btn;         // ▶ ↔ ⏸
+            if (r == 3 && c == 1) _mirrorBtn = btn;             // 镜(图标)
+            if (r == 3 && c == 2) _replaceBtn = btn;            // 替(图标)
         }
     }
+
+    // ===== 打光页: 占位(功能后续版本接入) =====
+    _lightPageView = [[UIView alloc] initWithFrame:CGRectMake(0, pageTop, panelW, lightH)];
+    _lightPageView.backgroundColor = [UIColor clearColor];
+    [_panelView addSubview:_lightPageView];
+
+    UILabel *lightTip = [[UILabel alloc] initWithFrame:CGRectMake(pad, 18, contentW, 24)];
+    lightTip.text = @"打光功能待接入";
+    lightTip.textColor = [UIColor colorWithRed:0.62 green:0.63 blue:0.65 alpha:1.0];
+    lightTip.textAlignment = NSTextAlignmentCenter;
+    lightTip.font = [UIFont systemFontOfSize:13];
+    [_lightPageView addSubview:lightTip];
 
     // ===== 设置页 =====
     _settingsPageView = [[UIView alloc] initWithFrame:CGRectMake(0, pageTop, panelW, settingsH)];
     _settingsPageView.backgroundColor = [UIColor clearColor];
     [_panelView addSubview:_settingsPageView];
 
+    // 选择视频(整宽, 原 3x3 布局时期在控制页, 4x4 宫格化后移到设置页)
+    VCamPanelButton *selectBtn = [self makeButton:@"选择视频"
+                                            frame:CGRectMake(pad, 0, contentW, rowH)
+                                          selector:@selector(selectVideoTapped)];
+    selectBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    [_settingsPageView addSubview:selectBtn];
+
     VCamPanelButton *preset2 = [self makeButton:@"预设视频2"
-                                          frame:CGRectMake(pad, 0, contentW, rowH)
+                                          frame:CGRectMake(pad, rowH + gap, contentW, rowH)
                                         selector:@selector(preset2Tapped)];
     preset2.titleLabel.font = [UIFont boldSystemFontOfSize:14];
     [_settingsPageView addSubview:preset2];
 
     VCamPanelButton *preset3 = [self makeButton:@"预设视频3"
-                                          frame:CGRectMake(pad, rowH + gap, contentW, rowH)
+                                          frame:CGRectMake(pad, (rowH + gap) * 2, contentW, rowH)
                                         selector:@selector(preset3Tapped)];
     preset3.titleLabel.font = [UIFont boldSystemFontOfSize:14];
     [_settingsPageView addSubview:preset3];
@@ -388,33 +479,38 @@ static void vcam_ball_log(NSString *msg) {
     // 岐盛相机: 隐藏频道链接按钮(跳转 Telegram)。
     // 2026-08-18: 品牌/签名/频道字符串混淆存储(VCamStr.h), 二进制无明文
     VCamPanelButton *channel = [self makeButton:VCS(qisheng)
-                                          frame:CGRectMake(pad, (rowH + gap) * 2, contentW, rowH)
+                                          frame:CGRectMake(pad, (rowH + gap) * 3, contentW, rowH)
                                         selector:@selector(channelLinkTapped)];
     channel.titleLabel.font = [UIFont boldSystemFontOfSize:14];
     [_settingsPageView addSubview:channel];
 
     // 水印
-    UILabel *mark = [[UILabel alloc] initWithFrame:CGRectMake(pad, (rowH + gap) * 2 + rowH + 10, contentW, 16)];
+    UILabel *mark = [[UILabel alloc] initWithFrame:CGRectMake(pad, (rowH + gap) * 3 + rowH + 10, contentW, 16)];
     mark.text = VCS(mark);
     mark.textColor = [UIColor colorWithRed:0.72 green:0.73 blue:0.75 alpha:1.0];
     mark.textAlignment = NSTextAlignmentCenter;
     mark.font = [UIFont systemFontOfSize:11];
     [_settingsPageView addSubview:mark];
 
-    // 初始页签 = 控制, 替/原标题按当前 enabled 状态
+    // 初始页签 = 控制, 替/镜边框按当前 enabled/mirrored 状态
+    _lightPageView.hidden = YES;
     _settingsPageView.hidden = YES;
     [self refreshTabStyles];
-    [self updateReplaceButtonTitle];
+    [self updateReplaceButtonVisual];
+    [self updateMirrorButtonVisual];
 
     // 面板先加, 悬浮球后加 → 球永远在面板上层, 即使重叠也能拖动/点击
     [_overlayWindow addSubview:_panelView];
 }
 
 - (void)refreshTabStyles {
-    BOOL controlActive = !_settingsPageView.hidden;
+    BOOL controlActive = !_controlPageView.hidden;
+    BOOL lightActive = !_lightPageView.hidden;
     _tabControlBtn.backgroundColor = controlActive ? [self vcTabActiveColor] : [self vcTabInactiveColor];
-    _tabSettingsBtn.backgroundColor = controlActive ? [self vcTabInactiveColor] : [self vcTabActiveColor];
+    _tabLightBtn.backgroundColor = lightActive ? [self vcTabActiveColor] : [self vcTabInactiveColor];
+    _tabSettingsBtn.backgroundColor = (!controlActive && !lightActive) ? [self vcTabActiveColor] : [self vcTabInactiveColor];
     [_tabControlBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [_tabLightBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     [_tabSettingsBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
 }
 
@@ -423,6 +519,15 @@ static void vcam_ball_log(NSString *msg) {
 - (void)controlTabTapped {
     vcam_ball_log(@"[vcam][tab] control");
     _controlPageView.hidden = NO;
+    _lightPageView.hidden = YES;
+    _settingsPageView.hidden = YES;
+    [self refreshTabStyles];
+}
+
+- (void)lightTabTapped {
+    vcam_ball_log(@"[vcam][tab] light");
+    _controlPageView.hidden = YES;
+    _lightPageView.hidden = NO;
     _settingsPageView.hidden = YES;
     [self refreshTabStyles];
 }
@@ -430,6 +535,7 @@ static void vcam_ball_log(NSString *msg) {
 - (void)settingsTabTapped {
     vcam_ball_log(@"[vcam][tab] settings");
     _controlPageView.hidden = YES;
+    _lightPageView.hidden = YES;
     _settingsPageView.hidden = NO;
     [self refreshTabStyles];
 }
@@ -511,18 +617,33 @@ static void vcam_ball_log(NSString *msg) {
     vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] playPause -> %@", _isPaused ? @"paused" : @"playing"]);
 }
 
-// 替/原: 替换摄像头 ↔ 还原摄像头
+// 替/原: 替换摄像头 ↔ 还原摄像头(图标按钮, 白色边框=替换开启)
 - (void)toggleReplacementTapped {
     BOOL newEnabled = ![VCamNotify isPlistEnabled];
     [VCamNotify setPlistEnabled:newEnabled];
     [[VCamCore sharedInstance] setEnabled:newEnabled];
-    [self updateReplaceButtonTitle];
+    [self updateReplaceButtonVisual];
     vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] replace toggle -> %@", newEnabled ? @"replaced" : @"restored"]);
 }
 
-- (void)updateReplaceButtonTitle {
+- (void)updateReplaceButtonVisual {
     BOOL en = [VCamNotify isPlistEnabled];
-    [self.replaceBtn setTitle:en ? @"原" : @"替" forState:UIControlStateNormal];
+    self.replaceBtn.layer.borderWidth = 2;
+    self.replaceBtn.layer.borderColor = en ? [UIColor whiteColor].CGColor
+                                           : [UIColor clearColor].CGColor;
+}
+
+// 镜: 镜像翻转(图标按钮, 白色边框=镜像开启)
+- (void)updateMirrorButtonVisual {
+    BOOL mi = [VCamNotify plistMirrored];
+    self.mirrorBtn.layer.borderWidth = 2;
+    self.mirrorBtn.layer.borderColor = mi ? [UIColor whiteColor].CGColor
+                                          : [UIColor clearColor].CGColor;
+}
+
+// 占位按钮(↑←↓→ − ＋ 复 1/2/3/4): 功能待后续版本定义, 仅记录点击
+- (void)placeholderTapped {
+    vcam_ball_log(@"[vcam][btn] placeholder tapped (function TBD)");
 }
 
 // 关: 只收起面板(悬浮球保持显示), 再点悬浮球即可重新打开
@@ -553,10 +674,11 @@ static void vcam_ball_log(NSString *msg) {
     // 路径变化 → mediaserverd 轮询自动重载; 若替换未开则同时开启
     [VCamNotify setActivePlaybackPath:path];
     [self resetOrientationState];  // 换源重置旋转/镜像(防残留角度与新视频元数据叠加翻转)
+    [self updateMirrorButtonVisual];  // 镜像重置后同步边框状态
     if (![VCamNotify isPlistEnabled]) {
         [VCamNotify setPlistEnabled:YES];
         [[VCamCore sharedInstance] setEnabled:YES];
-        [self updateReplaceButtonTitle];
+        [self updateReplaceButtonVisual];
     }
     vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] play slot %ld: %@", (long)slot, path]);
 }
@@ -575,6 +697,7 @@ static void vcam_ball_log(NSString *msg) {
 - (void)mirrorTapped {
     BOOL newMirrored = ![VCamNotify plistMirrored];
     [VCamNotify setPlistMirrored:newMirrored];
+    [self updateMirrorButtonVisual];
     vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] mirror toggled -> %d (synced)", newMirrored]);
 }
 
@@ -583,6 +706,7 @@ static void vcam_ball_log(NSString *msg) {
 - (void)resetOrientationState {
     [VCamNotify setPlistRotation:0];
     [VCamNotify setPlistMirrored:NO];
+    [self updateMirrorButtonVisual];
     vcam_ball_log(@"[vcam][btn] orientation state reset (rotation=0, mirror=off)");
 }
 
@@ -655,7 +779,7 @@ static void vcam_ball_log(NSString *msg) {
                 if (![VCamNotify isPlistEnabled]) {
                     [VCamNotify setPlistEnabled:YES];
                     [[VCamCore sharedInstance] setEnabled:YES];
-                    [strongSelf updateReplaceButtonTitle];
+                    [strongSelf updateReplaceButtonVisual];
                 }
                 vcam_ball_log([NSString stringWithFormat:@"[vcam] active source switched: %@", dest]);
             });
