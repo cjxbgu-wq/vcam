@@ -33,10 +33,6 @@
                                                   // 换视频后画面 180°/90° 翻转)
 @property (nonatomic, assign) BOOL mirrored;
 @property (nonatomic, readonly) BOOL rotationApiAvailable;
-// 自适应旋转 latch(2026-08-24 手动"转"方向修复): 曾有流靠 render 端 CCW90 转正。
-// 手动旋转首次接管时 VCamCore 读取此标志决定是否把这 90° 冻结补偿进角度,
-// 否则手动 90° 与自适应 CCW90 同向抵消(第一次点"转"无变化, 第二次直接 180°)
-@property (nonatomic, assign) BOOL hasAdaptiveRotated;
 
 // 用户画面变换(悬浮球 箭头/＋/−/复, 2026-08-23): 经 vc.plist 跨进程同步,
 // 预渲染线程 bakeUserTransformIntoCanvas 烘焙进像素(黑底画布合成)
