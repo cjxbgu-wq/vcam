@@ -435,16 +435,16 @@ static void vcam_ball_log(NSString *msg) {
     // 1.3.28 图标按需调大小: 播放大(insets 2), 复缩小(insets 8), 其余中等(insets 4)
     struct GridCell cells[4][4] = {
         { {CellIcon, nil, iconPlay, {2, 2, 2, 2}, @selector(restartVideoTapped)},
-          {CellSymbol, @"arrow.up", nil, {0, 0, 0, 0}, @selector(placeholderTapped)},
-          {CellIcon, nil, iconRestore, {8, 8, 8, 8}, @selector(placeholderTapped)},
+          {CellSymbol, @"arrow.up", nil, {0, 0, 0, 0}, @selector(panUpTapped)},
+          {CellIcon, nil, iconRestore, {8, 8, 8, 8}, @selector(resetTransformTapped)},
           {CellText, @"1", nil, {0, 0, 0, 0}, @selector(placeholderTapped)} },
-        { {CellSymbol, @"arrow.left", nil, {0, 0, 0, 0}, @selector(placeholderTapped)},
-          {CellSymbol, @"arrow.down", nil, {0, 0, 0, 0}, @selector(placeholderTapped)},
-          {CellSymbol, @"arrow.right", nil, {0, 0, 0, 0}, @selector(placeholderTapped)},
+        { {CellSymbol, @"arrow.left", nil, {0, 0, 0, 0}, @selector(panLeftTapped)},
+          {CellSymbol, @"arrow.down", nil, {0, 0, 0, 0}, @selector(panDownTapped)},
+          {CellSymbol, @"arrow.right", nil, {0, 0, 0, 0}, @selector(panRightTapped)},
           {CellText, @"2", nil, {0, 0, 0, 0}, @selector(placeholderTapped)} },
-        { {CellSymbol, @"minus", nil, {0, 0, 0, 0}, @selector(placeholderTapped)},
+        { {CellSymbol, @"minus", nil, {0, 0, 0, 0}, @selector(zoomOutTapped)},
           {CellSymbol, @"play.fill", nil, {0, 0, 0, 0}, @selector(playPauseTapped)},
-          {CellSymbol, @"plus", nil, {0, 0, 0, 0}, @selector(placeholderTapped)},
+          {CellSymbol, @"plus", nil, {0, 0, 0, 0}, @selector(zoomInTapped)},
           {CellText, @"3", nil, {0, 0, 0, 0}, @selector(placeholderTapped)} },
         { {CellIcon, nil, iconRotate, {7, 7, 7, 7}, @selector(rotateRightTapped)},
           {CellIcon, nil, iconMirror, {7, 7, 7, 7}, @selector(mirrorTapped)},
@@ -752,6 +752,60 @@ static void vcam_ball_log(NSString *msg) {
     vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] rotation: %d -> %d (synced)", oldAngle, newAngle]);
 }
 
+#pragma mark - 用户画面变换(箭头/＋/−/复, 1.3.30)
+// 语义: 箭头移动替换后的画面(先＋放大获得移动余量, zoom=1 时画面全幅无余量不动);
+// ＋放大/−缩小(1.0..4.0, 步进 0.25); 复还原为未移动未缩放的原始画面。
+// 通道: vc.plist userPanX/userPanY/userZoom → mediaserverd 轮询同步到 GPU 管线
+static const double kVcamPanStep  = 0.10;   // 每次点击移动 10% 可用余量
+static const double kVcamZoomStep = 0.25;   // 每次点击缩放档位
+static const double kVcamZoomMin  = 1.0;
+static const double kVcamZoomMax  = 4.0;
+
+static double vcamClamp(double v, double lo, double hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+// dx/dy 归一化增量: CoreVideo 偏移语义下 pan 正=窗口右/下移=画面左/上移,
+// 用户语义"画面向左移" = panX 增; "画面向上移" = panY 增
+- (void)panByX:(double)dx Y:(double)dy {
+    double nx = vcamClamp([VCamNotify plistPanX] + dx, -1.0, 1.0);
+    double ny = vcamClamp([VCamNotify plistPanY] + dy, -1.0, 1.0);
+    [VCamNotify setPlistPanX:nx];
+    [VCamNotify setPlistPanY:ny];
+    vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] pan -> (%.2f, %.2f) (synced)", nx, ny]);
+}
+
+- (void)panLeftTapped  { [self panByX: kVcamPanStep Y:0]; }  // 画面左移
+- (void)panRightTapped { [self panByX:-kVcamPanStep Y:0]; }  // 画面右移
+- (void)panUpTapped    { [self panByX:0 Y: kVcamPanStep]; }  // 画面上移
+- (void)panDownTapped  { [self panByX:0 Y:-kVcamPanStep]; }  // 画面下移
+
+- (void)zoomInTapped {
+    double nz = vcamClamp([VCamNotify plistZoom] + kVcamZoomStep, kVcamZoomMin, kVcamZoomMax);
+    [VCamNotify setPlistZoom:nz];
+    vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] zoom in -> %.2f (synced)", nz]);
+}
+
+- (void)zoomOutTapped {
+    double nz = vcamClamp([VCamNotify plistZoom] - kVcamZoomStep, kVcamZoomMin, kVcamZoomMax);
+    // 缩回 1.0 时同步清 pan: 全幅画面无移动余量, 残留 pan 会在再放大时突跳
+    if (nz <= kVcamZoomMin) {
+        [VCamNotify resetPlistTransform];
+        vcam_ball_log(@"[vcam][btn] zoom out -> 1.00, pan reset (synced)");
+        return;
+    }
+    [VCamNotify setPlistZoom:nz];
+    vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] zoom out -> %.2f (synced)", nz]);
+}
+
+// 复: 还原为最原始画面(未移动未缩放; 不动旋转/镜像 —— 那两个由"转/镜"管理)
+- (void)resetTransformTapped {
+    [VCamNotify resetPlistTransform];
+    vcam_ball_log(@"[vcam][btn] transform reset (pan=0, zoom=1) (synced)");
+}
+
 // 镜: 镜像翻转(同样以 plist 为单一事实源)
 - (void)mirrorTapped {
     BOOL newMirrored = ![VCamNotify plistMirrored];
@@ -762,11 +816,13 @@ static void vcam_ball_log(NSString *msg) {
 
 // 切视频时重置手动旋转/镜像: 残留的手动角度会与新视频自带的 preferredRotation
 // 叠加, 产生意外的 180° 等翻转(换视频后画面倒立的根因)。新视频从元数据干净起点显示
+// 1.3.30: 同步重置画面变换(pan/zoom), 新视频从原始全幅位置显示
 - (void)resetOrientationState {
     [VCamNotify setPlistRotation:0];
     [VCamNotify setPlistMirrored:NO];
+    [VCamNotify resetPlistTransform];
     [self updateMirrorButtonVisual];
-    vcam_ball_log(@"[vcam][btn] orientation state reset (rotation=0, mirror=off)");
+    vcam_ball_log(@"[vcam][btn] orientation state reset (rotation=0, mirror=off, pan=0, zoom=1)");
 }
 
 #pragma mark - 视频选择(PHPicker 相册选择器)
