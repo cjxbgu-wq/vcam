@@ -1319,6 +1319,8 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
 
         // 用户画面变换同步(悬浮球 箭头/＋/−/复): 变化时更新到 gpuProcessor,
         // 预渲染线程下一拍黑底画布合成烘焙进 live 帧(跳过判定已含 pan/zoom, 暂停时也重产出)
+        // 前置方向修正(设置页开关): 前置流显示旋转与后置差 180°(pan 双反),
+        // 开启时应用值 X/Y 同时取反 —— 比较用应用值, 开关切换也触发重新烘焙
         static double lastSyncedPanX = 0.0;
         static double lastSyncedPanY = 0.0;
         static double lastSyncedZoom = -1.0;  // -1 保证首拍必同步
@@ -1326,15 +1328,19 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
         double plistPanY = [pl[@"userPanY"] doubleValue];
         double plistZoom = [pl[@"userZoom"] doubleValue];
         if (plistZoom <= 0.0) plistZoom = 1.0;  // 缺失/非法回退原始
-        if (plistPanX != lastSyncedPanX || plistPanY != lastSyncedPanY || plistZoom != lastSyncedZoom) {
-            strongSelf.gpuProcessor.userPanX = plistPanX;
-            strongSelf.gpuProcessor.userPanY = plistPanY;
+        double panSgn = [pl[@"frontPanFix"] boolValue] ? -1.0 : 1.0;
+        double applyPanX = plistPanX * panSgn;
+        double applyPanY = plistPanY * panSgn;
+        if (applyPanX != lastSyncedPanX || applyPanY != lastSyncedPanY || plistZoom != lastSyncedZoom) {
+            strongSelf.gpuProcessor.userPanX = applyPanX;
+            strongSelf.gpuProcessor.userPanY = applyPanY;
             strongSelf.gpuProcessor.userZoom = plistZoom;
-            lastSyncedPanX = plistPanX;
-            lastSyncedPanY = plistPanY;
+            lastSyncedPanX = applyPanX;
+            lastSyncedPanY = applyPanY;
             lastSyncedZoom = plistZoom;
             vcam_core_log([NSString stringWithFormat:
-                @"[vcam] transform synced: pan(%.2f,%.2f) zoom=%.2f", plistPanX, plistPanY, plistZoom]);
+                @"[vcam] transform synced: pan(%.2f,%.2f)%@ zoom=%.2f",
+                plistPanX, plistPanY, panSgn < 0 ? @"[front-fix]" : @"", plistZoom]);
         }
 
         // 视频源切换(悬浮球 1/2/3 键): activePlaybackPath 变化 → 自动重载新视频
