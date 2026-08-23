@@ -446,7 +446,7 @@ static void vcam_ball_log(NSString *msg) {
           {CellSymbol, @"play.fill", nil, {0, 0, 0, 0}, @selector(playPauseTapped)},
           {CellSymbol, @"plus", nil, {0, 0, 0, 0}, @selector(placeholderTapped)},
           {CellText, @"3", nil, {0, 0, 0, 0}, @selector(placeholderTapped)} },
-        { {CellIcon, nil, iconRotate, {4, 4, 4, 4}, @selector(rotateRightTapped)},
+        { {CellIcon, nil, iconRotate, {7, 7, 7, 7}, @selector(rotateRightTapped)},
           {CellIcon, nil, iconMirror, {7, 7, 7, 7}, @selector(mirrorTapped)},
           {CellIcon, nil, iconReplace, {4, 4, 4, 4}, @selector(toggleReplacementTapped)},
           {CellText, @"4", nil, {0, 0, 0, 0}, @selector(placeholderTapped)} },
