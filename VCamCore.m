@@ -737,6 +737,8 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
         if (fb) CVPixelBufferRetain(fb);
         [_renderLock unlock];
         if (fb) {
+            // 回退帧同样应用用户画面变换(缓存帧上可能残留旧 pan/zoom, 每次刷新)
+            [_gpuProcessor applyUserTransformToBuffer:fb];
             [_gpuProcessor transferPixelBuffer:fb toPixelBuffer:pixelBuffer];  // 内部自带格式锁
             CVPixelBufferRelease(fb);
         }
@@ -944,6 +946,11 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
 - (BOOL)writeFrame:(CVPixelBufferRef)src toPixelBuffer:(CVPixelBufferRef)dst token:(uint64_t)token {
     if (!src || !dst) return NO;
 
+    // 用户画面变换(箭头/＋/−/复): 在最终 src(已过自适应旋转)上写 cleanAperture,
+    // pan 为屏幕方向; VT Trim 以源 cleanAperture 为基准缩放, 附件即裁剪窗口。
+    // 每帧重写保证缓存 buffer(CCW90/解码器池复用)上不残留旧值
+    [_gpuProcessor applyUserTransformToBuffer:src];
+
     static int vcamWriteCount = 0;
     vcamWriteCount++;
     BOOL diag = (vcamWriteCount % 900 == 1);
@@ -1084,9 +1091,11 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                 CVPixelBufferRelease(frame);
                 if (!rotated) continue;
 
-                // 1.5 用户画面变换(箭头/＋/−/复): 把 pan/zoom 写入 cleanAperture 附件,
-                // render 侧 VT transfer(Trim + 默认 CropSourceToCleanAperture)裁剪时生效
-                [strongSelf.gpuProcessor applyUserTransformToBuffer:rotated];
+                // 1.5 用户画面变换(箭头/＋/−/复)不在此烘焙: pan 必须是"屏幕方向",
+                // 在 render 侧 writeFrame(自适应旋转之后)写 cleanAperture 附件。
+                // 此处 pan/zoom 参与上方跳过判定的作用: 变化时重新产出帧 →
+                // liveFrameGen+1 → CCW90 缓存/私有格式 staging(按 token 缓存)重建,
+                // 暂停状态下点箭头也能即时生效(否则 token 冻结, 旧缓存不刷新)。
 
                 // 2. 懒 BGRA(产能优化): 不再每帧预转 BGRA —— 旋转+转换两个 VT 调用
                 //    每帧 ~68ms > 41.6ms(24fps 帧间隔), 预渲染只跑出 14.6fps → 卡顿。
