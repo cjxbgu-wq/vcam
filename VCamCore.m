@@ -727,19 +727,38 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
     // 周期性撞数据竞争窗口导致 mediaserverd 崩溃(相机闪退)。写入相机帧一律走 VT。
     // 注2: 预渲染不再预产 BGRA(懒加载, 产能优化), BGRA 回退时现场转换。
 
+    // ===== 渲染主体全局串行化(2026-08-24 视频模式黑屏/崩溃循环根治) =====
+    // 根因(设备实证 6 次 malloc abort + 4 次 backboardd IOFence): CMCapture 多流
+    // (预览/视频/照片)在不同 Apple 队列线程并发回调 hook → renderReplacement
+    // 并发执行(2026-08-15 的 per-key 并行锁体系) → GPUImageProcessor 共享
+    // NSMutableDictionary(_twoStepStagingPool/_twoStepTokenPool/_twoStepFailCountPool/
+    // _twoStepDisabledPool)在并行 keyLock 段内被并发 mutate(NSMutableDictionary
+    // 非线程安全, 不同 key 的并发写同样损坏内部哈希表) → 堆元数据损坏 → 任意线程
+    // malloc abort(崩溃栈: convertFormat 的 VT 内部 malloc, 爆发点非损坏点);
+    // 多 per-key VT session 并发提交 → GPU IOFence 互等 → backboardd
+    // "blocked by IOFence" 崩溃 → mediaserverd 重启循环 = 视频模式持续黑屏。
+    // 视频模式是触发窗口: 流多(3-4 条)且含失败流(p200 -12905 熔断), 失败/熔断
+    // 路径每帧 mutate 字典, 并发窗口全开; 拍照模式流少且组合全支持, 极少触发。
+    // 修复: 渲染主体回到全局 _renderLock 串行(当年弃全局锁是因 CI 软渲 12MP 照片
+    // 帧 ~100ms 冻结预览; 现 CI 路径已废弃, VT 12MP ~17ms, 多流排队代价 <25ms,
+    // 低于 41ms 帧预算, 无冻结感)。锁序单向无倒置: _renderLock →
+    // (_rotationRenderLock / @synchronized(self) → keyLock → poolDictLock)。
+    // 内层原有三处 _renderLock(无帧回退读/懒 BGRA/回退帧缓存)随外层持有一并移除
+    // (NSLock 不可重入, 保留会自死锁)。
+    [_renderLock lock];
+
     if (!yuv) {
         // 无帧回退(对齐千面 0xb018-0xb05c): 用上一帧缓存填充, 视频解码间隙不闪回相机画面。
         // 不再要求尺寸匹配 —— VT transfer 本身支持任意尺寸 crop fill,
         // 尺寸不匹配时跳过会导致间隙闪现真实相机画面(不稳定感)
         if (diagThisFrame) vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d NO frame, fallback", vcamRenderCount]);
-        [_renderLock lock];
         CVPixelBufferRef fb = _fallbackFrame;
         if (fb) CVPixelBufferRetain(fb);
-        [_renderLock unlock];
         if (fb) {
             [_gpuProcessor transferPixelBuffer:fb toPixelBuffer:pixelBuffer];  // 内部自带格式锁
             CVPixelBufferRelease(fb);
         }
+        [_renderLock unlock];
         return;
     }
 
@@ -764,15 +783,14 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
     if (!ok && base == yuv) {
         // YUV 源失败(该 420f→目标组合 VT 不支持): 懒转 BGRA 回退(预渲染已不预产 BGRA,
         // 罕见路径现场转换一次, 正常帧不付这个代价)
+        // (外层已持 _renderLock, 原 inner lock 已移除 —— NSLock 不可重入)
         if (src) CVPixelBufferRelease(src);
         src = NULL;
-        [_renderLock lock];
         CVPixelBufferRef lazyBGRA = [_gpuProcessor convertFormat:yuv toFormat:kCVPixelFormatType_32BGRA];
         if (lazyBGRA) {
             src = [_gpuProcessor adaptiveRotateIfNeeded:lazyBGRA targetWidth:targetW targetHeight:targetH token:0];
             CVPixelBufferRelease(lazyBGRA);
         }
-        [_renderLock unlock];
         ok = [self writeFrame:src toPixelBuffer:pixelBuffer token:0];  // 0 = 不复用 staging
         usedFallbackSource = ok;
         if (ok && diagThisFrame) {
@@ -788,13 +806,12 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                            (src != base && !usedFallbackSource) ? @" +CCW90" : @""]);
         }
         // 缓存回退帧(千面缓存旋转后的实际 transfer 源 x24, 0xb15c-0xb19c) + 同帧去重
-        [_renderLock lock];
+        // (外层已持 _renderLock)
         if (_fallbackFrame) CVPixelBufferRelease(_fallbackFrame);
         _fallbackFrame = src;
         CVPixelBufferRetain(_fallbackFrame);
         _fallbackWidth = targetW;
         _fallbackHeight = targetH;
-        [_renderLock unlock];
         _dedupLastBuffer = pixelBuffer;
         _dedupLastTime = CFAbsoluteTimeGetCurrent();
     } else if (diagThisFrame) {
@@ -804,6 +821,7 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
     if (src) CVPixelBufferRelease(src);
     if (bgra) CVPixelBufferRelease(bgra);
     if (yuv) CVPixelBufferRelease(yuv);
+    [_renderLock unlock];
 }
 
 - (BOOL)hasReplacementFrame {
@@ -1304,12 +1322,28 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
         NSDictionary *pl = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath] ?: @{};
         static NSInteger lastSyncedRotation = -1;
         static BOOL lastSyncedMirrored = NO;
+        // 手动"转"补偿(2026-08-24 首次点击无反应修复): 无手动时竖流靠自适应 CCW90
+        // 转正; 手动首次接管瞬间若自适应在生效, 把这 90° 冻结补偿进角度 ——
+        // 否则手动 90° 与自适应 CCW90 同向抵消(第一次点无变化, 第二次直接 180°)。
+        // 补偿在接管瞬间冻结, 之后每次 +90 显示恰好转 90°, m 循环回 0 时
+        // 显示 = source+90 与原始正常显示重合(循环闭合)。切视频/复时重置。
+        static BOOL manualTaken = NO;
+        static int manualComp = 0;
         NSInteger plistRotation = [pl[@"manualRotation"] integerValue];
         BOOL plistMirrored = [pl[@"mirrored"] boolValue];
         if (plistRotation != lastSyncedRotation) {
-            strongSelf.gpuProcessor.rotationAngle = (int)plistRotation;
+            if (plistRotation != 0 && !manualTaken && lastSyncedRotation == 0) {
+                // 首次接管(manual 从 0 变非 0): 冻结当前自适应状态为补偿
+                manualComp = strongSelf.gpuProcessor.hasAdaptiveRotated ? 90 : 0;
+                manualTaken = YES;
+                vcam_core_log([NSString stringWithFormat:
+                    @"[vcam] manual rotation takes over, adaptive comp=%d", manualComp]);
+            }
+            strongSelf.gpuProcessor.rotationAngle = (int)((plistRotation + manualComp) % 360);
             lastSyncedRotation = plistRotation;
-            vcam_core_log([NSString stringWithFormat:@"[vcam] rotation synced: %ld", (long)plistRotation]);
+            vcam_core_log([NSString stringWithFormat:
+                @"[vcam] rotation synced: plist=%ld applied=%ld", (long)plistRotation,
+                (long)((plistRotation + manualComp) % 360)]);
         }
         if (plistMirrored != lastSyncedMirrored) {
             strongSelf.gpuProcessor.mirrored = plistMirrored;
@@ -1356,8 +1390,10 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                 // 叠加, 产生意外的 180° 等翻转(换视频后画面倒立的根因)。
                 // 新视频按其自身元数据从干净起点显示
                 // 1.3.30: 画面变换(pan/zoom)一并重置, 新视频从原始全幅位置显示
+                // 手动"转"补偿一并重置(新视频从自适应 CCW90 干净起点重新接管)
                 strongSelf.gpuProcessor.rotationAngle = 0;
                 strongSelf.gpuProcessor.mirrored = NO;
+                strongSelf.gpuProcessor.hasAdaptiveRotated = NO;
                 strongSelf.gpuProcessor.userPanX = 0.0;
                 strongSelf.gpuProcessor.userPanY = 0.0;
                 strongSelf.gpuProcessor.userZoom = 1.0;
@@ -1369,6 +1405,8 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                 lastSyncedPanX = 0.0;
                 lastSyncedPanY = 0.0;
                 lastSyncedZoom = 1.0;
+                manualTaken = NO;   // 手动"转"补偿随切视频重置
+                manualComp = 0;
                 // 异步重载(同步加载阻塞轮询线程 → watchdog 崩溃)
                 __weak typeof(strongSelf) wSelf = strongSelf;
                 dispatch_async(strongSelf.processingQueue, ^{
