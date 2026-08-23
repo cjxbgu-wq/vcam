@@ -395,11 +395,17 @@ static void vcam_ball_log(NSString *msg) {
         VCS_BTN_VCAM_BTN_RESTORE_KEY4, VCS_BTN_VCAM_BTN_RESTORE_KEY5,
         VCS_BTN_VCAM_BTN_RESTORE_KEY6, VCS_BTN_VCAM_BTN_RESTORE_KEY7,
     };
+    static const unsigned char kRotateKey[8] = {
+        VCS_BTN_VCAM_BTN_ROTATE_KEY0, VCS_BTN_VCAM_BTN_ROTATE_KEY1,
+        VCS_BTN_VCAM_BTN_ROTATE_KEY2, VCS_BTN_VCAM_BTN_ROTATE_KEY3,
+        VCS_BTN_VCAM_BTN_ROTATE_KEY4, VCS_BTN_VCAM_BTN_ROTATE_KEY5,
+        VCS_BTN_VCAM_BTN_ROTATE_KEY6, VCS_BTN_VCAM_BTN_ROTATE_KEY7,
+    };
 
     // 宫格布局: 文字 / SF Symbol / 自定义图标 三类按钮
-    // 播图标 → 从头重播; 复图标 → 占位; 镜图标 → 镜像; 替图标 → 替换开关
-    // 箭头/加减/播放暂停/旋转 = SF Symbol(系统矢量图标, 渲染正常无 Unicode 字形超界问题;
-    // 1.3.24 实测 ↷ 字形下缘超出按钮)。1/2/3/4 = 文字占位
+    // 播图标 → 从头重播; 复图标 → 占位; 镜图标 → 镜像; 替图标 → 替换开关;
+    // 转图标 → 旋转(1.3.26 起用自定义图标替代 arrow.clockwise)
+    // 箭头/加减/播放暂停 = SF Symbol。1/2/3/4 = 文字占位
     typedef NS_ENUM(int, GridCellType) {
         CellText,    // 文字按钮
         CellIcon,    // 自定义加密 PNG 图标(btn_icons.h)
@@ -415,15 +421,18 @@ static void vcam_ball_log(NSString *msg) {
     UIImage *iconMirror  = vcamDecodeBtnIcon(vcam_btn_mirror_enc, vcam_btn_mirror_len, kMirrorKey);
     UIImage *iconReplace = vcamDecodeBtnIcon(vcam_btn_replace_enc, vcam_btn_replace_len, kReplaceKey);
     UIImage *iconRestore = vcamDecodeBtnIcon(vcam_btn_restore_enc, vcam_btn_restore_len, kRestoreKey);
+    UIImage *iconRotate  = vcamDecodeBtnIcon(vcam_btn_rotate_enc, vcam_btn_rotate_len, kRotateKey);
     // AlwaysOriginal: UIButtonTypeSystem 会把 image tint 染成系统蓝
     // (1.3.24 实测图标全蓝的根因), 固定原始灰白像素免染色
     iconPlay    = [iconPlay    imageWithRenderingMode:UIImageRenderingModeAlwaysOriginal];
     iconMirror  = [iconMirror  imageWithRenderingMode:UIImageRenderingModeAlwaysOriginal];
     iconReplace = [iconReplace imageWithRenderingMode:UIImageRenderingModeAlwaysOriginal];
     iconRestore = [iconRestore imageWithRenderingMode:UIImageRenderingModeAlwaysOriginal];
+    iconRotate  = [iconRotate  imageWithRenderingMode:UIImageRenderingModeAlwaysOriginal];
 
+    // 1.3.26 修复: 播图标此前漏绑(icon=nil → 空白按钮), "左上角图标没显示"的根因
     struct GridCell cells[4][4] = {
-        { {CellIcon, nil, nil, @selector(restartVideoTapped)},
+        { {CellIcon, nil, iconPlay, @selector(restartVideoTapped)},
           {CellSymbol, @"arrow.up", nil, @selector(placeholderTapped)},
           {CellIcon, nil, iconRestore, @selector(placeholderTapped)},
           {CellText, @"1", nil, @selector(placeholderTapped)} },
@@ -435,7 +444,7 @@ static void vcam_ball_log(NSString *msg) {
           {CellSymbol, @"play.fill", nil, @selector(playPauseTapped)},
           {CellSymbol, @"plus", nil, @selector(placeholderTapped)},
           {CellText, @"3", nil, @selector(placeholderTapped)} },
-        { {CellSymbol, @"arrow.clockwise", nil, @selector(rotateRightTapped)},
+        { {CellIcon, nil, iconRotate, @selector(rotateRightTapped)},
           {CellIcon, nil, iconMirror, @selector(mirrorTapped)},
           {CellIcon, nil, iconReplace, @selector(toggleReplacementTapped)},
           {CellText, @"4", nil, @selector(placeholderTapped)} },
@@ -453,10 +462,11 @@ static void vcam_ball_log(NSString *msg) {
                 btn.imageEdgeInsets = UIEdgeInsetsMake(7, 7, 7, 7);
             } else if (cell.type == CellSymbol) {
                 // SF Symbol 按钮: template 矢量图, tintColor 染白贴合灰色主题
+                // (1.3.26 字号还原: 20pt 偏大, 与文字按钮 16pt 视觉平衡)
                 btn = [self makeButton:@"" frame:f selector:cell.action];
                 UIImageSymbolConfiguration *cfg =
-                    [UIImageSymbolConfiguration configurationWithPointSize:20
-                                                                   weight:UIImageSymbolWeightSemibold];
+                    [UIImageSymbolConfiguration configurationWithPointSize:17
+                                                                   weight:UIImageSymbolWeightRegular];
                 UIImage *sym = [UIImage systemImageNamed:cell.repr withConfiguration:cfg];
                 if (sym) {
                     [btn setImage:sym forState:UIControlStateNormal];
@@ -465,11 +475,11 @@ static void vcam_ball_log(NSString *msg) {
                 } else {
                     // 兜底: 极老系统无 SF Symbol 时显示文字
                     btn = [self makeButton:@"·" frame:f selector:cell.action];
-                    btn.titleLabel.font = [UIFont boldSystemFontOfSize:17];
+                    btn.titleLabel.font = [UIFont boldSystemFontOfSize:16];
                 }
             } else {
                 btn = [self makeButton:cell.repr frame:f selector:cell.action];
-                btn.titleLabel.font = [UIFont boldSystemFontOfSize:17];
+                btn.titleLabel.font = [UIFont boldSystemFontOfSize:16];
             }
             [_controlPageView addSubview:btn];
             if (r == 2 && c == 1) _playPauseBtn = btn;         // ▶ ↔ ⏸ (play.fill/pause.fill)
@@ -652,8 +662,8 @@ static void vcam_ball_log(NSString *msg) {
     _isPaused = !_isPaused;
     [VCamNotify setPlistPaused:_isPaused];
     UIImageSymbolConfiguration *cfg =
-        [UIImageSymbolConfiguration configurationWithPointSize:20
-                                                       weight:UIImageSymbolWeightSemibold];
+        [UIImageSymbolConfiguration configurationWithPointSize:17
+                                                       weight:UIImageSymbolWeightRegular];
     UIImage *sym = [UIImage systemImageNamed:(_isPaused ? @"pause.fill" : @"play.fill")
                             withConfiguration:cfg];
     [self.playPauseBtn setImage:sym forState:UIControlStateNormal];
