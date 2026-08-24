@@ -105,6 +105,58 @@ static void vcamIOSurfaceInit(void) {
     }
 }
 
+// ===== 已知颜色集合(1.3.38, 对齐 Android vcam KNOWN_COLORS) =====
+// 用户指定: 只打这几个标准色 —— 捕获端逐像素向已知色匹配计票(欧氏距离
+// <120), 多数表决(>=30/441), 匹配不到 → 熄灭。输出标准纯色值(光斑颜色
+// 纯正, 不受采样噪声影响)。定义在最前(捕获线程函数依赖)。
+static const uint32_t vcamKnownLights[7] = {
+    0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0x00FFFF, 0xFF00FF, 0xFFFFFF
+};
+// 名称 getter 函数(非静态数组: 混淆器把字符串字面量换成运行时解密调用,
+// 全局数组的非常量初始化器编译不过 —— 工程既有约束, 同 ovfN 模式)
+static NSString *vcamKnownLightName(int idx) {
+    switch (idx) {
+        case 0: return @"红";
+        case 1: return @"绿";
+        case 2: return @"蓝";
+        case 3: return @"黄";
+        case 4: return @"青";
+        case 5: return @"紫";
+        case 6: return @"白";
+    }
+    return @"?";
+}
+
+// RGBA 像素数组 → 已知色匹配。返回 0=无匹配, 否则标准色值; outName/outCount 诊断
+static uint32_t vcamMatchKnownLight(const uint8_t *rgba, int n, NSString **outName, int *outCount) {
+    int counts[7] = {0};
+    for (int i = 0; i < n; i++) {
+        int r = rgba[i * 4], g = rgba[i * 4 + 1], b = rgba[i * 4 + 2];
+        int maxc = MAX(MAX(r, g), b), minc = MIN(MIN(r, g), b);
+        if (maxc > 200 && maxc - minc < 50) { counts[6]++; continue; }  // 白特判(饱和度滤会误杀)
+        if (maxc < 180 || maxc - minc < 60) continue;  // 饱和度过滤(同 Android)
+        int best = -1, bestD2 = 120 * 120;
+        for (int k = 0; k < 6; k++) {  // 白已特判, 只比 6 色
+            int dr = r - (int)((vcamKnownLights[k] >> 16) & 0xFF);
+            int dg = g - (int)((vcamKnownLights[k] >> 8) & 0xFF);
+            int db = b - (int)(vcamKnownLights[k] & 0xFF);
+            int d2 = dr * dr + dg * dg + db * db;
+            if (d2 < bestD2) { bestD2 = d2; best = k; }
+        }
+        if (best >= 0) counts[best]++;
+    }
+    int bestK = -1, bestC = 0;
+    for (int k = 0; k < 7; k++) {
+        if (counts[k] > bestC) { bestC = counts[k]; bestK = k; }
+    }
+    if (bestK >= 0 && bestC >= 30) {  // 441 像素的 ~7%
+        if (outName) *outName = vcamKnownLightName(bestK);
+        if (outCount) *outCount = bestC;
+        return vcamKnownLights[bestK];
+    }
+    return 0;
+}
+
 // ===== CARenderServer 捕获策略链(1.3.39 看门狗架构) =====
 // 1.3.38 两次实证: CARenderServerCaptureDisplay 的 port 参数错误时 mach_msg
 // 无限等待(SIGSEGV/假死, port=MACH_PORT_NULL 直接崩 SB)。正确端口姿势未知 →
@@ -298,58 +350,6 @@ static void *vcamPickCaptureMain(void *ctx) {
     vcam_ball_log([NSString stringWithFormat:
         @"[vcam][light] capture thread (strategy %d) exited", strategy]);
     return NULL;
-}
-
-// ===== 已知颜色集合(1.3.38, 对齐 Android vcam KNOWN_COLORS) =====
-// 用户指定: 只打这几个标准色 —— 检测端逐像素向已知色匹配计票(欧氏距离
-// <120), 多数表决(>=30/441), 匹配不到 → 熄灭。输出标准纯色值(光斑颜色
-// 纯正, 不受采样噪声影响)。
-static const uint32_t vcamKnownLights[7] = {
-    0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0x00FFFF, 0xFF00FF, 0xFFFFFF
-};
-// 名称 getter 函数(非静态数组: 混淆器把字符串字面量换成运行时解密调用,
-// 全局数组的非常量初始化器编译不过 —— 工程既有约束, 同 ovfN 模式)
-static NSString *vcamKnownLightName(int idx) {
-    switch (idx) {
-        case 0: return @"红";
-        case 1: return @"绿";
-        case 2: return @"蓝";
-        case 3: return @"黄";
-        case 4: return @"青";
-        case 5: return @"紫";
-        case 6: return @"白";
-    }
-    return @"?";
-}
-
-// RGBA 像素数组 → 已知色匹配。返回 0=无匹配, 否则标准色值; outName/outCount 诊断
-static uint32_t vcamMatchKnownLight(const uint8_t *rgba, int n, NSString **outName, int *outCount) {
-    int counts[7] = {0};
-    for (int i = 0; i < n; i++) {
-        int r = rgba[i * 4], g = rgba[i * 4 + 1], b = rgba[i * 4 + 2];
-        int maxc = MAX(MAX(r, g), b), minc = MIN(MIN(r, g), b);
-        if (maxc > 200 && maxc - minc < 50) { counts[6]++; continue; }  // 白特判(饱和度滤会误杀)
-        if (maxc < 180 || maxc - minc < 60) continue;  // 饱和度过滤(同 Android)
-        int best = -1, bestD2 = 120 * 120;
-        for (int k = 0; k < 6; k++) {  // 白已特判, 只比 6 色
-            int dr = r - (int)((vcamKnownLights[k] >> 16) & 0xFF);
-            int dg = g - (int)((vcamKnownLights[k] >> 8) & 0xFF);
-            int db = b - (int)(vcamKnownLights[k] & 0xFF);
-            int d2 = dr * dr + dg * dg + db * db;
-            if (d2 < bestD2) { bestD2 = d2; best = k; }
-        }
-        if (best >= 0) counts[best]++;
-    }
-    int bestK = -1, bestC = 0;
-    for (int k = 0; k < 7; k++) {
-        if (counts[k] > bestC) { bestC = counts[k]; bestK = k; }
-    }
-    if (bestK >= 0 && bestC >= 30) {  // 441 像素的 ~7%
-        if (outName) *outName = vcamKnownLightName(bestK);
-        if (outCount) *outCount = bestC;
-        return vcamKnownLights[bestK];
-    }
-    return 0;
 }
 
 #pragma mark - 触摸穿透 window
