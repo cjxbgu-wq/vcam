@@ -205,6 +205,14 @@ static void vcam_gpu_log(NSString *msg) {
 // 与"仅视频模式黑屏"现象完全吻合
 @property (nonatomic, assign) VTPixelTransferSessionRef userTransferSession;
 
+// 三色打光注入画布池(1.3.37): 3 槽轮转(同 userCanvas 模式, live/render 持有期
+// 与预渲染写入错开)。注入必须写副本 —— baked 可能是旋转池/bake 画布的复用 buffer,
+// 直接注入会污染缓存池(下一帧复用时残留光斑)。关闭时直通零开销不建画布。
+@property (nonatomic, assign) CVPixelBufferRef lightCanvasPool0;
+@property (nonatomic, assign) CVPixelBufferRef lightCanvasPool1;
+@property (nonatomic, assign) CVPixelBufferRef lightCanvasPool2;
+@property (nonatomic, assign) int lightCanvasSlot;
+
 // CIContext（软件渲染，mediaserverd 没有 GPU 上下文）
 // 两个独立 CIContext: 预渲染线程用 preprocessContext, render 线程回退用 renderContext（CIContext 非线程安全）
 @property (nonatomic, strong) CIContext *preprocessContext;
@@ -1449,6 +1457,211 @@ static void vcamClearBiPlanarBlack(CVPixelBufferRef buf, OSType fmt) {
     return (CVPixelBufferRef)CVPixelBufferRetain(canvas);  // 池持有 + 返回额外 retain
 }
 
+#pragma mark - 三色打光注入(1.3.37, 复刻 Android vcplax apply_color_injection_nv21)
+
+// 420f/420v 是 bi-planar: plane0 = Y(W×H), plane1 = CbCr 交织(W/2 对 × 2 字节/行 H/2)
+// 与 Android NV21(VU 交织) 结构同族, 仅 UV 顺序相反: NV21 row[V,U], 420f row[U,V]。
+// 公式与 Android 完全一致(含两处用户校准映射):
+//   inner_r = radius*(100-feather)*80/10000  → feather=0 等同旧版 20 的羽化
+//   max_alpha_256 = intensity*192/100        → intensity=100 等同旧版 75 的强度
+static void vcamApplyLightBiPlanar(CVPixelBufferRef buf, uint32_t rgb,
+                                   int px, int py, int intensity,
+                                   int diameter, int feather) {
+    if (!buf || rgb == 0) return;
+    if (intensity > 100) intensity = 100;
+    if (diameter == 0) diameter = 50;
+    if (feather > 100) feather = 100;
+    if (px > 100) px = 50;
+    if (py > 100) py = 50;
+
+    size_t fw = CVPixelBufferGetWidth(buf);
+    size_t fh = CVPixelBufferGetHeight(buf);
+    if (fw < 8 || fh < 8) return;
+
+    int cx = (int)((int64_t)px * (int64_t)fw / 100);
+    int cy = (int)((int64_t)py * (int64_t)fh / 100);
+    int minDim = (int)((fw < fh) ? fw : fh);
+    int radius = (int)((int64_t)diameter * minDim / 200);
+    if (radius < 2) return;
+    int innerR = radius * (100 - feather) * 80 / 10000;
+    int maxAlpha256 = intensity * 192 / 100;
+
+    uint8_t r = (rgb >> 16) & 0xFF;
+    uint8_t g = (rgb >> 8) & 0xFF;
+    uint8_t b = rgb & 0xFF;
+    // BT.601 整数近似(与 Android 相同; 直接写进 buffer, 显示端语义与 Android 观感一致)
+    uint8_t colorY = (uint8_t)((299 * r + 587 * g + 114 * b) / 1000);
+    uint8_t colorU = (uint8_t)((-169 * r - 331 * g + 500 * b) / 1000 + 128);
+    uint8_t colorV = (uint8_t)((500 * r - 419 * g - 81 * b) / 1000 + 128);
+
+    uint8_t *yPlane = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(buf, 0);
+    uint8_t *cPlane = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(buf, 1);
+    size_t yStride = CVPixelBufferGetBytesPerRowOfPlane(buf, 0);
+    size_t cStride = CVPixelBufferGetBytesPerRowOfPlane(buf, 1);
+    if (!yPlane || !cPlane) return;
+
+    // ===== Y 平面: 圆形渐变(中心实心 inner_r, 线性羽化到 radius) =====
+    int radiusSq = radius * radius;
+    int innerSq = innerR * innerR;
+    int featherRange = radiusSq - innerSq;
+    int yStart = cy - radius; if (yStart < 0) yStart = 0;
+    int yEnd = cy + radius;   if (yEnd > (int)fh) yEnd = (int)fh;
+
+    for (int y = yStart; y < yEnd; y++) {
+        int dy = y - cy;
+        int dySq = dy * dy;
+        if (dySq >= radiusSq) continue;
+        uint8_t *row = yPlane + (size_t)y * yStride;
+
+        // 本行 x 有效范围(整数 sqrt 近似, 同 Android 牛顿一次迭代)
+        int remain = radiusSq - dySq;
+        int dxMax = radius;
+        dxMax = (dxMax + remain / dxMax) / 2;
+        if (dxMax > radius) dxMax = radius;
+
+        int rxStart = cx - dxMax; if (rxStart < 0) rxStart = 0;
+        int rxEnd = cx + dxMax;   if (rxEnd > (int)fw) rxEnd = (int)fw;
+        for (int x = rxStart; x < rxEnd; x++) {
+            int dx = x - cx;
+            int distSq = dx * dx + dySq;
+            int alpha256;
+            if (distSq <= innerSq) {
+                alpha256 = maxAlpha256;
+            } else if (distSq < radiusSq && featherRange > 0) {
+                alpha256 = maxAlpha256 * (radiusSq - distSq) / featherRange;
+            } else {
+                continue;
+            }
+            row[x] = (uint8_t)((row[x] * (256 - alpha256) + colorY * alpha256) >> 8);
+        }
+    }
+
+    // ===== CbCr 平面(半分辨率 UV 交织, 每行处理防色度像素方块) =====
+    int bw2 = (int)fw / 2, bh2 = (int)fh / 2;
+    if (bw2 < 2 || bh2 < 2) return;
+    int cx2 = cx / 2, cy2 = cy / 2;
+    int radius2 = radius / 2;
+    int innerR2 = innerR / 2;
+    int radius2Sq = radius2 * radius2;
+    int inner2Sq = innerR2 * innerR2;
+    int feather2 = radius2Sq - inner2Sq;
+
+    int y2Start = cy2 - radius2; if (y2Start < 0) y2Start = 0;
+    int y2End = cy2 + radius2;   if (y2End > bh2) y2End = bh2;
+
+    for (int y = y2Start; y < y2End; y++) {
+        int dy = y - cy2;
+        int dySq = dy * dy;
+        if (dySq >= radius2Sq) continue;
+        uint8_t *row = cPlane + (size_t)y * cStride;
+
+        int remain2 = radius2Sq - dySq;
+        int dxMax2 = radius2;
+        if (dxMax2 < 1) dxMax2 = 1;
+        dxMax2 = (dxMax2 + remain2 / dxMax2) / 2;
+        if (dxMax2 > radius2) dxMax2 = radius2;
+
+        int rx2Start = cx2 - dxMax2; if (rx2Start < 0) rx2Start = 0;
+        int rx2End = cx2 + dxMax2;   if (rx2End > bw2) rx2End = bw2;
+        for (int x = rx2Start; x < rx2End; x++) {
+            int dx = x - cx2;
+            int distSq = dx * dx + dySq;
+            int alpha256;
+            if (distSq <= inner2Sq) {
+                alpha256 = maxAlpha256;
+            } else if (distSq < radius2Sq && feather2 > 0) {
+                alpha256 = maxAlpha256 * (radius2Sq - distSq) / feather2;
+            } else {
+                continue;
+            }
+            int idx = x * 2;
+            // 420f plane1 = [Cb, Cr, Cb, Cr...] (UV 交织; NV21 是 VU, 顺序相反)
+            row[idx]     = (uint8_t)((row[idx]     * (256 - alpha256) + colorU * alpha256) >> 8);
+            row[idx + 1] = (uint8_t)((row[idx + 1] * (256 - alpha256) + colorV * alpha256) >> 8);
+        }
+    }
+}
+
+// 注入画布取槽(与 userCanvasAtSlot 同模式)
+- (CVPixelBufferRef)lightCanvasAtSlot:(int)slot {
+    if (slot == 0) return _lightCanvasPool0;
+    if (slot == 1) return _lightCanvasPool1;
+    return _lightCanvasPool2;
+}
+- (void)setLightCanvas:(CVPixelBufferRef)buf atSlot:(int)slot {
+    if (slot == 0) _lightCanvasPool0 = buf;
+    else if (slot == 1) _lightCanvasPool1 = buf;
+    else _lightCanvasPool2 = buf;
+}
+
+- (CVPixelBufferRef)injectLightIntoFrame:(CVPixelBufferRef)input CF_RETURNS_RETAINED {
+    if (!input) return NULL;
+    // 直通快路径: 关闭/无色 → 零开销(常态)
+    if (!_lightEnabled || _lightColorRGB == 0) {
+        return (CVPixelBufferRef)CVPixelBufferRetain(input);
+    }
+    // 仅双平面 YUV(解码原生 420f/420v); 其他格式直通保底
+    if (CVPixelBufferGetPlaneCount(input) != 2) {
+        return (CVPixelBufferRef)CVPixelBufferRetain(input);
+    }
+
+    OSType fmt = CVPixelBufferGetPixelFormatType(input);
+    size_t W = CVPixelBufferGetWidth(input);
+    size_t H = CVPixelBufferGetHeight(input);
+    if (W < 16 || H < 16) {
+        return (CVPixelBufferRef)CVPixelBufferRetain(input);
+    }
+
+    // 注入画布(3 槽轮转): 尺寸/格式变化时重建(切视频)
+    int slot = _lightCanvasSlot;
+    _lightCanvasSlot = (slot + 1) % 3;
+    CVPixelBufferRef canvas = [self lightCanvasAtSlot:slot];
+    if (!canvas || CVPixelBufferGetWidth(canvas) != W ||
+        CVPixelBufferGetHeight(canvas) != H ||
+        CVPixelBufferGetPixelFormatType(canvas) != fmt) {
+        if (canvas) CVPixelBufferRelease(canvas);
+        canvas = NULL;
+        // 约束(记忆): mediaserverd 绝不用 IOSurface attributes, 传 NULL
+        if (CVPixelBufferCreate(kCFAllocatorDefault, W, H, fmt, NULL, &canvas) != noErr || !canvas) {
+            [self setLightCanvas:NULL atSlot:slot];
+            return (CVPixelBufferRef)CVPixelBufferRetain(input);  // 建不出: 直通保底
+        }
+        [self setLightCanvas:canvas atSlot:slot];
+        vcam_gpu_log([NSString stringWithFormat:@"[vcam] light canvas built %zux%zu (slot %d)", W, H, slot]);
+    }
+
+    // 源内容整帧复制到画布(Y + CbCr 两平面, 行对齐逐行 memcpy)
+    CVPixelBufferLockBaseAddress(input, kCVPixelBufferLock_ReadOnly);
+    CVPixelBufferLockBaseAddress(canvas, 0);
+    for (int p = 0; p < 2; p++) {
+        const uint8_t *src = (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(input, p);
+        uint8_t *dst = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(canvas, p);
+        size_t rows = (p == 0) ? H : H / 2;
+        size_t srs = CVPixelBufferGetBytesPerRowOfPlane(input, p);
+        size_t drs = CVPixelBufferGetBytesPerRowOfPlane(canvas, p);
+        size_t rowBytes = MIN(srs, drs);
+        if (!src || !dst) continue;
+        for (size_t y = 0; y < rows; y++) {
+            memcpy(dst + y * drs, src + y * srs, rowBytes);
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(input, kCVPixelBufferLock_ReadOnly);
+
+    // 色彩附件复制: 下游 VT 转换色彩语义正确(同 bake 画布)
+    CFDictionaryRef colorAtts = CVBufferCopyAttachments(input, kCVAttachmentMode_ShouldPropagate);
+    if (colorAtts) {
+        CVBufferSetAttachments(canvas, colorAtts, kCVAttachmentMode_ShouldPropagate);
+        CFRelease(colorAtts);
+    }
+
+    // 圆形渐变光斑注入(参数 clamp 在函数内)
+    vcamApplyLightBiPlanar(canvas, _lightColorRGB, _lightX, _lightY,
+                           _lightIntensity, _lightDiameter, _lightFeather);
+
+    CVPixelBufferUnlockBaseAddress(canvas, 0);
+    return (CVPixelBufferRef)CVPixelBufferRetain(canvas);  // 池持有 + 返回额外 retain
+}
+
 // 预渲染用: 同尺寸格式转换(如 BGRA -> 420f), VT 主路径 + CoreImage 回退
 // 注意: 用预渲染专用 session（避免与 render 线程的 session 并发调用崩溃）
 - (CVPixelBufferRef)convertFormat:(CVPixelBufferRef)input toFormat:(OSType)format CF_RETURNS_RETAINED {
@@ -2418,6 +2631,15 @@ static const NSUInteger kVcamMaxStreamKeys = 6;
             CVPixelBufferRelease(_userPieceBuffer);
             _userPieceBuffer = NULL;
             released++;
+        }
+        // 三色打光注入画布池(1.3.37, 同上: 预渲染线程已暂停, 安全释放)
+        for (int i = 0; i < 3; i++) {
+            CVPixelBufferRef b = [self lightCanvasAtSlot:i];
+            if (b) {
+                CVPixelBufferRelease(b);
+                [self setLightCanvas:NULL atSlot:i];
+                released++;
+            }
         }
         for (id key in _bgraBufferPoolMap) {
             CVPixelBufferPoolRelease((__bridge CVPixelBufferPoolRef)_bgraBufferPoolMap[key]);
