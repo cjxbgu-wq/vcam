@@ -1131,14 +1131,22 @@ static NSString *vcamLightColorName(uint32_t c) {
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self
                                                                           action:@selector(pickDotDragged:)];
     [_pickDotView addGestureRecognizer:pan];
-    // 1.3.43: 层级改为 屏幕内容之上、悬浮窗 UI 之下 —— 同一 overlay window
-    // (window 本身 Alert+100 已高于全部屏幕内容), 但插到悬浮球/面板的下层。
+    // 1.3.44: 窗口内 z 序是 [rootVC.view, 面板, 球] —— createPanel 先加面板(1018 行),
+    // 球在 createOverlayWindow 642 行后加 = 球是最顶层。取色点要压在全部悬浮窗 UI
+    // 之下 → 锚点必须是 _panelView(最底层 UI)。1.3.43 的 belowSubview:_ballView 锚在
+    // 最顶层球上 = 插到球下面/面板上面 —— 取色点仍浮在面板上的真正根因。
     // 命中测试按逆 z 序遍历, 准星未被面板盖住时触摸仍可命中(可拖动)。
-    if (_ballView) {
+    if (_panelView) {
+        [_overlayWindow insertSubview:_pickDotView belowSubview:_panelView];
+    } else if (_ballView) {
         [_overlayWindow insertSubview:_pickDotView belowSubview:_ballView];
     } else {
         [_overlayWindow insertSubview:_pickDotView atIndex:1];  // rootVC.view 之上
     }
+    vcam_ball_log([NSString stringWithFormat:
+        @"[vcam][light] pick dot z=%lu/%lu (below panel, ball on top)",
+        (unsigned long)[_overlayWindow.subviews indexOfObject:_pickDotView],
+        (unsigned long)_overlayWindow.subviews.count]);
 }
 
 - (void)hidePickDot {
@@ -1338,13 +1346,30 @@ static NSString *vcamLightColorName(uint32_t c) {
         }
     }
 
-    // 1.3.43 遮挡掩蔽: 采样点被悬浮球/面板盖住 → 本拍不检测不消费不写色,
+    // 1.3.44 遮挡掩蔽: 采样点被悬浮球/面板盖住 → 本拍不检测不消费不写色,
     // 保持上一检测色(光斑持续稳定)。面板 UI 像素(按钮按下高亮/颜色预览块/
     // 滑块)不再进入采样 —— 断开"预览块显示检测色 → 采到预览色"的自反馈环,
-    // 点击任何按键(含"复")都不影响已打到画面上的光。
+    // 点击任何按键(播/复/转/镜等)都不影响已打到画面上的光。
+    // 矩形外扩 5pt: 采样区为中心 21px(~7pt)见方, 外扩防面板边缘像素漏进采样。
+    // 节流日志(2s 一行)供部署后验证掩蔽确实在生效。
+    static double lastMaskLog = 0;
     CGPoint pickPt = CGPointMake(gVcamPick.px, gVcamPick.py);
-    if (_ballView && CGRectContainsPoint(_ballView.frame, pickPt)) return;
-    if (_panelView && !_panelView.hidden && CGRectContainsPoint(_panelView.frame, pickPt)) return;
+    BOOL pickMasked = NO;
+    if (_ballView && CGRectContainsPoint(CGRectInset(_ballView.frame, -5, -5), pickPt)) {
+        pickMasked = YES;
+    }
+    if (!pickMasked && _panelView && !_panelView.hidden &&
+        CGRectContainsPoint(CGRectInset(_panelView.frame, -5, -5), pickPt)) {
+        pickMasked = YES;
+    }
+    if (pickMasked) {
+        double nowMask = CFAbsoluteTimeGetCurrent();
+        if (nowMask - lastMaskLog > 2.0) {
+            lastMaskLog = nowMask;
+            vcam_ball_log(@"[vcam][light] sample masked (dot under UI), holding color");
+        }
+        return;
+    }
 
     if (gVcamPick.currentStrategy >= 0 && gVcamPick.threadAlive) {
         // ===== CARS 模式: 消费捕获线程结果 =====
