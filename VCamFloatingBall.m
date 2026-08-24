@@ -607,19 +607,15 @@ static void vcam_ball_log(NSString *msg) {
     [_lightPageView addSubview:_lightColorLabel];
 
     // 5 参数滑块行: 标题(56) + 滑块 + 值(42), 默认 强度30/直径48/X50/Y50/羽化100
+    // plist 已有值优先(跨进程持久化), 否则用默认值(getter 内置默认)
     CGFloat sliderX = pad + 56;
     CGFloat sliderW = contentW - 56 - 42;
     CGFloat sy = colorRowY + 22 + 8;
     CGFloat rowStep = 30 + 6;
-    struct LightRow { NSString *title; UISlider **slider; UILabel **value; SEL action; };
-    struct LightRow rows[] = {
-        {@"打光强度", &_lightIntensitySlider, &_lightIntensityValue, @selector(lightIntensityChanged:)},
-        {@"打光直径", &_lightDiameterSlider, &_lightDiameterValue, @selector(lightDiameterChanged:)},
-        {@"横坐标",   &_lightXSlider,        &_lightXValue,        @selector(lightXChanged:)},
-        {@"纵坐标",   &_lightYSlider,        &_lightYValue,        @selector(lightYChanged:)},
-        {@"边缘羽化", &_lightFeatherSlider,  &_lightFeatherValue,  @selector(lightFeatherChanged:)},
-    };
-    // plist 已有值优先(跨进程持久化), 否则用默认值
+    NSString *rowTitles[5] = {@"打光强度", @"打光直径", @"横坐标", @"纵坐标", @"边缘羽化"};
+    SEL rowActions[5] = {@selector(lightIntensityChanged:), @selector(lightDiameterChanged:),
+                         @selector(lightXChanged:), @selector(lightYChanged:),
+                         @selector(lightFeatherChanged:)};
     int initVals[5] = {
         [VCamNotify plistLightIntensity], [VCamNotify plistLightDiameter],
         [VCamNotify plistLightX], [VCamNotify plistLightY],
@@ -628,7 +624,7 @@ static void vcam_ball_log(NSString *msg) {
     for (int i = 0; i < 5; i++) {
         CGFloat ry = sy + rowStep * i;
         UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(pad, ry + 5, 56, 20)];
-        title.text = rows[i].title;
+        title.text = rowTitles[i];
         title.textColor = [UIColor colorWithRed:0.72 green:0.73 blue:0.75 alpha:1.0];
         title.font = [UIFont systemFontOfSize:12];
         [_lightPageView addSubview:title];
@@ -641,7 +637,7 @@ static void vcam_ball_log(NSString *msg) {
         if (v > 100) v = 100;
         slider.value = (float)v;
         slider.minimumTrackTintColor = [UIColor colorWithRed:0.55 green:0.56 blue:0.58 alpha:1.0];
-        [slider addTarget:self action:rows[i].action forControlEvents:UIControlEventValueChanged];
+        [slider addTarget:self action:rowActions[i] forControlEvents:UIControlEventValueChanged];
         [_lightPageView addSubview:slider];
 
         UILabel *val = [[UILabel alloc] initWithFrame:CGRectMake(pad + contentW - 42, ry + 5, 42, 20)];
@@ -651,8 +647,14 @@ static void vcam_ball_log(NSString *msg) {
         val.textAlignment = NSTextAlignmentRight;
         [_lightPageView addSubview:val];
 
-        *rows[i].slider = slider;
-        *rows[i].value = val;
+        // ARC 下不能把 __strong ivar 地址塞进数组 —— switch 直接赋值
+        switch (i) {
+            case 0: _lightIntensitySlider = slider; _lightIntensityValue = val; break;
+            case 1: _lightDiameterSlider = slider; _lightDiameterValue = val; break;
+            case 2: _lightXSlider = slider; _lightXValue = val; break;
+            case 3: _lightYSlider = slider; _lightYValue = val; break;
+            case 4: _lightFeatherSlider = slider; _lightFeatherValue = val; break;
+        }
     }
 
     // ===== 设置页 =====
