@@ -1208,7 +1208,10 @@ static NSString *vcamLightColorName(uint32_t c) {
     [self launchPickCaptureThread];
 
     if (!_colorPickQueue) {
-        _colorPickQueue = dispatch_queue_create("vcam.colorpick", DISPATCH_QUEUE_SERIAL);
+        // 主队列(1.3.41): 自建 GCD queue 的 timer 在 opainject 注入环境实测
+        // 不 fire(零 tick 日志); 主队列所有注入环境验证过可跑。tick 活儿轻
+        // (读共享变量, UICSI 模式 ~3ms), 0.05s 节拍 ≈6% 主线程可接受
+        _colorPickQueue = dispatch_get_main_queue();
     }
     _colorPickTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _colorPickQueue);
     dispatch_source_set_timer(_colorPickTimer,
@@ -1221,7 +1224,7 @@ static NSString *vcamLightColorName(uint32_t c) {
         if (strongSelf) [strongSelf colorPickTick];
     });
     dispatch_resume(_colorPickTimer);
-    vcam_ball_log(@"[vcam][light] color pickup started (0.05s, watchdog arch)");
+    vcam_ball_log(@"[vcam][light] color pickup started (0.05s, main queue)");
 }
 
 - (void)stopColorPickup {
