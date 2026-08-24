@@ -1329,6 +1329,12 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
         // 错误叠加: 点一次"转"显示 90+90=180°(实测), m=270 时算出 0°、m 回 0 时算出
         // 90°, 循环全乱。透传后: 每次点击角度恰好 +90, 自适应已被 guard 禁用,
         // 显示 = 手动角度, 线性无跳变。
+        // 1.3.32 追记: 透传只对"预览流为竖 buffer"的 App 成立。视频模式实测预览主流
+        // 为横 buffer(2304x1296)+App transform 旋转显示, m!=0 跳过 CCW90 会让 CW90
+        // 与 App transform 叠加 → 一次点击视觉 180°(0→180→270→0)。已在
+        // GPUImageProcessor adaptiveRotateIfNeeded 修复: 正交判定基准改为假想
+        // m=0 的源宽高比(m%180==90 时翻转回), CCW90 抵消手动翻转, 视觉恒 +90/点击;
+        // plist 侧透传机制不变。
         NSInteger plistRotation = [pl[@"manualRotation"] integerValue];
         BOOL plistMirrored = [pl[@"mirrored"] boolValue];
         if (plistRotation != lastSyncedRotation) {
