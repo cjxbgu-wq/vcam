@@ -317,6 +317,26 @@ static void vcamYuvSplitDisable(uint32_t fmt) {
     }
 }
 
+// 直转快路径 memo(2026-08-24 视频模式帧率优化, 进程级 per-format):
+// 0=未探测(允许首试) 1=YUV→私有直转可用(恒走直转) -1=永久回退两步法。
+// 拆段 v3 同款模式: 首帧真实 dst 试跑, 失败零重试(此后零日志零开销)。
+static uint32_t gVcamYuvDirectFmt[4] = {0, 0, 0, 0};
+static int8_t gVcamYuvDirectOk[4] = {0, 0, 0, 0};
+static int8_t vcamYuvDirectState(uint32_t fmt) {
+    for (int i = 0; i < 4; i++) {
+        if (gVcamYuvDirectFmt[i] == fmt) return gVcamYuvDirectOk[i];
+    }
+    return 0;  // 未登记: 允许首试
+}
+static void vcamYuvDirectSet(uint32_t fmt, int8_t ok) {
+    for (int i = 0; i < 4; i++) {
+        if (gVcamYuvDirectFmt[i] == fmt) { gVcamYuvDirectOk[i] = ok; return; }
+    }
+    for (int i = 0; i < 4; i++) {
+        if (gVcamYuvDirectFmt[i] == 0) { gVcamYuvDirectFmt[i] = fmt; gVcamYuvDirectOk[i] = ok; return; }
+    }
+}
+
 // 车道熔断 memo: 热路径零装箱查表; 熔断写入时刷新对应槽
 static uint32_t gVcamLaneMemoFmt[4] = {0, 0, 0, 0};
 static BOOL gVcamLaneMemoOff[4] = {NO, NO, NO, NO};
@@ -1837,6 +1857,43 @@ static void vcamClearBiPlanarBlack(CVPixelBufferRef buf, OSType fmt) {
                 VTSessionSetProperty(_privateTransferSession, CFSTR("ScalingMode"), CFSTR("Trim"));
                 VTSessionSetProperty(_privateTransferSession, CFSTR("RealTime"), kCFBooleanTrue);
                 vcam_gpu_log(@"[vcam] Lane S2(private) session created (Trim)");
+            }
+        }
+
+        // ===== 直转快路径(2026-08-24 视频模式帧率优化): YUV 源 → 私有格式一步直转 =====
+        // 设备遥测实证: p420 流 420f→p420 直转仅 ~2.8ms/3MP, 而下方两步法
+        // 420f→BGRA(2MP 源尺寸 RGB 中转 ~13ms)+BGRA→私有(3MP 缩放 ~8ms) 合计
+        // ~21ms/帧 —— |xv0/-8f0 流被 BGRA 中转吃掉近半 CPU(EMA 72-83% 触发
+        // 紧急节流 20fps, 每秒丢 4 帧 = 视频模式卡顿掉帧主因)。
+        // 约束: 私有格式写入须有尺寸差(同尺寸 -12905, 1.3.7 BGRA 实证),
+        // 预渲染源(2MP 级)与相机流目标(≥2.5MP)天然满足; 源须 YUV planar。
+        // 千面 0xb0f8 同款直转架构; YUV range/矩阵 attachments 全程保留,
+        // 无 BGRA 中转的高光洗白风险。首帧真实 dst 试跑(拆段 v3 同款):
+        // 成功 memo=1 此后恒走直转(零 BGRA staging 零中转); 失败 memo=-1
+        // 永久回退两步法(同帧内完成, fence 顺序化无闪烁)。
+        {
+            OSType srcFmtD = CVPixelBufferGetPixelFormatType(src);
+            BOOL srcYuvPlanar = (srcFmtD == '420f' || srcFmtD == '420v' ||
+                                 srcFmtD == 0x70343230);
+            if (srcYuvPlanar && (srcW != dstW || srcH != dstH) &&
+                vcamYuvDirectState(dstFormat) >= 0 && _privateTransferSession) {
+                int8_t prevState = vcamYuvDirectState(dstFormat);
+                OSStatus stD = VTPixelTransferSessionTransferImage(_privateTransferSession, src, dst);
+                if (stD == noErr) {
+                    if (prevState == 0) {
+                        vcamYuvDirectSet(dstFormat, 1);
+                        vcam_gpu_log([NSString stringWithFormat:
+                            @"[vcam] lane direct YUV->0x%x OK (fast path, BGRA detour skipped)",
+                            (unsigned)dstFormat]);
+                    }
+                    [self noteStreamRenderFmt:(uint32_t)dstFormat w:(uint32_t)dstW h:(uint32_t)dstH pixels:(uint64_t)dstW * dstH];
+                    [_laneLockPrivate unlock];
+                    return YES;
+                }
+                vcamYuvDirectSet(dstFormat, -1);
+                vcam_gpu_log([NSString stringWithFormat:
+                    @"[vcam] lane direct YUV->0x%x failed (%d), fallback two-step",
+                    (unsigned)dstFormat, (int)stD]);
             }
         }
         // staging 按源尺寸缓存(2026-08-19 交替重建风暴修复): 源有 2 种尺寸并存
