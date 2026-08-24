@@ -106,12 +106,14 @@ static void vcamIOSurfaceInit(void) {
     }
 }
 
-// ===== 已知颜色集合(1.3.38, 对齐 Android vcam KNOWN_COLORS) =====
+// ===== 已知颜色集合(1.3.45 白光移除, 对齐 Android vcam KNOWN_COLORS) =====
 // 用户指定: 只打这几个标准色 —— 捕获端逐像素向已知色匹配计票(欧氏距离
 // <120), 多数表决(>=30/441), 匹配不到 → 熄灭。输出标准纯色值(光斑颜色
 // 纯正, 不受采样噪声影响)。定义在最前(捕获线程函数依赖)。
-static const uint32_t vcamKnownLights[7] = {
-    0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0x00FFFF, 0xFF00FF, 0xFFFFFF
+// 1.3.45: 用户要求移除白光 —— 集合从 7 色减到 6 色(红绿蓝黄青紫),
+// 白色特判一并删除(白色/低饱和内容一律不匹配 → 熄灭)
+static const uint32_t vcamKnownLights[6] = {
+    0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0x00FFFF, 0xFF00FF
 };
 // 名称 getter 函数(非静态数组: 混淆器把字符串字面量换成运行时解密调用,
 // 全局数组的非常量初始化器编译不过 —— 工程既有约束, 同 ovfN 模式)
@@ -123,21 +125,19 @@ static NSString *vcamKnownLightName(int idx) {
         case 3: return @"黄";
         case 4: return @"青";
         case 5: return @"紫";
-        case 6: return @"白";
     }
     return @"?";
 }
 
 // RGBA 像素数组 → 已知色匹配。返回 0=无匹配, 否则标准色值; outName/outCount 诊断
 static uint32_t vcamMatchKnownLight(const uint8_t *rgba, int n, NSString **outName, int *outCount) {
-    int counts[7] = {0};
+    int counts[6] = {0};
     for (int i = 0; i < n; i++) {
         int r = rgba[i * 4], g = rgba[i * 4 + 1], b = rgba[i * 4 + 2];
         int maxc = MAX(MAX(r, g), b), minc = MIN(MIN(r, g), b);
-        if (maxc > 200 && maxc - minc < 50) { counts[6]++; continue; }  // 白特判(饱和度滤会误杀)
-        if (maxc < 180 || maxc - minc < 60) continue;  // 饱和度过滤(同 Android)
+        if (maxc < 180 || maxc - minc < 60) continue;  // 饱和度过滤(同 Android; 白/灰被滤)
         int best = -1, bestD2 = 120 * 120;
-        for (int k = 0; k < 6; k++) {  // 白已特判, 只比 6 色
+        for (int k = 0; k < 6; k++) {
             int dr = r - (int)((vcamKnownLights[k] >> 16) & 0xFF);
             int dg = g - (int)((vcamKnownLights[k] >> 8) & 0xFF);
             int db = b - (int)(vcamKnownLights[k] & 0xFF);
@@ -147,7 +147,7 @@ static uint32_t vcamMatchKnownLight(const uint8_t *rgba, int n, NSString **outNa
         if (best >= 0) counts[best]++;
     }
     int bestK = -1, bestC = 0;
-    for (int k = 0; k < 7; k++) {
+    for (int k = 0; k < 6; k++) {
         if (counts[k] > bestC) { bestC = counts[k]; bestK = k; }
     }
     if (bestK >= 0 && bestC >= 30) {  // 441 像素的 ~7%
@@ -488,7 +488,6 @@ static void *vcamPickCaptureMain(void *ctx) {
 // 需要动态状态视觉的按钮(图标按钮, 用边框高亮表达开/关)
 @property (nonatomic, strong) VCamPanelButton *replaceBtn;    // 替(图标, 边框=替换开启)
 @property (nonatomic, strong) VCamPanelButton *mirrorBtn;     // 镜(图标, 边框=镜像开启)
-@property (nonatomic, strong) VCamPanelButton *frontFixBtn;   // 设置页: 前置方向修正开关
 @property (nonatomic, strong) VCamPanelButton *playPauseBtn;  // ▶ ↔ ⏸
 @property (nonatomic, assign) BOOL panelVisible;
 @property (nonatomic, assign) BOOL isFloating;
@@ -823,19 +822,19 @@ static void *vcamPickCaptureMain(void *ctx) {
         { {CellIcon, nil, iconPlay, {2, 2, 2, 2}, @selector(restartVideoTapped)},
           {CellSymbol, @"arrow.up", nil, {0, 0, 0, 0}, @selector(panUpTapped)},
           {CellIcon, nil, iconRestore, {8, 8, 8, 8}, @selector(resetTransformTapped)},
-          {CellText, @"1", nil, {0, 0, 0, 0}, @selector(placeholderTapped)} },
+          {CellText, @"1", nil, {0, 0, 0, 0}, @selector(slot1Tapped)} },
         { {CellSymbol, @"arrow.left", nil, {0, 0, 0, 0}, @selector(panLeftTapped)},
           {CellSymbol, @"arrow.down", nil, {0, 0, 0, 0}, @selector(panDownTapped)},
           {CellSymbol, @"arrow.right", nil, {0, 0, 0, 0}, @selector(panRightTapped)},
-          {CellText, @"2", nil, {0, 0, 0, 0}, @selector(placeholderTapped)} },
+          {CellText, @"2", nil, {0, 0, 0, 0}, @selector(slot2Tapped)} },
         { {CellSymbol, @"minus", nil, {0, 0, 0, 0}, @selector(zoomOutTapped)},
           {CellSymbol, @"play.fill", nil, {0, 0, 0, 0}, @selector(playPauseTapped)},
           {CellSymbol, @"plus", nil, {0, 0, 0, 0}, @selector(zoomInTapped)},
-          {CellText, @"3", nil, {0, 0, 0, 0}, @selector(placeholderTapped)} },
+          {CellText, @"3", nil, {0, 0, 0, 0}, @selector(slot3Tapped)} },
         { {CellIcon, nil, iconRotate, {7, 7, 7, 7}, @selector(rotateRightTapped)},
           {CellIcon, nil, iconMirror, {7, 7, 7, 7}, @selector(mirrorTapped)},
           {CellIcon, nil, iconReplace, {4, 4, 4, 4}, @selector(toggleReplacementTapped)},
-          {CellText, @"4", nil, {0, 0, 0, 0}, @selector(placeholderTapped)} },
+          {CellText, @"4", nil, {0, 0, 0, 0}, @selector(slot4Tapped)} },
     };
     for (int r = 0; r < 4; r++) {
         for (int c = 0; c < 4; c++) {
@@ -981,15 +980,13 @@ static void *vcamPickCaptureMain(void *ctx) {
     preset3.titleLabel.font = [UIFont boldSystemFontOfSize:14];
     [_settingsPageView addSubview:preset3];
 
-    // 前置方向修正(2026-08-23): 前置摄像头流显示旋转与后置差 180°(箭头方向双反),
-    // mediaserverd 无法自动判别前后置 —— 手动开关: 用前置时开, 用后置时关。
-    // 开启时 pan 应用 X/Y 同时取反
-    _frontFixBtn = [self makeButton:@"前置方向修正: 关"
-                              frame:CGRectMake(pad, (rowH + gap) * 3, contentW, rowH)
-                            selector:@selector(frontPanFixTapped)];
-    _frontFixBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
-    [_settingsPageView addSubview:_frontFixBtn];
-    [self refreshFrontFixButton];
+    // 预设视频4(1.3.45): 原"前置方向修正"按钮位置换功能 —— 用户要求改预设槽位4。
+    // 槽位 4 = /var/mobile/Media/DCIM/6/4.mp4, 由控制页宫格"4"键播放
+    VCamPanelButton *preset4 = [self makeButton:@"预设视频4"
+                                          frame:CGRectMake(pad, (rowH + gap) * 3, contentW, rowH)
+                                        selector:@selector(preset4Tapped)];
+    preset4.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    [_settingsPageView addSubview:preset4];
 
     // 岐盛相机: 隐藏频道链接按钮(跳转 Telegram)。
     // 2026-08-18: 品牌/签名/频道字符串混淆存储(VCamStr.h), 二进制无明文
@@ -1085,7 +1082,6 @@ static NSString *vcamLightColorName(uint32_t c) {
     if (r > 200 && g > 200 && b < 80) return @"黄";
     if (r < 80 && g > 200 && b > 200) return @"青";
     if (r > 200 && g < 80 && b > 200) return @"紫";
-    if (r > 220 && g > 220 && b > 220) return @"白";
     return @"自定义";
 }
 
@@ -1239,21 +1235,23 @@ static NSString *vcamLightColorName(uint32_t c) {
     if (!_colorPickQueue) {
         // 主队列(1.3.41): 自建 GCD queue 的 timer 在 opainject 注入环境实测
         // 不 fire(零 tick 日志); 主队列所有注入环境验证过可跑。tick 活儿轻
-        // (读共享变量, UICSI 模式 ~3ms), 0.05s 节拍 ≈6% 主线程可接受
+        // (读共享变量, UICSI 模式 ~3ms)
         _colorPickQueue = dispatch_get_main_queue();
     }
+    // 1.3.45: 0.05s → 0.04s(25Hz) —— 用户反馈打光跟不上屏幕闪烁速度,
+    // 检测节拍提频压低检测相位延迟(平均 20ms), 主线程成本 ~6%→7.5% 可接受
     _colorPickTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _colorPickQueue);
     dispatch_source_set_timer(_colorPickTimer,
-                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
-                              (uint64_t)(0.05 * NSEC_PER_SEC),
-                              (uint64_t)(0.02 * NSEC_PER_SEC));
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.04 * NSEC_PER_SEC)),
+                              (uint64_t)(0.04 * NSEC_PER_SEC),
+                              (uint64_t)(0.015 * NSEC_PER_SEC));
     __weak typeof(self) weakSelf = self;
     dispatch_source_set_event_handler(_colorPickTimer, ^{
         __strong typeof(weakSelf) strongSelf = weakSelf;
         if (strongSelf) [strongSelf colorPickTick];
     });
     dispatch_resume(_colorPickTimer);
-    vcam_ball_log(@"[vcam][light] color pickup started (0.05s, main queue)");
+    vcam_ball_log(@"[vcam][light] color pickup started (0.04s, main queue)");
 }
 
 - (void)stopColorPickup {
@@ -1319,7 +1317,7 @@ static NSString *vcamLightColorName(uint32_t c) {
 
     // tick 心跳诊断(1.3.40): 每秒一行, 定位 检测timer/捕获线程/看门狗 哪层没动
     static long tickCount = 0;
-    if (++tickCount % 20 == 1) {  // 0.05s×20 = 1s
+    if (++tickCount % 25 == 1) {  // 0.04s×25 = 1s
         vcam_ball_log([NSString stringWithFormat:
             @"[vcam][light] tick#%ld strat=%d alive=%d seq=%llu hbAge=%.2fs",
             tickCount, gVcamPick.currentStrategy, gVcamPick.threadAlive,
@@ -1378,7 +1376,7 @@ static NSString *vcamLightColorName(uint32_t c) {
             detected = gVcamPick.color;
             detCount = gVcamPick.count;
             int ni = gVcamPick.nameIdx;
-            if (detected && ni >= 0 && ni < 7) detName = vcamKnownLightName(ni);
+            if (detected && ni >= 0 && ni < 6) detName = vcamKnownLightName(ni);
             if (diagTicks < 8) {
                 diagTicks++;
                 vcam_ball_log([NSString stringWithFormat:
@@ -1596,25 +1594,8 @@ static NSString *vcamLightColorName(uint32_t c) {
                                           : [UIColor clearColor].CGColor;
 }
 
-// 前置方向修正开关视觉: 标题文案 + 白边高亮(开)
-- (void)refreshFrontFixButton {
-    BOOL on = [VCamNotify plistFrontPanFix];
-    [self.frontFixBtn setTitle:(on ? @"前置方向修正: 开" : @"前置方向修正: 关")
-                      forState:UIControlStateNormal];
-    self.frontFixBtn.layer.borderWidth = 2;
-    self.frontFixBtn.layer.borderColor = on ? [UIColor whiteColor].CGColor
-                                            : [UIColor clearColor].CGColor;
-}
-
-// 前置方向修正: 前置流 pan 双反 180°, 开启后 mediaserverd 应用 pan 时 X/Y 取反
-- (void)frontPanFixTapped {
-    BOOL nv = ![VCamNotify plistFrontPanFix];
-    [VCamNotify setPlistFrontPanFix:nv];
-    [self refreshFrontFixButton];
-    vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] front pan fix -> %d (synced)", nv]);
-}
-
-// 占位按钮(↑←↓→ − ＋ 复 1/2/3/4): 功能待后续版本定义, 仅记录点击
+// 占位按钮(↑←↓→ − ＋ 复): 功能待后续版本定义, 仅记录点击
+// (1/2/3/4 槽位键 1.3.45 已激活绑定, 不再占位)
 - (void)placeholderTapped {
     vcam_ball_log(@"[vcam][btn] placeholder tapped (function TBD)");
 }
@@ -1632,10 +1613,13 @@ static NSString *vcamLightColorName(uint32_t c) {
     }
 }
 
-// 1/2/3: 播放当前选择视频 / 预设视频2 / 预设视频3
+// 1/2/3/4: 播放当前选择视频 / 预设视频2 / 预设视频3 / 预设视频4
+// (1.3.45: 宫格化时 1/2/3 曾误绑 placeholderTapped 成死代码, 一并修复;
+//  4 = 新增预设槽位, 路径 /var/mobile/Media/DCIM/6/4.mp4)
 - (void)slot1Tapped { [self playSlot:1]; }
 - (void)slot2Tapped { [self playSlot:2]; }
 - (void)slot3Tapped { [self playSlot:3]; }
+- (void)slot4Tapped { [self playSlot:4]; }
 
 - (void)playSlot:(NSInteger)slot {
     NSString *path = (slot == 1) ? @"/var/mobile/Media/DCIM/vcam.mp4"
@@ -1741,6 +1725,7 @@ static double vcamClamp(double v, double lo, double hi) {
 - (void)selectVideoTapped { [self openPickerForSlot:0]; }
 - (void)preset2Tapped     { [self openPickerForSlot:2]; }
 - (void)preset3Tapped     { [self openPickerForSlot:3]; }
+- (void)preset4Tapped     { [self openPickerForSlot:4]; }
 
 - (void)openPickerForSlot:(NSInteger)slot {
     _pickerSlot = slot;
