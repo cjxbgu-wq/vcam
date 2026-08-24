@@ -68,6 +68,7 @@ static void vcam_ball_log(NSString *msg) {
 #include <dlfcn.h>
 #include <pthread.h>
 #import <mach/mach.h>
+#import <objc/runtime.h>
 
 typedef CGImageRef (*VcamUICreateScreenImageFn)(void);
 typedef struct __VcamIOSurface *VcamIOSurfaceRef;
@@ -1165,26 +1166,39 @@ static NSString *vcamLightColorName(uint32_t c) {
 }
 
 // 启动捕获线程(按未失败策略; 全失败 → UICSI 回退模式由检测 timer 直接跑)
+// 1.3.42 止血: CARS 全策略在这台设备实证不可用 —— bootstrap port 策略在
+// launchdhook 注入环境 SIGSEGV 杀 SB(11s 崩溃循环 = Safe Mode 反复弹窗),
+// SBS port 策略阻塞/随机崩(1.3.38), MACH_PORT_NULL 直接崩(1.3.38 首发实证)。
+// 彻底禁用 CARS(全策略标记失败), 检测走 UICSI(实测稳定不崩)。
 - (void)launchPickCaptureThread {
-    int next = -1;
     for (int i = 0; i < kVcamPickStrategyCount; i++) {
-        if (!gVcamPickStrategyFailed[i]) { next = i; break; }
+        gVcamPickStrategyFailed[i] = YES;
     }
-    gVcamPick.currentStrategy = next;
-    gVcamPick.heartbeat = CFAbsoluteTimeGetCurrent();
-    if (next >= 0) {
-        gVcamPick.threadAlive = 1;
-        pthread_t t;
-        pthread_attr_t attr;
-        pthread_attr_init(&attr);
-        pthread_attr_setstacksize(&attr, 256 * 1024);
-        pthread_create(&t, &attr, vcamPickCaptureMain, (void *)(intptr_t)next);
-        pthread_detach(t);
-        vcam_ball_log([NSString stringWithFormat:
-            @"[vcam][light] capture thread launched (strategy=%d)", next]);
-    } else {
-        vcam_ball_log(@"[vcam][light] all CARS strategies dead, UICSI fallback mode");
+    gVcamPick.currentStrategy = -1;
+    gVcamPick.threadAlive = 0;
+    // 一次性侦查(为下轮找正确截屏 API): dump 运行时类名含关键词的类
+    static int reconDumped = 0;
+    if (!reconDumped) {
+        reconDumped = 1;
+        unsigned int clsCount = 0;
+        Class *classes = objc_copyClassList(&clsCount);
+        if (classes) {
+            NSMutableArray *hits = [NSMutableArray array];
+            for (unsigned int i = 0; i < clsCount; i++) {
+                const char *n = class_getName(classes[i]);
+                if (!n) continue;
+                NSString *name = [NSString stringWithUTF8String:n];
+                if ([name containsString:@"creenshot"] || [name containsString:@"apture"]) {
+                    [hits addObject:name];
+                    if (hits.count >= 40) break;
+                }
+            }
+            free(classes);
+            vcam_ball_log([NSString stringWithFormat:
+                @"[vcam][light] class recon: %@", hits]);
+        }
     }
+    vcam_ball_log(@"[vcam][light] CARS disabled (device-incompatible), UICSI mode");
 }
 
 // 检测 timer(0.05s, 后台串行队列): 消费捕获线程结果 + 看门狗 + UICSI 回退
