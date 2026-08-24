@@ -632,20 +632,24 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                     double pct = delta / (nowT - lastCpuSample) * 100.0;
                     emaPct = emaInit ? (emaPct * 0.5 + pct * 0.5) : pct;  // 0.6/0.4→0.5/0.5 更灵敏
                     emaInit = YES;
-                    // 进入快(2s)/退出慢(10s): 2026-08-18 重构 —— 旧 8s 进入 hold
-                    // 在启动风暴里形同虚设(6 秒内死 3 次); 退出放慢防振荡
-                    BOOL minHoldOk = (nowT - lastModeSwitch) > (lowPower ? 10.0 : 2.0);
-                    // 硬闸: EMA>110% = 逼近 2 核, 无视 hold 立即压(秒级尖峰也杀进程)
-                    BOOL hardTrip = (emaPct > 110.0);
+                    // 进入快(2s)/退出 hold 5s(1.3.36 卡顿修复): 旧 10s 保持期让
+                    // 短活跃窗口(切模式/速览, 实测 8s)整窗被压 20fps 从未退出;
+                    // 退出后 6s exitCooldown 防横跳仍在, 5s+6s 振荡周期可接受
+                    BOOL minHoldOk = (nowT - lastModeSwitch) > (lowPower ? 5.0 : 2.0);
                     // 会话豁免(2026-08-20 首开卡顿修复): 相机会话起点(render 心跳
                     // 中断>2s 后恢复 = 热进程首开/空闲重开/切App)后 8s 内, EMA>72
                     // 不进降载 —— 相机启动风暴(管线init+媒体重载+预填+各流首帧建槽)
                     // 是一次性成本, 压内容帧率对 CPU 峰值帮助有限, 却让用户看到
-                    // "开头掉帧卡顿"(24fps 压 20fps 每秒丢4帧)再熬 10s 保持期才退出
-                    // = "过一段时间才稳定流畅"。hardTrip(>110)仍立即压(真失控保命);
-                    // 8s 后闭环正常接管(持续真过载仍会降载)
+                    // "开头掉帧卡顿"(24fps 压 20fps 每秒丢4帧)再熬保持期才退出
+                    // = "过一段时间才稳定流畅"。8s 后闭环正常接管(持续真过载仍会降载)
                     BOOL sessionExempt = (self->_camSessionStart > 0 &&
                                           (nowT - self->_camSessionStart) < 8.0);
+                    // 硬闸: EMA>110% = 逼近 2 核, 无视 hold 立即压(秒级尖峰也杀进程)。
+                    // 豁免期内阈值放宽到 170%(1.3.36 卡顿修复): resume/首开风暴
+                    // (解码器异步重载+帧预填+建槽叠加)1-2s 内 EMA 实测冲 124%,
+                    // 180s 均值配额吃得下; 旧 110 绕过豁免立即压 → 切模式短窗口
+                    // 全程 20fps 卡顿。真失控(接近 2 核满载)豁免期内仍立即压
+                    BOOL hardTrip = (emaPct > (sessionExempt ? 170.0 : 110.0));
                     // 退出后再进冷却(见 lastThrottleExit 声明): OFF 后 6s 稳定窗
                     BOOL exitCooldownOk = (lastThrottleExit == 0 ||
                                            (nowT - lastThrottleExit) > 6.0);
