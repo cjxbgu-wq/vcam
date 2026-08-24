@@ -1433,6 +1433,8 @@ static void vcamClearBiPlanarBlack(CVPixelBufferRef buf, OSType fmt) {
 
 // render 路径用: 自适应正交旋转 —— 源/目标宽高比正交(一横一竖)时 CCW90 旋转
 // (宽高互换, 保持源格式), 预览流(竖向)与拍照/录像流(横向)各自正确方向。
+// 手动旋转(m!=0)时同样参与正交判定(基准见下), CCW90 抵消手动旋转带来的宽高
+// 翻转 —— 保证"转"按钮每次点击视觉恰好 +90°。
 // token = 帧代数: 同一帧被相机多条流渲染时只 CCW90 一次, 后续流直接复用缓存
 // (每流省一次 VT rotate ~2-4ms, 多流场景 CPU 大降)。传 0 = 不缓存。
 - (CVPixelBufferRef)adaptiveRotateIfNeeded:(CVPixelBufferRef)src
@@ -1440,8 +1442,7 @@ static void vcamClearBiPlanarBlack(CVPixelBufferRef buf, OSType fmt) {
                               targetHeight:(size_t)targetH
                                      token:(uint64_t)token CF_RETURNS_RETAINED {
     if (!src) return NULL;
-    if (_rotationAngle != 0 || !_rotationApiAvailable || !_renderRotationSession) {
-        // 用户已手动旋转(预渲染已应用)或 API 不可用
+    if (!_rotationApiAvailable || !_renderRotationSession) {
         return (CVPixelBufferRef)CVPixelBufferRetain(src);
     }
 
@@ -1451,8 +1452,24 @@ static void vcamClearBiPlanarBlack(CVPixelBufferRef buf, OSType fmt) {
         return (CVPixelBufferRef)CVPixelBufferRetain(src);
     }
 
+    // 正交判定基准 = 假想 manualRotation=0 的源宽高比(2026-08-24 修复视频模式
+    // 点"转"直接 180°): 手动角度 90/270 时预渲染已把宽高比翻转, 判定前翻回。
+    // 旧行为(m!=0 直接跳过 CCW90)在"预览流为横 buffer + App 固定 transform 旋转
+    // 显示"的相机(视频模式主流 2304x1296 横向)下: m=0 时 CCW90 与 App transform
+    // 抵消显示正常, 点转后 CW90 与 App transform 同向叠加 → 视觉 180°
+    // (实测序列 0→180→270→0, 90° 状态不存在)。基准统一后 CCW90 恰好抵消手动
+    // 旋转的宽高翻转: 预览显示角 = m, 每次点击视觉 +90°; 且预览(数据+T_app)与
+    // 录像回放(数据+文件 transform)方向天然一致, 不会预览/录制分裂。
+    int manualRot = _rotationAngle % 360;
+    if (manualRot < 0) manualRot += 360;
+    size_t baseW = srcW, baseH = srcH;
+    if (manualRot % 180 == 90) {
+        baseW = srcH;
+        baseH = srcW;
+    }
+
     // 源/目标宽高比正交(一横一竖) -> CCW90
-    double srcRatio = (double)srcW / (double)srcH;
+    double srcRatio = (double)baseW / (double)baseH;
     double dstRatio = (double)targetW / (double)targetH;
     BOOL orthogonal = (srcRatio > 1.0 && dstRatio < 1.0) || (srcRatio < 1.0 && dstRatio > 1.0);
     if (!orthogonal) {
