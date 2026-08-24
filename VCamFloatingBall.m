@@ -812,13 +812,14 @@ static void vcam_ball_log(NSString *msg) {
 
 #pragma mark - 用户画面变换(箭头/＋/−/复, 1.3.30)
 // 语义: 箭头移动替换后的画面 —— 不需要先放大, 未放大也可自由移动,
-// 画面移出的区域显示黑色; ＋放大/−缩小(0.5..4.0, 每次固定 5%, 缩小时四周露黑边);
+// 画面移出的区域显示黑色; ＋放大/−缩小(0.5..4.0, 每次固定 10%, 缩小时四周露黑边);
 // 复还原为未移动未缩放的原始画面。
 // 通道: vc.plist userPanX/userPanY/userZoom → mediaserverd 轮询同步到 GPU 管线
 // (预渲染黑底画布合成, 方向为屏幕语义: panX 正=画面右移, panY 正=画面下移)
 static const double kVcamPanStep   = 0.05;   // 每次点击移动 5% 源宽(对齐安卓统一基数)
-static const double kVcamZoomFactor = 1.05;  // 每次点击相对缩放 5%(乘法步进: 感知等幅,
-                                             // 加法步进在高倍率时相对变化衰减 → "越放大越少")
+static const double kVcamZoomFactor = 1.10;  // 每次点击相对缩放 10%(1.3.34 用户要求
+                                             // 步进 x2: 原 5% 太小; 仍用乘法步进保持
+                                             // 高倍率时感知等幅)
 static const double kVcamZoomMin  = 0.5;     // 最小缩小到一半(四周黑边)
 static const double kVcamZoomMax  = 4.0;
 
