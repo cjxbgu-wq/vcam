@@ -54,22 +54,46 @@ static void vcam_ball_log(NSString *msg) {
     } @catch (NSException *e) {}
 }
 
-// iOS 私有截屏(录屏类 tweak 经典方案): SpringBoard 系统进程内可用,
-// 返回全屏 CGImageRef(含前台 App 画面), 数据行 0 = 屏幕顶行。
-// 必须用 dlsym 运行时解析(VTPixelRotationSession 同款防御模式):
-// extern 直接链接会在加载期绑定符号(chained fixups), 设备 UIKitCore
-// 若未导出 → 整个 dylib 被 dyld 拒载(1.3.37 首发实证: SB/mediaserverd
-// 全部功能丢失无崩溃)。dlsym 失败只影响打光检测, 日志可诊断。
+// iOS 私有截屏探测(1.3.37b): 设备实证 UIGetScreenImage dlsym=NULL(符号已被
+// 移除), extern 直接链接更会导致整个 dylib 被 dyld 拒载(chained fixups
+// 加载期绑定失败)。截屏多路径探测:
+//   路径 A: dlsym 私有符号候选(UIGetScreenImage/_UIGetScreenImage/UICreateScreenImage)
+//   路径 B: UIScreen snapshotViewAfterScreenUpdates + CALayer renderInContext
+//           (公开 API 组合, 零符号风险; SB 进程内快照为显示合成内容)
+//   路径 C: SBScreenShotter 类探测 + 方法列表 dump(诊断, 下轮精准接入)
+// 首拍探测结果写日志, 前 8 拍写采样诊断(亮度/有效像素)。
 #include <dlfcn.h>
+#import <objc/runtime.h>
 typedef CGImageRef (*VcamUIGetScreenImageFn)(void);
 static VcamUIGetScreenImageFn vcamUIGetScreenImage(void) {
     static VcamUIGetScreenImageFn fn = NULL;
     static int probed = 0;
     if (!probed) {
         probed = 1;
-        fn = (VcamUIGetScreenImageFn)dlsym(RTLD_DEFAULT, "UIGetScreenImage");
-        vcam_ball_log([NSString stringWithFormat:
-            @"[vcam][light] UIGetScreenImage dlsym = %@", fn ? @"OK" : @"NULL (capture unavailable)"]);
+        const char *cands[] = {"UIGetScreenImage", "_UIGetScreenImage", "UICreateScreenImage"};
+        for (int i = 0; i < 3 && !fn; i++) {
+            fn = (VcamUIGetScreenImageFn)dlsym(RTLD_DEFAULT, cands[i]);
+            if (fn) {
+                vcam_ball_log([NSString stringWithFormat:
+                    @"[vcam][light] capture symbol hit: %s", cands[i]]);
+            }
+        }
+        if (!fn) vcam_ball_log(@"[vcam][light] capture symbols all NULL, fallback snapshotView path");
+        // 一次性诊断: SBScreenShotter 可用方法 dump(若类存在)
+        Class shotCls = NSClassFromString(@"SBScreenShotter");
+        if (shotCls) {
+            unsigned int mc = 0;
+            Method *ms = class_copyMethodList(shotCls, &mc);
+            NSMutableArray *names = [NSMutableArray array];
+            for (unsigned int i = 0; i < mc && i < 20; i++) {
+                [names addObject:NSStringFromSelector(method_getName(ms[i]))];
+            }
+            free(ms);
+            vcam_ball_log([NSString stringWithFormat:
+                @"[vcam][light] SBScreenShotter methods: %@", names]);
+        } else {
+            vcam_ball_log(@"[vcam][light] SBScreenShotter class not found");
+        }
     }
     return fn;
 }
@@ -883,12 +907,12 @@ static NSString *vcamLightColorName(uint32_t c) {
     }
 }
 
-// 检测线程: 0.1s 节拍 serial queue(独立于主线程, 截屏+采样不卡 UI)
+// 检测线程: 0.1s 节拍。挂主队列 —— 路径 B(UIScreen snapshotView/renderInContext)
+// 是 UIKit API 必须主线程; 每拍 44x44 小区域渲染 + 441 像素采样 ~3-5ms,
+// 0.1s 间隔 ≈ 3-5% 主线程占用(仅取色模式开启期间)可接受
 - (void)startColorPickup {
     if (_colorPickTimer) return;
-    if (!_colorPickQueue) {
-        _colorPickQueue = dispatch_queue_create("vcam.colorpick", DISPATCH_QUEUE_SERIAL);
-    }
+    _colorPickQueue = dispatch_get_main_queue();
     _colorPickTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _colorPickQueue);
     dispatch_source_set_timer(_colorPickTimer,
                               dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
@@ -900,7 +924,7 @@ static NSString *vcamLightColorName(uint32_t c) {
         if (strongSelf) [strongSelf colorPickTick];
     });
     dispatch_resume(_colorPickTimer);
-    vcam_ball_log(@"[vcam][light] color pickup timer started (0.1s)");
+    vcam_ball_log(@"[vcam][light] color pickup timer started (0.1s, main queue)");
 }
 
 - (void)stopColorPickup {
@@ -912,10 +936,10 @@ static NSString *vcamLightColorName(uint32_t c) {
 }
 
 // 检测一拍(复刻 Android onImageAvailable 采样算法):
-// UIGetScreenImage 全屏 → UIGraphicsImageRenderer 只重绘取色点周围 44x44pt
-// (UIKit 坐标方向安全) → 中心 21x21px 采样 → 饱和度过滤(max>180 且 max-min>60)
-// → RGB 量化 >>5 到 512 桶 → 多数表决(bestCount>=30) → 颜色变化写 vc.plist
-// 检测不到鲜艳色 → lightColor=0 = 打光熄灭(颜色跟随屏幕闪烁熄/亮)
+// 截屏(路径 A dlsym 私有符号 / 路径 B UIScreen snapshotView+renderInContext)
+// → 只重绘取色点周围 44x44pt → 中心 21x21px 采样 → 饱和度过滤(max>180 且
+// max-min>60) → RGB 量化 >>5 到 512 桶 → 多数表决(bestCount>=30) → 颜色
+// 变化写 vc.plist。检测不到鲜艳色 → lightColor=0 = 打光熄灭(颜色跟随闪烁)
 - (void)colorPickTick {
     if (_pickSuspended) return;
     if (_pickSkipCount > 0) { _pickSkipCount--; return; }
@@ -927,21 +951,39 @@ static NSString *vcamLightColorName(uint32_t c) {
     CGRect sb = [UIScreen mainScreen].bounds;
     if (px <= 0 || py <= 0) { px = sb.size.width / 2; py = sb.size.height / 2; }
 
-    // 全屏截屏(SpringBoard 权限; dlsym 运行时解析, 不可用则本拍跳过)
+    // ===== 截屏: 路径 A(dlsym 符号, 全屏 CGImageRef) =====
+    UIImage *snap = nil;
     VcamUIGetScreenImageFn capFn = vcamUIGetScreenImage();
-    if (!capFn) return;
-    CGImageRef full = capFn();
-    if (!full) return;  // 截屏失败(罕见): 本拍跳过, 不熄灯(避免误闪)
-    UIImage *fullImg = [UIImage imageWithCGImage:full];
-    CFRelease(full);
-    if (!fullImg) return;
+    if (capFn) {
+        CGImageRef full = capFn();
+        if (full) {
+            UIImage *fullImg = [UIImage imageWithCGImage:full];
+            CFRelease(full);
+            if (fullImg) {
+                UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(44, 44)];
+                snap = [r imageWithActions:^(__kindof UIGraphicsImageRendererContext *ctx) {
+                    // drawAtPoint 使全图 (px,py) 落画布中心(22,22), UIKit 方向安全
+                    [fullImg drawAtPoint:CGPointMake(22 - px, 22 - py)];
+                }];
+            }
+        }
+    }
 
-    // 重绘取色点周围 44x44pt: drawAtPoint 使全图 (px,py) 落画布中心(22,22)
-    // —— UIKit 方向语义保证不翻转; 画布 @scale 像素(~132px)
-    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(44, 44)];
-    UIImage *snap = [r imageWithActions:^(__kindof UIGraphicsImageRendererContext *ctx) {
-        [fullImg drawAtPoint:CGPointMake(22 - px, 22 - py)];
-    }];
+    // ===== 路径 B(公开 API: UIScreen 快照 + layer renderInContext) =====
+    // SB 进程内 UIScreen 快照为显示合成内容; renderInContext 纯 CPU 渲染
+    // layer 位图, 无私有符号风险。CTM 平移使取色点区域落画布中心。
+    if (!snap) {
+        UIView *snapView = [[UIScreen mainScreen] snapshotViewAfterScreenUpdates:NO];
+        if (snapView) {
+            UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(44, 44)];
+            snap = [r imageWithActions:^(__kindof UIGraphicsImageRendererContext *ctx) {
+                CGContextRef cg = ctx.CGContext;
+                CGContextTranslateCTM(cg, 22 - px, 22 - py);
+                [snapView.layer renderInContext:cg];
+            }];
+        }
+    }
+
     CGImageRef snapCG = snap.CGImage;
     if (!snapCG) return;
 
@@ -962,15 +1004,29 @@ static NSString *vcamLightColorName(uint32_t c) {
                 // 量化多数表决(Android 同款: 8x8x8=512 桶, 每通道 >>5)
                 int counts[512] = {0};
                 int sumR[512] = {0}, sumG[512] = {0}, sumB[512] = {0};
+                static int diagTicks = 0;
+                long diagLumaSum = 0;
+                int diagNonBlack = 0;
                 for (int y = 0; y < S; y++) {
                     for (int x = 0; x < S; x++) {
                         const uint8_t *p = rgba + (y * S + x) * 4;
                         int r = p[0], g = p[1], b = p[2];
                         int maxc = MAX(MAX(r, g), b), minc = MIN(MIN(r, g), b);
+                        if (diagTicks < 8) {
+                            diagLumaSum += (r + g + b) / 3;
+                            if (maxc > 24) diagNonBlack++;
+                        }
                         if (maxc < 180 || maxc - minc < 60) continue;  // 饱和度过滤
                         int idx = ((r >> 5) << 6) | ((g >> 5) << 3) | (b >> 5);
                         counts[idx]++; sumR[idx] += r; sumG[idx] += g; sumB[idx] += b;
                     }
+                }
+                // 采样诊断(前 8 拍): 亮度均值/非黑像素 —— 全黑 = 截屏路径无效
+                if (diagTicks < 8) {
+                    diagTicks++;
+                    vcam_ball_log([NSString stringWithFormat:
+                        @"[vcam][light] sample diag #%d luma=%ld nonBlack=%d/441 pos(%.0f,%.0f)",
+                        diagTicks, diagLumaSum / (S * S), diagNonBlack, px, py]);
                 }
                 int bestIdx = 0, bestCount = 0;
                 for (int i = 0; i < 512; i++) {
