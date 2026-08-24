@@ -43,6 +43,13 @@ typedef void(^VCamNotifyCallback)(NSString *name);
                         callback:(void(^)(BOOL enabled))callback;
 - (void)stopPolling;
 
+// 打光专用快速轮询(1.3.45): lightColor 跟随屏幕闪烁 0.1s 级变化, 主轮询
+// 0.15s 节拍跟不上 → 独立 timer 高频(0.04s)只同步打光 7 键。
+// 挂与主轮询同一串行队列: 两个 timer handler 天然互斥, 无并发问题
+- (void)startLightPollingWithInterval:(NSTimeInterval)interval
+                             callback:(void(^)(NSDictionary *plist))callback;
+- (void)stopLightPolling;
+
 #pragma mark - plist 读写
 + (BOOL)isPlistEnabled;
 + (void)setPlistEnabled:(BOOL)enabled;
