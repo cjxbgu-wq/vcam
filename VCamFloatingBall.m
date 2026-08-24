@@ -54,48 +54,124 @@ static void vcam_ball_log(NSString *msg) {
     } @catch (NSException *e) {}
 }
 
-// iOS 私有截屏探测(1.3.37b): 设备实证 UIGetScreenImage dlsym=NULL(符号已被
-// 移除), extern 直接链接更会导致整个 dylib 被 dyld 拒载(chained fixups
-// 加载期绑定失败)。截屏多路径探测:
-//   路径 A: dlsym 私有符号候选(UIGetScreenImage/_UIGetScreenImage/UICreateScreenImage)
-//   路径 B: UIScreen snapshotViewAfterScreenUpdates + CALayer renderInContext
-//           (公开 API 组合, 零符号风险; SB 进程内快照为显示合成内容)
-//   路径 C: SBScreenShotter 类探测 + 方法列表 dump(诊断, 下轮精准接入)
-// 首拍探测结果写日志, 前 8 拍写采样诊断(亮度/有效像素)。
+// iOS 私有截屏(1.3.38 重构): 用户实测"红色闪烁识别不到" —— 根因是
+// snapshotViewAfterScreenUpdates 在 SpringBoard 进程只渲染 SB 自己的图层
+// (桌面壁纸 0x0b81c4 即误检证据), 截不到前台 App 内容。
+// 主路径改为 CARenderServerCaptureDisplay(录屏 tweak 标准方案): SB 进程内
+// 直接向 render server 请求 framebuffer 合成(含前台 App), 返回 IOSurface,
+// IOSurfaceLock 直读像素(零渲染开销, 20Hz 采样无压力)。
+// 回退: UICreateScreenImage(dlsym 命中的私有符号, 全屏 CGImage)。
+// 所有私有符号必须 dlsym 运行时解析 —— extern 直接链接会在加载期绑定
+// (chained fixups), 符号缺失时整个 dylib 被 dyld 静默拒载(1.3.37 实证)。
 #include <dlfcn.h>
-#import <objc/runtime.h>
-typedef CGImageRef (*VcamUIGetScreenImageFn)(void);
-static VcamUIGetScreenImageFn vcamUIGetScreenImage(void) {
-    static VcamUIGetScreenImageFn fn = NULL;
+#import <IOSurface/IOSurface.h>
+#import <mach/mach.h>
+
+typedef CGImageRef (*VcamUICreateScreenImageFn)(void);
+typedef int (*VcamCARSCaptureFn)(mach_port_t, uint32_t, uint32_t, uint32_t,
+                                 uint32_t, uint32_t, uint32_t, IOSurfaceRef *);
+
+// CARenderServerCaptureDisplay 探测(一次性): dlsym + (port, display) 组合试捕。
+// 签名自 iOS 9 起稳定(QuartzCore), 众多录屏 tweak 在 iOS 15/16 使用同款。
+static VcamCARSCaptureFn sVcamCARSFn = NULL;
+static mach_port_t sVcamCARSPort = MACH_PORT_NULL;
+static uint32_t sVcamCARSDisplay = 0;
+static int sVcamCARSProbed = 0;
+
+static IOSurfaceRef vcamCaptureDisplaySurface(void) {
+    if (!sVcamCARSProbed) {
+        sVcamCARSProbed = 1;
+        sVcamCARSFn = (VcamCARSCaptureFn)dlsym(RTLD_DEFAULT, "CARenderServerCaptureDisplay");
+        if (!sVcamCARSFn) {
+            vcam_ball_log(@"[vcam][light] CARenderServerCaptureDisplay dlsym NULL, fallback UICreateScreenImage");
+            return NULL;
+        }
+        CGRect sb = [UIScreen mainScreen].bounds;
+        CGFloat sc = [UIScreen mainScreen].scale;
+        uint32_t pw = (uint32_t)(sb.size.width * sc), ph = (uint32_t)(sb.size.height * sc);
+        mach_port_t ports[] = {MACH_PORT_NULL, mach_task_self()};
+        uint32_t displays[] = {0, 1};
+        for (int pi = 0; pi < 2 && !sVcamCARSPort; pi++) {
+            for (int di = 0; di < 2; di++) {
+                IOSurfaceRef t = NULL;
+                if (sVcamCARSFn(ports[pi], displays[di], 0, 0, pw, ph, 0, &t) == KERN_SUCCESS && t) {
+                    IOSurfaceRelease(t);  // 探测成功, 记组合(真捕获由调用方做)
+                    sVcamCARSPort = ports[pi];
+                    sVcamCARSDisplay = displays[di];
+                    vcam_ball_log([NSString stringWithFormat:
+                        @"[vcam][light] CARS ok (port=%d display=%u %ux%u)",
+                        pi, displays[di], pw, ph]);
+                    break;
+                }
+            }
+        }
+        if (!sVcamCARSPort) {
+            vcam_ball_log(@"[vcam][light] CARS combos all failed, fallback UICreateScreenImage");
+        }
+    }
+    if (!sVcamCARSFn || !sVcamCARSPort) return NULL;
+    CGRect sb = [UIScreen mainScreen].bounds;
+    CGFloat sc = [UIScreen mainScreen].scale;
+    uint32_t pw = (uint32_t)(sb.size.width * sc), ph = (uint32_t)(sb.size.height * sc);
+    IOSurfaceRef surf = NULL;
+    if (sVcamCARSFn(sVcamCARSPort, sVcamCARSDisplay, 0, 0, pw, ph, 0, &surf) != KERN_SUCCESS || !surf) {
+        return NULL;
+    }
+    return surf;
+}
+
+// UICreateScreenImage 回退(全屏 CGImage, row0=屏幕顶行, 与 UIKit 同向)
+static VcamUICreateScreenImageFn vcamUICreateScreenImage(void) {
+    static VcamUICreateScreenImageFn fn = NULL;
     static int probed = 0;
     if (!probed) {
         probed = 1;
-        const char *cands[] = {"UIGetScreenImage", "_UIGetScreenImage", "UICreateScreenImage"};
-        for (int i = 0; i < 3 && !fn; i++) {
-            fn = (VcamUIGetScreenImageFn)dlsym(RTLD_DEFAULT, cands[i]);
-            if (fn) {
-                vcam_ball_log([NSString stringWithFormat:
-                    @"[vcam][light] capture symbol hit: %s", cands[i]]);
-            }
-        }
-        if (!fn) vcam_ball_log(@"[vcam][light] capture symbols all NULL, fallback snapshotView path");
-        // 一次性诊断: SBScreenShotter 可用方法 dump(若类存在)
-        Class shotCls = NSClassFromString(@"SBScreenShotter");
-        if (shotCls) {
-            unsigned int mc = 0;
-            Method *ms = class_copyMethodList(shotCls, &mc);
-            NSMutableArray *names = [NSMutableArray array];
-            for (unsigned int i = 0; i < mc && i < 20; i++) {
-                [names addObject:NSStringFromSelector(method_getName(ms[i]))];
-            }
-            free(ms);
-            vcam_ball_log([NSString stringWithFormat:
-                @"[vcam][light] SBScreenShotter methods: %@", names]);
-        } else {
-            vcam_ball_log(@"[vcam][light] SBScreenShotter class not found");
-        }
+        fn = (VcamUICreateScreenImageFn)dlsym(RTLD_DEFAULT, "UICreateScreenImage");
+        vcam_ball_log([NSString stringWithFormat:
+            @"[vcam][light] UICreateScreenImage dlsym = %@", fn ? @"OK" : @"NULL"]);
     }
     return fn;
+}
+
+// ===== 已知颜色集合(1.3.38, 对齐 Android vcam KNOWN_COLORS) =====
+// 用户指定: 只打这几个标准色 —— 检测端逐像素向已知色匹配计票(欧氏距离
+// <120), 多数表决(>=30/441), 匹配不到 → 熄灭。输出标准纯色值(光斑颜色
+// 纯正, 不受采样噪声影响)。
+static const uint32_t vcamKnownLights[7] = {
+    0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0x00FFFF, 0xFF00FF, 0xFFFFFF
+};
+static NSString *const vcamKnownLightNames[7] = {
+    @"红", @"绿", @"蓝", @"黄", @"青", @"紫", @"白"
+};
+
+// RGBA 像素数组 → 已知色匹配。返回 0=无匹配, 否则标准色值; outName/outCount 诊断
+static uint32_t vcamMatchKnownLight(const uint8_t *rgba, int n, NSString **outName, int *outCount) {
+    int counts[7] = {0};
+    for (int i = 0; i < n; i++) {
+        int r = rgba[i * 4], g = rgba[i * 4 + 1], b = rgba[i * 4 + 2];
+        int maxc = MAX(MAX(r, g), b), minc = MIN(MIN(r, g), b);
+        if (maxc > 200 && maxc - minc < 50) { counts[6]++; continue; }  // 白特判(饱和度滤会误杀)
+        if (maxc < 180 || maxc - minc < 60) continue;  // 饱和度过滤(同 Android)
+        int best = -1, bestD2 = 120 * 120;
+        for (int k = 0; k < 6; k++) {  // 白已特判, 只比 6 色
+            int dr = r - (int)((vcamKnownLights[k] >> 16) & 0xFF);
+            int dg = g - (int)((vcamKnownLights[k] >> 8) & 0xFF);
+            int db = b - (int)(vcamKnownLights[k] & 0xFF);
+            int d2 = dr * dr + dg * dg + db * db;
+            if (d2 < bestD2) { bestD2 = d2; best = k; }
+        }
+        if (best >= 0) counts[best]++;
+    }
+    int bestK = -1, bestC = 0;
+    for (int k = 0; k < 7; k++) {
+        if (counts[k] > bestC) { bestC = counts[k]; bestK = k; }
+    }
+    if (bestK >= 0 && bestC >= 30) {  // 441 像素的 ~7%
+        if (outName) *outName = vcamKnownLightNames[bestK];
+        if (outCount) *outCount = bestC;
+        return vcamKnownLights[bestK];
+    }
+    return 0;
 }
 
 #pragma mark - 触摸穿透 window
@@ -907,24 +983,26 @@ static NSString *vcamLightColorName(uint32_t c) {
     }
 }
 
-// 检测线程: 0.1s 节拍。挂主队列 —— 路径 B(UIScreen snapshotView/renderInContext)
-// 是 UIKit API 必须主线程; 每拍 44x44 小区域渲染 + 441 像素采样 ~3-5ms,
-// 0.1s 间隔 ≈ 3-5% 主线程占用(仅取色模式开启期间)可接受
+// 检测线程: 0.05s 节拍(20Hz, 跟上快速闪烁)。后台串行队列 —— 1.3.38 起两条
+// 截屏路径(CARenderServer IOSurface 直读 / UICreateScreenImage)都不依赖
+// UIKit 主线程, 挪离主队列避免与 SB UI 抢时间片; 单拍开销 <2ms
 - (void)startColorPickup {
     if (_colorPickTimer) return;
-    _colorPickQueue = dispatch_get_main_queue();
+    if (!_colorPickQueue) {
+        _colorPickQueue = dispatch_queue_create("vcam.colorpick", DISPATCH_QUEUE_SERIAL);
+    }
     _colorPickTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _colorPickQueue);
     dispatch_source_set_timer(_colorPickTimer,
-                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
-                              (uint64_t)(0.1 * NSEC_PER_SEC),
-                              (uint64_t)(0.05 * NSEC_PER_SEC));
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
+                              (uint64_t)(0.05 * NSEC_PER_SEC),
+                              (uint64_t)(0.02 * NSEC_PER_SEC));
     __weak typeof(self) weakSelf = self;
     dispatch_source_set_event_handler(_colorPickTimer, ^{
         __strong typeof(weakSelf) strongSelf = weakSelf;
         if (strongSelf) [strongSelf colorPickTick];
     });
     dispatch_resume(_colorPickTimer);
-    vcam_ball_log(@"[vcam][light] color pickup timer started (0.1s, main queue)");
+    vcam_ball_log(@"[vcam][light] color pickup timer started (0.05s, bg queue)");
 }
 
 - (void)stopColorPickup {
@@ -935,11 +1013,12 @@ static NSString *vcamLightColorName(uint32_t c) {
     }
 }
 
-// 检测一拍(复刻 Android onImageAvailable 采样算法):
-// 截屏(路径 A dlsym 私有符号 / 路径 B UIScreen snapshotView+renderInContext)
-// → 只重绘取色点周围 44x44pt → 中心 21x21px 采样 → 饱和度过滤(max>180 且
-// max-min>60) → RGB 量化 >>5 到 512 桶 → 多数表决(bestCount>=30) → 颜色
-// 变化写 vc.plist。检测不到鲜艳色 → lightColor=0 = 打光熄灭(颜色跟随闪烁)
+// 检测一拍(1.3.38 重构, 修复"闪烁颜色识别不到"):
+// CARenderServerCaptureDisplay 全屏 IOSurface(含前台 App) → 直读取色点
+// 双 y 候选(左上/左下原点, 免疫坐标系方向)各 21x21 像素 → 已知色集合匹配
+// (红绿蓝黄青紫白逐像素计票) → 颜色变化写 vc.plist(0=熄灭)。
+// 回退: UICreateScreenImage 全屏 CGImage(UIKit 同向, 单候选)。
+// 节拍 0.05s(20Hz)跟上快速闪烁; 小区域直读, 单拍开销 <2ms。
 - (void)colorPickTick {
     if (_pickSuspended) return;
     if (_pickSkipCount > 0) { _pickSkipCount--; return; }
@@ -951,110 +1030,139 @@ static NSString *vcamLightColorName(uint32_t c) {
     CGRect sb = [UIScreen mainScreen].bounds;
     if (px <= 0 || py <= 0) { px = sb.size.width / 2; py = sb.size.height / 2; }
 
-    // ===== 截屏: 路径 A(dlsym 符号, 全屏 CGImageRef) =====
-    UIImage *snap = nil;
-    VcamUIGetScreenImageFn capFn = vcamUIGetScreenImage();
-    if (capFn) {
-        CGImageRef full = capFn();
-        if (full) {
-            UIImage *fullImg = [UIImage imageWithCGImage:full];
-            CFRelease(full);
-            if (fullImg) {
-                UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(44, 44)];
-                snap = [r imageWithActions:^(__kindof UIGraphicsImageRendererContext *ctx) {
-                    // drawAtPoint 使全图 (px,py) 落画布中心(22,22), UIKit 方向安全
-                    [fullImg drawAtPoint:CGPointMake(22 - px, 22 - py)];
-                }];
-            }
-        }
-    }
+    static int diagTicks = 0;
+    const int S = 21;              // 采样边长(像素): 441 像素, 与旧版一致
+    uint32_t detected = 0;
+    NSString *detName = nil;
+    int detCount = 0;
 
-    // ===== 路径 B(公开 API: UIScreen 快照 + layer renderInContext) =====
-    // SB 进程内 UIScreen 快照为显示合成内容; renderInContext 纯 CPU 渲染
-    // layer 位图, 无私有符号风险。CTM 平移使取色点区域落画布中心。
-    if (!snap) {
-        UIView *snapView = [[UIScreen mainScreen] snapshotViewAfterScreenUpdates:NO];
-        if (snapView) {
-            UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(44, 44)];
-            snap = [r imageWithActions:^(__kindof UIGraphicsImageRendererContext *ctx) {
-                CGContextRef cg = ctx.CGContext;
-                CGContextTranslateCTM(cg, 22 - px, 22 - py);
-                [snapView.layer renderInContext:cg];
-            }];
-        }
-    }
+    // ===== 主路径: CARenderServerCaptureDisplay → IOSurface 直读 =====
+    IOSurfaceRef surf = vcamCaptureDisplaySurface();
+    if (surf) {
+        size_t sw = IOSurfaceGetWidth(surf);
+        size_t sh = IOSurfaceGetHeight(surf);
+        size_t stride = IOSurfaceGetBytesPerRow(surf);
+        OSType sfmt = IOSurfaceGetPixelFormat(surf);
+        // framebuffer 常见 'BGRA'(kCVPixelFormatType_32BGRA); 其他格式诊断后走回退
+        BOOL bgra = (sfmt == 'BGRA');
+        if (bgra && sw >= 64 && sh >= 64) {
+            if (IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL) == kIOReturnSuccess) {
+                const uint8_t *base = (const uint8_t *)IOSurfaceGetBaseAddress(surf);
+                if (base) {
+                    // 点坐标 → 像素坐标(按全屏比例, 免疫 scale 取整误差)
+                    int cxPx = (int)lround(px * (double)sw / (double)sb.size.width);
+                    int cyPx = (int)lround(py * (double)sh / (double)sb.size.height);
+                    cxPx = MAX(10, MIN((int)sw - 11, cxPx));
+                    cyPx = MAX(10, MIN((int)sh - 11, cyPx));
 
-    CGImageRef snapCG = snap.CGImage;
-    if (!snapCG) return;
-
-    // 中心 21x21px(中心对称裁剪: 无 y 方向歧义), 绘制到 RGBA8 采样
-    const int S = 21;  // 采样边长(像素, ~7pt): 准星中心透明区内
-    size_t iw = CGImageGetWidth(snapCG), ih = CGImageGetHeight(snapCG);
-    if (iw >= (size_t)S && ih >= (size_t)S) {
-        CGImageRef crop = CGImageCreateWithImageInRect(snapCG,
-            CGRectMake((CGFloat)(iw - S) / 2.0, (CGFloat)(ih - S) / 2.0, S, S));
-        if (crop) {
-            CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-            CGContextRef bctx = CGBitmapContextCreate(NULL, S, S, 8, S * 4, cs,
-                                                      kCGBitmapByteOrder32Big | kCGImageAlphaPremultipliedLast);
-            if (bctx) {
-                CGContextDrawImage(bctx, CGRectMake(0, 0, S, S), crop);
-                const uint8_t *rgba = (const uint8_t *)CGBitmapContextGetData(bctx);
-
-                // 量化多数表决(Android 同款: 8x8x8=512 桶, 每通道 >>5)
-                int counts[512] = {0};
-                int sumR[512] = {0}, sumG[512] = {0}, sumB[512] = {0};
-                static int diagTicks = 0;
-                long diagLumaSum = 0;
-                int diagNonBlack = 0;
-                for (int y = 0; y < S; y++) {
-                    for (int x = 0; x < S; x++) {
-                        const uint8_t *p = rgba + (y * S + x) * 4;
-                        int r = p[0], g = p[1], b = p[2];
-                        int maxc = MAX(MAX(r, g), b), minc = MIN(MIN(r, g), b);
-                        if (diagTicks < 8) {
-                            diagLumaSum += (r + g + b) / 3;
-                            if (maxc > 24) diagNonBlack++;
+                    // 双 y 候选: A=左上原点(与 UIKit 同向), B=左下原点(CA 坐标)
+                    int candY[2] = { cyPx - 10, (int)sh - cyPx - 11 };
+                    uint32_t bestColor = 0;
+                    NSString *bestName = nil;
+                    int bestCnt = 0;
+                    for (int ci = 0; ci < 2; ci++) {
+                        int y0 = candY[ci];
+                        if (y0 < 0 || y0 + S > (int)sh) continue;
+                        uint8_t buf[441 * 4];
+                        long lumaSum = 0;
+                        int nonBlack = 0;
+                        int bi = 0;
+                        for (int y = y0; y < y0 + S; y++) {
+                            const uint8_t *row = base + (size_t)y * stride + (size_t)(cxPx - 10) * 4;
+                            for (int x = 0; x < S; x++) {
+                                // BGRA 字节序
+                                buf[bi]     = row[x * 4 + 2];  // R
+                                buf[bi + 1] = row[x * 4 + 1];  // G
+                                buf[bi + 2] = row[x * 4];      // B
+                                buf[bi + 3] = 255;
+                                lumaSum += (buf[bi] + buf[bi + 1] + buf[bi + 2]) / 3;
+                                if (MAX(MAX(buf[bi], buf[bi + 1]), buf[bi + 2]) > 24) nonBlack++;
+                                bi += 4;
+                            }
                         }
-                        if (maxc < 180 || maxc - minc < 60) continue;  // 饱和度过滤
-                        int idx = ((r >> 5) << 6) | ((g >> 5) << 3) | (b >> 5);
-                        counts[idx]++; sumR[idx] += r; sumG[idx] += g; sumB[idx] += b;
+                        if (diagTicks < 8) {
+                            vcam_ball_log([NSString stringWithFormat:
+                                @"[vcam][light] diag #%d CARS cand%d luma=%ld nonBlack=%d/441 pos(%.0f,%.0f)",
+                                diagTicks + 1, ci, lumaSum / (S * S), nonBlack, px, py]);
+                        }
+                        NSString *nm = nil;
+                        int cnt = 0;
+                        uint32_t c = vcamMatchKnownLight(buf, 441, &nm, &cnt);
+                        // 取票数更高且有效的候选(方向未知的兜底)
+                        if (c != 0 && cnt > bestCnt) { bestCnt = cnt; bestColor = c; bestName = nm; }
+                    }
+                    detected = bestColor;
+                    detName = bestName;
+                    detCount = bestCnt;
+                }
+                IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+            }
+        } else if (diagTicks < 8) {
+            vcam_ball_log([NSString stringWithFormat:
+                @"[vcam][light] CARS surface fmt=0x%x (%zux%zu), not BGRA → fallback",
+                (unsigned)sfmt, sw, sh]);
+        }
+        IOSurfaceRelease(surf);
+    }
+
+    // ===== 回退: UICreateScreenImage(全屏 CGImage, UIKit 同向单候选) =====
+    if (detected == 0) {
+        VcamUICreateScreenImageFn capFn = vcamUICreateScreenImage();
+        if (capFn) {
+            CGImageRef full = capFn();
+            if (full) {
+                size_t iw = CGImageGetWidth(full), ih = CGImageGetHeight(full);
+                int cxPx = (int)lround(px * (double)iw / (double)sb.size.width);
+                int cyPx = (int)lround(py * (double)ih / (double)sb.size.height);
+                cxPx = MAX(10, MIN((int)iw - 11, cxPx));
+                cyPx = MAX(10, MIN((int)ih - 11, cyPx));
+                if (iw > (size_t)(cxPx + 11) && ih > (size_t)(cyPx + 11)) {
+                    CGImageRef crop = CGImageCreateWithImageInRect(full,
+                        CGRectMake(cxPx - 10, cyPx - 10, S, S));
+                    if (crop) {
+                        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+                        CGContextRef bctx = CGBitmapContextCreate(NULL, S, S, 8, S * 4, cs,
+                                                                  kCGBitmapByteOrder32Big | kCGImageAlphaPremultipliedLast);
+                        if (bctx) {
+                            CGContextDrawImage(bctx, CGRectMake(0, 0, S, S), crop);
+                            const uint8_t *rgba = (const uint8_t *)CGBitmapContextGetData(bctx);
+                            if (rgba) {
+                                if (diagTicks < 8) {
+                                    long lumaSum = 0;
+                                    int nonBlack = 0;
+                                    for (int i = 0; i < 441; i++) {
+                                        lumaSum += (rgba[i*4] + rgba[i*4+1] + rgba[i*4+2]) / 3;
+                                        if (MAX(MAX(rgba[i*4], rgba[i*4+1]), rgba[i*4+2]) > 24) nonBlack++;
+                                    }
+                                    vcam_ball_log([NSString stringWithFormat:
+                                        @"[vcam][light] diag #%d UICSI luma=%ld nonBlack=%d/441 pos(%.0f,%.0f)",
+                                        diagTicks + 1, lumaSum / 441, nonBlack, px, py]);
+                                }
+                                detected = vcamMatchKnownLight(rgba, 441, &detName, &detCount);
+                            }
+                            CGContextRelease(bctx);
+                        }
+                        CGColorSpaceRelease(cs);
+                        CFRelease(crop);
                     }
                 }
-                // 采样诊断(前 8 拍): 亮度均值/非黑像素 —— 全黑 = 截屏路径无效
-                if (diagTicks < 8) {
-                    diagTicks++;
-                    vcam_ball_log([NSString stringWithFormat:
-                        @"[vcam][light] sample diag #%d luma=%ld nonBlack=%d/441 pos(%.0f,%.0f)",
-                        diagTicks, diagLumaSum / (S * S), diagNonBlack, px, py]);
-                }
-                int bestIdx = 0, bestCount = 0;
-                for (int i = 0; i < 512; i++) {
-                    if (counts[i] > bestCount) { bestCount = counts[i]; bestIdx = i; }
-                }
-                uint32_t detected = 0;
-                if (bestCount >= 30) {  // 441 像素的 ~7%(对齐 Android 10/121)
-                    int r = sumR[bestIdx] / bestCount;
-                    int g = sumG[bestIdx] / bestCount;
-                    int b = sumB[bestIdx] / bestCount;
-                    detected = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
-                }
-
-                if (detected != _lastDetectedColor) {
-                    _lastDetectedColor = detected;
-                    [VCamNotify setPlistLightColor:detected];  // 0=熄灭
-                    uint32_t d = detected;
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        [self updateColorPreview:d];
-                    });
-                    vcam_ball_log([NSString stringWithFormat:
-                        @"[vcam][light] color detected: 0x%06x %@", d, vcamLightColorName(d)]);
-                }
-                CGContextRelease(bctx);
+                CFRelease(full);
             }
-            CGColorSpaceRelease(cs);
-            CFRelease(crop);
         }
+    }
+
+    if (diagTicks < 8) diagTicks++;
+
+    if (detected != _lastDetectedColor) {
+        _lastDetectedColor = detected;
+        [VCamNotify setPlistLightColor:detected];  // 0=熄灭(闪烁消失/无匹配)
+        uint32_t d = detected;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self updateColorPreview:d];
+        });
+        vcam_ball_log([NSString stringWithFormat:
+            @"[vcam][light] color detected: 0x%06x %@ (%d/441)", d,
+            detName ?: @"熄灭", detCount]);
     }
 }
 
