@@ -67,6 +67,10 @@ static void vcam_darwin_callback(CFNotificationCenterRef center, void *observer,
 @property (nonatomic, strong) dispatch_source_t pollingTimer;
 @property (nonatomic, copy)   void(^pollingCallback)(BOOL enabled);
 @property (nonatomic, assign) BOOL pollingActive;
+// 打光快速轮询(1.3.45): 与主轮询同队列串行, 见 .h 注释
+@property (nonatomic, strong) dispatch_source_t lightPollingTimer;
+@property (nonatomic, copy)   void(^lightPollingCallback)(NSDictionary *plist);
+@property (nonatomic, assign) BOOL lightPollingActive;
 @end
 
 @implementation VCamNotify
@@ -217,6 +221,37 @@ static void vcam_darwin_callback(CFNotificationCenterRef center, void *observer,
     }
     _pollingActive = NO;
     _pollingCallback = nil;
+}
+
+// 打光专用快速轮询(1.3.45): timer 挂与主轮询同一个 _notifyQueue ——
+// dispatch serial queue 上两个 timer handler 串行执行, 与主轮询回调
+// 天然互斥(都能安全访问 VCamCore 的 gpuProcessor 状态)。
+// 单次开销 = 一次 plist 文件读(~0.1-0.2ms) + 回调, 25Hz ≈ 0.5% 单核
+- (void)startLightPollingWithInterval:(NSTimeInterval)interval
+                             callback:(void(^)(NSDictionary *plist))callback {
+    if (_lightPollingActive) return;
+    _lightPollingActive = YES;
+    _lightPollingCallback = [callback copy];
+
+    _lightPollingTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _notifyQueue);
+    uint64_t intervalNs = interval * NSEC_PER_SEC;
+    dispatch_source_set_timer(_lightPollingTimer, dispatch_time(DISPATCH_TIME_NOW, 0), intervalNs, intervalNs / 2);
+    dispatch_source_set_event_handler(_lightPollingTimer, ^{
+        NSDictionary *pl = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath];
+        if (self->_lightPollingCallback) {
+            self->_lightPollingCallback(pl ?: @{});
+        }
+    });
+    dispatch_resume(_lightPollingTimer);
+}
+
+- (void)stopLightPolling {
+    if (_lightPollingTimer) {
+        dispatch_source_cancel(_lightPollingTimer);
+        _lightPollingTimer = nil;
+    }
+    _lightPollingActive = NO;
+    _lightPollingCallback = nil;
 }
 
 #pragma mark - plist 读写
