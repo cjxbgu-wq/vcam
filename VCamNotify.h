@@ -77,4 +77,23 @@ typedef void(^VCamNotifyCallback)(NSString *name);
 + (NSInteger)plistRestartToken;
 + (void)bumpRestartToken;
 
+// 三色打光(1.3.37, 跨进程: 悬浮球屏幕取色检测写, mediaserverd 轮询应用):
+// lightEnabled=取色总开关; lightColor=0x00RRGGBB(0=熄灭, 颜色跟随屏幕闪烁);
+// lightX/lightY=光斑中心 %(默认 50/50); lightIntensity 强度%(默认 30);
+// lightDiameter 直径%(默认 48); lightFeather 羽化%(默认 100)
++ (BOOL)plistLightEnabled;
++ (void)setPlistLightEnabled:(BOOL)enabled;
++ (uint32_t)plistLightColor;
++ (void)setPlistLightColor:(uint32_t)color;
++ (int)plistLightX;
++ (void)setPlistLightX:(int)x;
++ (int)plistLightY;
++ (void)setPlistLightY:(int)y;
++ (int)plistLightIntensity;
++ (void)setPlistLightIntensity:(int)v;
++ (int)plistLightDiameter;
++ (void)setPlistLightDiameter:(int)v;
++ (int)plistLightFeather;
++ (void)setPlistLightFeather:(int)v;
+
 @end
