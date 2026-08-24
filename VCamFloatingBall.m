@@ -891,8 +891,13 @@ static NSString *vcamLightColorName(uint32_t c) {
     }
 }
 
+// iOS 私有截屏(录屏类 tweak 经典方案): SpringBoard 系统进程内可用,
+// 返回全屏 CGImageRef(含前台 App 画面), 数据行 0 = 屏幕顶行
+extern CGImageRef UIGetScreenImage(void);
+
 // 检测一拍(复刻 Android onImageAvailable 采样算法):
-// 截取色点周围 44x44pt → 中心 21x21px 采样 → 饱和度过滤(max>180 且 max-min>60)
+// UIGetScreenImage 全屏 → UIGraphicsImageRenderer 只重绘取色点周围 44x44pt
+// (UIKit 坐标方向安全) → 中心 21x21px 采样 → 饱和度过滤(max>180 且 max-min>60)
 // → RGB 量化 >>5 到 512 桶 → 多数表决(bestCount>=30) → 颜色变化写 vc.plist
 // 检测不到鲜艳色 → lightColor=0 = 打光熄灭(颜色跟随屏幕闪烁熄/亮)
 - (void)colorPickTick {
@@ -906,20 +911,27 @@ static NSString *vcamLightColorName(uint32_t c) {
     CGRect sb = [UIScreen mainScreen].bounds;
     if (px <= 0 || py <= 0) { px = sb.size.width / 2; py = sb.size.height / 2; }
 
-    // 截屏(小区域): SpringBoard 系统进程内 CGWindowListCreateImage 可用,
-    // 只合成取色点周围 44x44pt(GPU 小区域读回, 开销极低)
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    CGImageRef img = CGWindowListCreateImage(
-        CGRectMake(px - 22, py - 22, 44, 44),
-        kCGWindowListOptionOnScreenOnly, kCGNullWindowID, kCGWindowImageDefault);
-#pragma clang diagnostic pop
-    if (!img) return;  // 截屏失败(罕见): 本拍跳过, 不熄灯(避免误闪)
+    // 全屏截屏(SpringBoard 权限)
+    CGImageRef full = UIGetScreenImage();
+    if (!full) return;  // 截屏失败(罕见): 本拍跳过, 不熄灯(避免误闪)
+    UIImage *fullImg = [UIImage imageWithCGImage:full];
+    CFRelease(full);
+    if (!fullImg) return;
 
+    // 重绘取色点周围 44x44pt: drawAtPoint 使全图 (px,py) 落画布中心(22,22)
+    // —— UIKit 方向语义保证不翻转; 画布 @scale 像素(~132px)
+    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(44, 44)];
+    UIImage *snap = [r imageWithActions:^(__kindof UIGraphicsImageRendererContext *ctx) {
+        [fullImg drawAtPoint:CGPointMake(22 - px, 22 - py)];
+    }];
+    CGImageRef snapCG = snap.CGImage;
+    if (!snapCG) return;
+
+    // 中心 21x21px(中心对称裁剪: 无 y 方向歧义), 绘制到 RGBA8 采样
     const int S = 21;  // 采样边长(像素, ~7pt): 准星中心透明区内
-    size_t iw = CGImageGetWidth(img), ih = CGImageGetHeight(img);
+    size_t iw = CGImageGetWidth(snapCG), ih = CGImageGetHeight(snapCG);
     if (iw >= (size_t)S && ih >= (size_t)S) {
-        CGImageRef crop = CGImageCreateWithImageInRect(img,
+        CGImageRef crop = CGImageCreateWithImageInRect(snapCG,
             CGRectMake((CGFloat)(iw - S) / 2.0, (CGFloat)(ih - S) / 2.0, S, S));
         if (crop) {
             CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
@@ -970,7 +982,6 @@ static NSString *vcamLightColorName(uint32_t c) {
             CFRelease(crop);
         }
     }
-    CFRelease(img);
 }
 
 // 主线程更新颜色预览
