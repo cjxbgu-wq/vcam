@@ -59,17 +59,50 @@ static void vcam_ball_log(NSString *msg) {
 // (桌面壁纸 0x0b81c4 即误检证据), 截不到前台 App 内容。
 // 主路径改为 CARenderServerCaptureDisplay(录屏 tweak 标准方案): SB 进程内
 // 直接向 render server 请求 framebuffer 合成(含前台 App), 返回 IOSurface,
-// IOSurfaceLock 直读像素(零渲染开销, 20Hz 采样无压力)。
+// 直读像素(零渲染开销, 20Hz 采样无压力)。
 // 回退: UICreateScreenImage(dlsym 命中的私有符号, 全屏 CGImage)。
 // 所有私有符号必须 dlsym 运行时解析 —— extern 直接链接会在加载期绑定
-// (chained fixups), 符号缺失时整个 dylib 被 dyld 静默拒载(1.3.37 实证)。
+// (chained fixups), 符号缺失时整个 dylib 被 dyld 静默拒载(1.3.37 实证);
+// 且 theos 精简 SDK 无 IOSurface.framework 头, C API 也走 dlsym
+// (IOSurfaceRef 是不透明结构指针, 纯指针传递无 ABI 风险)。
 #include <dlfcn.h>
-#import <IOSurface/IOSurface.h>
 #import <mach/mach.h>
 
 typedef CGImageRef (*VcamUICreateScreenImageFn)(void);
+typedef struct __VcamIOSurface *VcamIOSurfaceRef;
 typedef int (*VcamCARSCaptureFn)(mach_port_t, uint32_t, uint32_t, uint32_t,
-                                 uint32_t, uint32_t, uint32_t, IOSurfaceRef *);
+                                 uint32_t, uint32_t, uint32_t, VcamIOSurfaceRef *);
+typedef kern_return_t (*VcamIOSLockFn)(VcamIOSurfaceRef, uint32_t, uint32_t *);
+typedef void *(*VcamIOSBaseAddrFn)(VcamIOSurfaceRef);
+typedef size_t (*VcamIOSDimFn)(VcamIOSurfaceRef);
+typedef OSType (*VcamIOSFmtFn)(VcamIOSurfaceRef);
+
+// IOSurface C API 函数指针集(一次性 dlsym); kIOSurfaceLockReadOnly = 0x1
+static struct {
+    VcamIOSLockFn lock;
+    VcamIOSLockFn unlock;
+    VcamIOSBaseAddrFn base;
+    VcamIOSDimFn width, height, stride;
+    VcamIOSFmtFn fmt;
+    int ok;
+} sVcamIOS = {0};
+
+static void vcamIOSurfaceInit(void) {
+    if (sVcamIOS.ok) return;
+    sVcamIOS.ok = 1;
+    sVcamIOS.lock = (VcamIOSLockFn)dlsym(RTLD_DEFAULT, "IOSurfaceLock");
+    sVcamIOS.unlock = (VcamIOSLockFn)dlsym(RTLD_DEFAULT, "IOSurfaceUnlock");
+    sVcamIOS.base = (VcamIOSBaseAddrFn)dlsym(RTLD_DEFAULT, "IOSurfaceGetBaseAddress");
+    sVcamIOS.width = (VcamIOSDimFn)dlsym(RTLD_DEFAULT, "IOSurfaceGetWidth");
+    sVcamIOS.height = (VcamIOSDimFn)dlsym(RTLD_DEFAULT, "IOSurfaceGetHeight");
+    sVcamIOS.stride = (VcamIOSDimFn)dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerRow");
+    sVcamIOS.fmt = (VcamIOSFmtFn)dlsym(RTLD_DEFAULT, "IOSurfaceGetPixelFormat");
+    if (!sVcamIOS.lock || !sVcamIOS.unlock || !sVcamIOS.base ||
+        !sVcamIOS.width || !sVcamIOS.height || !sVcamIOS.stride || !sVcamIOS.fmt) {
+        sVcamIOS.ok = -1;  // 不完整: 全链路禁用, 走回退
+        vcam_ball_log(@"[vcam][light] IOSurface API dlsym incomplete, CARS path disabled");
+    }
+}
 
 // CARenderServerCaptureDisplay 探测(一次性): dlsym + (port, display) 组合试捕。
 // 签名自 iOS 9 起稳定(QuartzCore), 众多录屏 tweak 在 iOS 15/16 使用同款。
@@ -78,7 +111,9 @@ static mach_port_t sVcamCARSPort = MACH_PORT_NULL;
 static uint32_t sVcamCARSDisplay = 0;
 static int sVcamCARSProbed = 0;
 
-static IOSurfaceRef vcamCaptureDisplaySurface(void) {
+static VcamIOSurfaceRef vcamCaptureDisplaySurface(void) {
+    vcamIOSurfaceInit();
+    if (sVcamIOS.ok < 0) return NULL;
     if (!sVcamCARSProbed) {
         sVcamCARSProbed = 1;
         sVcamCARSFn = (VcamCARSCaptureFn)dlsym(RTLD_DEFAULT, "CARenderServerCaptureDisplay");
@@ -93,9 +128,9 @@ static IOSurfaceRef vcamCaptureDisplaySurface(void) {
         uint32_t displays[] = {0, 1};
         for (int pi = 0; pi < 2 && !sVcamCARSPort; pi++) {
             for (int di = 0; di < 2; di++) {
-                IOSurfaceRef t = NULL;
+                VcamIOSurfaceRef t = NULL;
                 if (sVcamCARSFn(ports[pi], displays[di], 0, 0, pw, ph, 0, &t) == KERN_SUCCESS && t) {
-                    IOSurfaceRelease(t);  // 探测成功, 记组合(真捕获由调用方做)
+                    CFRelease(t);  // 探测成功, 记组合(真捕获由调用方做)
                     sVcamCARSPort = ports[pi];
                     sVcamCARSDisplay = displays[di];
                     vcam_ball_log([NSString stringWithFormat:
@@ -113,7 +148,7 @@ static IOSurfaceRef vcamCaptureDisplaySurface(void) {
     CGRect sb = [UIScreen mainScreen].bounds;
     CGFloat sc = [UIScreen mainScreen].scale;
     uint32_t pw = (uint32_t)(sb.size.width * sc), ph = (uint32_t)(sb.size.height * sc);
-    IOSurfaceRef surf = NULL;
+    VcamIOSurfaceRef surf = NULL;
     if (sVcamCARSFn(sVcamCARSPort, sVcamCARSDisplay, 0, 0, pw, ph, 0, &surf) != KERN_SUCCESS || !surf) {
         return NULL;
     }
@@ -1037,17 +1072,17 @@ static NSString *vcamLightColorName(uint32_t c) {
     int detCount = 0;
 
     // ===== 主路径: CARenderServerCaptureDisplay → IOSurface 直读 =====
-    IOSurfaceRef surf = vcamCaptureDisplaySurface();
+    VcamIOSurfaceRef surf = vcamCaptureDisplaySurface();
     if (surf) {
-        size_t sw = IOSurfaceGetWidth(surf);
-        size_t sh = IOSurfaceGetHeight(surf);
-        size_t stride = IOSurfaceGetBytesPerRow(surf);
-        OSType sfmt = IOSurfaceGetPixelFormat(surf);
+        size_t sw = sVcamIOS.width(surf);
+        size_t sh = sVcamIOS.height(surf);
+        size_t stride = sVcamIOS.stride(surf);
+        OSType sfmt = sVcamIOS.fmt(surf);
         // framebuffer 常见 'BGRA'(kCVPixelFormatType_32BGRA); 其他格式诊断后走回退
         BOOL bgra = (sfmt == 'BGRA');
         if (bgra && sw >= 64 && sh >= 64) {
-            if (IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL) == kIOReturnSuccess) {
-                const uint8_t *base = (const uint8_t *)IOSurfaceGetBaseAddress(surf);
+            if (sVcamIOS.lock(surf, 0x1 /* kIOSurfaceLockReadOnly */, NULL) == KERN_SUCCESS) {
+                const uint8_t *base = (const uint8_t *)sVcamIOS.base(surf);
                 if (base) {
                     // 点坐标 → 像素坐标(按全屏比例, 免疫 scale 取整误差)
                     int cxPx = (int)lround(px * (double)sw / (double)sb.size.width);
@@ -1095,14 +1130,14 @@ static NSString *vcamLightColorName(uint32_t c) {
                     detName = bestName;
                     detCount = bestCnt;
                 }
-                IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+                sVcamIOS.unlock(surf, 0x1 /* kIOSurfaceLockReadOnly */, NULL);
             }
         } else if (diagTicks < 8) {
             vcam_ball_log([NSString stringWithFormat:
                 @"[vcam][light] CARS surface fmt=0x%x (%zux%zu), not BGRA → fallback",
                 (unsigned)sfmt, sw, sh]);
         }
-        IOSurfaceRelease(surf);
+        CFRelease(surf);  // IOSurfaceRef 是 CFType
     }
 
     // ===== 回退: UICreateScreenImage(全屏 CGImage, UIKit 同向单候选) =====
