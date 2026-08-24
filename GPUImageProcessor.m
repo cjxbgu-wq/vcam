@@ -318,24 +318,81 @@ static void vcamYuvSplitDisable(uint32_t fmt) {
 }
 
 // 直转快路径 memo(2026-08-24 视频模式帧率优化, 进程级 per-format):
-// 0=未探测(允许首试) 1=YUV→私有直转可用(恒走直转) -1=永久回退两步法。
-// 拆段 v3 同款模式: 首帧真实 dst 试跑, 失败零重试(此后零日志零开销)。
+// 0=未探测(允许首试) 1=YUV→私有直转可用(恒走直转) -1=回退(YUV staging/
+// BGRA 两步法)。拆段 v3 同款模式: 首帧真实 dst 试跑。
+// 失败延迟重试(1.3.36): -12902/-12905 可能是启动竞态(会话刚建/首帧
+// buffer 状态特殊)而非格式永久不支持 —— 失败 30s 后允许重试, 最多 3 次
+// 防每帧重试风暴; 重试窗口期 getter 返回 0(视为未探测)。
 static uint32_t gVcamYuvDirectFmt[4] = {0, 0, 0, 0};
 static int8_t gVcamYuvDirectOk[4] = {0, 0, 0, 0};
+static uint8_t gVcamYuvDirectFails[4] = {0, 0, 0, 0};
+static CFAbsoluteTime gVcamYuvDirectFailAt[4] = {0, 0, 0, 0};
 static int8_t vcamYuvDirectState(uint32_t fmt) {
     for (int i = 0; i < 4; i++) {
-        if (gVcamYuvDirectFmt[i] == fmt) return gVcamYuvDirectOk[i];
+        if (gVcamYuvDirectFmt[i] == fmt) {
+            if (gVcamYuvDirectOk[i] == -1 &&
+                gVcamYuvDirectFails[i] < 3 && gVcamYuvDirectFailAt[i] > 0 &&
+                (CFAbsoluteTimeGetCurrent() - gVcamYuvDirectFailAt[i]) > 30.0) {
+                return 0;  // 重试窗口: 允许再试
+            }
+            return gVcamYuvDirectOk[i];
+        }
     }
     return 0;  // 未登记: 允许首试
 }
 static void vcamYuvDirectSet(uint32_t fmt, int8_t ok) {
     for (int i = 0; i < 4; i++) {
-        if (gVcamYuvDirectFmt[i] == fmt) { gVcamYuvDirectOk[i] = ok; return; }
+        if (gVcamYuvDirectFmt[i] == fmt) {
+            if (ok == -1) {
+                gVcamYuvDirectFails[i]++;
+                gVcamYuvDirectFailAt[i] = CFAbsoluteTimeGetCurrent();
+            }
+            gVcamYuvDirectOk[i] = ok; return;
+        }
     }
     for (int i = 0; i < 4; i++) {
-        if (gVcamYuvDirectFmt[i] == 0) { gVcamYuvDirectFmt[i] = fmt; gVcamYuvDirectOk[i] = ok; return; }
+        if (gVcamYuvDirectFmt[i] == 0) {
+            gVcamYuvDirectFmt[i] = fmt; gVcamYuvDirectOk[i] = ok;
+            if (ok == -1) {
+                gVcamYuvDirectFails[i] = 1;
+                gVcamYuvDirectFailAt[i] = CFAbsoluteTimeGetCurrent();
+            }
+            return;
+        }
     }
 }
+
+// YUV staging 两步法 memo(1.3.36 帧率优化 v2, 进程级 per-format):
+// 0=未探测 1=可用(YUV→420f→私有) -1=不可用(回退 BGRA 两步法)。
+// 动机: 直转失败的私有流走 YUV→BGRA→私有 ~21ms/帧, BGRA 中转(RGB
+// 转换 ~13ms)是 CPU 大头; 420f 中转纯 YUV 域 ~1-2ms + 缩放段 ~3-8ms。
+// staging 是自建干净 buffer(无 cleanAperture 附件), s2' 与直转同款
+// VT 操作但源参数干净, 可能绕过直转的 -12902/-12905 限制。
+static uint32_t gVcamYuvStageFmt[4] = {0, 0, 0, 0};
+static int8_t gVcamYuvStageOk[4] = {0, 0, 0, 0};
+static int8_t vcamYuvStageState(uint32_t fmt) {
+    for (int i = 0; i < 4; i++) {
+        if (gVcamYuvStageFmt[i] == fmt) return gVcamYuvStageOk[i];
+    }
+    return 0;  // 未登记: 允许首试
+}
+static void vcamYuvStageSet(uint32_t fmt, int8_t ok) {
+    for (int i = 0; i < 4; i++) {
+        if (gVcamYuvStageFmt[i] == fmt) { gVcamYuvStageOk[i] = ok; return; }
+    }
+    for (int i = 0; i < 4; i++) {
+        if (gVcamYuvStageFmt[i] == 0) { gVcamYuvStageFmt[i] = fmt; gVcamYuvStageOk[i] = ok; return; }
+    }
+}
+
+// YUV 中转 staging 槽(源尺寸 420f): 按 (w,h) 缓存, token 复用同帧多消费者
+typedef struct {
+    size_t w, h;
+    CVPixelBufferRef staging;
+    uint64_t token;
+} VCamYuvLaneSlot;
+#define kVcamYuvLaneMax 4
+static VCamYuvLaneSlot gVcamYuvLane[kVcamYuvLaneMax];
 
 // 车道熔断 memo: 热路径零装箱查表; 熔断写入时刷新对应槽
 static uint32_t gVcamLaneMemoFmt[4] = {0, 0, 0, 0};
@@ -1870,7 +1927,8 @@ static void vcamClearBiPlanarBlack(CVPixelBufferRef buf, OSType fmt) {
         // 千面 0xb0f8 同款直转架构; YUV range/矩阵 attachments 全程保留,
         // 无 BGRA 中转的高光洗白风险。首帧真实 dst 试跑(拆段 v3 同款):
         // 成功 memo=1 此后恒走直转(零 BGRA staging 零中转); 失败 memo=-1
-        // 永久回退两步法(同帧内完成, fence 顺序化无闪烁)。
+        // 回退(同帧内完成, fence 顺序化无闪烁)。失败 30s 后延迟重试(1.3.36,
+        // 最多 3 次): -12902 疑似启动竞态而非格式永久不支持。
         {
             OSType srcFmtD = CVPixelBufferGetPixelFormatType(src);
             BOOL srcYuvPlanar = (srcFmtD == '420f' || srcFmtD == '420v' ||
@@ -1894,6 +1952,77 @@ static void vcamClearBiPlanarBlack(CVPixelBufferRef buf, OSType fmt) {
                 vcam_gpu_log([NSString stringWithFormat:
                     @"[vcam] lane direct YUV->0x%x failed (%d), fallback two-step",
                     (unsigned)dstFormat, (int)stD]);
+            }
+            // ===== YUV staging 两步法(1.3.36 帧率优化 v2): 直转失败格式的 YUV 域中转 =====
+            // 旧两步法 YUV→BGRA(源尺寸 RGB 中转 ~13ms)→私有(~8ms) 的 BGRA 段是
+            // CPU 大头。此处先试: s1' YUV→420f(源尺寸, 纯 YUV 域 ~1-2ms, token
+            // 复用同帧多消费者) + s2' 420f→私有(带缩放) —— staging 自建干净
+            // buffer 无 cleanAperture 附件, s2' 与直转同款 VT 操作但源参数
+            // 干净, 可能绕过直转的 -12902/-12905 限制。首帧试跑: 成功 memo=1
+            // 恒走此路; 失败 memo=-1 同帧继续 BGRA 两步法(不丢帧)。YUV→YUV
+            // 无 RGB 往返, 色彩保真优于 BGRA 中转(无高光洗白)。
+            if (srcYuvPlanar && (srcW != dstW || srcH != dstH) &&
+                vcamYuvDirectState(dstFormat) == -1 &&
+                vcamYuvStageState(dstFormat) >= 0 && _privateTransferSession) {
+                VCamYuvLaneSlot *yslot = NULL;
+                for (int i = 0; i < kVcamYuvLaneMax; i++) {
+                    if (gVcamYuvLane[i].staging &&
+                        gVcamYuvLane[i].w == srcW && gVcamYuvLane[i].h == srcH) {
+                        yslot = &gVcamYuvLane[i];
+                        break;
+                    }
+                }
+                if (!yslot) {
+                    for (int i = 0; i < kVcamYuvLaneMax; i++) {
+                        if (!gVcamYuvLane[i].staging) {
+                            CVPixelBufferRef nb = NULL;
+                            if (CVPixelBufferCreate(kCFAllocatorDefault, srcW, srcH,
+                                                    '420f', NULL, &nb) == noErr && nb) {
+                                gVcamYuvLane[i].w = srcW;
+                                gVcamYuvLane[i].h = srcH;
+                                gVcamYuvLane[i].staging = nb;
+                                gVcamYuvLane[i].token = 0;
+                                yslot = &gVcamYuvLane[i];
+                                vcam_gpu_log([NSString stringWithFormat:
+                                    @"[vcam] YUV lane staging built %zux%zu (slot %d)",
+                                    srcW, srcH, i]);
+                            }
+                            break;
+                        }
+                    }
+                }
+                BOOL ysOk = NO;
+                if (yslot && _twoStepS1Session) {
+                    if (token != 0 && yslot->token == token) {
+                        ysOk = YES;  // 同帧已转
+                    } else {
+                        OSStatus st1 = VTPixelTransferSessionTransferImage(_twoStepS1Session, src, yslot->staging);
+                        if (st1 == noErr) {
+                            yslot->token = token;
+                            ysOk = YES;
+                        } else {
+                            yslot->token = 0;
+                        }
+                    }
+                    if (ysOk) {
+                        OSStatus st2 = VTPixelTransferSessionTransferImage(_privateTransferSession, yslot->staging, dst);
+                        if (st2 == noErr) {
+                            if (vcamYuvStageState(dstFormat) == 0) {
+                                vcamYuvStageSet(dstFormat, 1);
+                                vcam_gpu_log([NSString stringWithFormat:
+                                    @"[vcam] lane YUV-staging 0x%x OK (YUV detour, BGRA detour skipped)",
+                                    (unsigned)dstFormat]);
+                            }
+                            [self noteStreamRenderFmt:(uint32_t)dstFormat w:(uint32_t)dstW h:(uint32_t)dstH pixels:(uint64_t)dstW * dstH];
+                            [_laneLockPrivate unlock];
+                            return YES;
+                        }
+                        vcamYuvStageSet(dstFormat, -1);
+                        vcam_gpu_log([NSString stringWithFormat:
+                            @"[vcam] lane YUV-staging 0x%x failed (%d), fallback BGRA two-step",
+                            (unsigned)dstFormat, (int)st2]);
+                    }
+                }
             }
         }
         // staging 按源尺寸缓存(2026-08-19 交替重建风暴修复): 源有 2 种尺寸并存
