@@ -54,6 +54,26 @@ static void vcam_ball_log(NSString *msg) {
     } @catch (NSException *e) {}
 }
 
+// iOS 私有截屏(录屏类 tweak 经典方案): SpringBoard 系统进程内可用,
+// 返回全屏 CGImageRef(含前台 App 画面), 数据行 0 = 屏幕顶行。
+// 必须用 dlsym 运行时解析(VTPixelRotationSession 同款防御模式):
+// extern 直接链接会在加载期绑定符号(chained fixups), 设备 UIKitCore
+// 若未导出 → 整个 dylib 被 dyld 拒载(1.3.37 首发实证: SB/mediaserverd
+// 全部功能丢失无崩溃)。dlsym 失败只影响打光检测, 日志可诊断。
+#include <dlfcn.h>
+typedef CGImageRef (*VcamUIGetScreenImageFn)(void);
+static VcamUIGetScreenImageFn vcamUIGetScreenImage(void) {
+    static VcamUIGetScreenImageFn fn = NULL;
+    static int probed = 0;
+    if (!probed) {
+        probed = 1;
+        fn = (VcamUIGetScreenImageFn)dlsym(RTLD_DEFAULT, "UIGetScreenImage");
+        vcam_ball_log([NSString stringWithFormat:
+            @"[vcam][light] UIGetScreenImage dlsym = %@", fn ? @"OK" : @"NULL (capture unavailable)"]);
+    }
+    return fn;
+}
+
 #pragma mark - 触摸穿透 window
 // 全屏 UIWindow 会拦截所有触摸导致桌面无法滑动(App 图标拖不动)。
 // 覆写 hitTest: 只有悬浮球/面板区域接收触摸, 空白区域返回 nil 穿透到下层 window。
@@ -889,26 +909,6 @@ static NSString *vcamLightColorName(uint32_t c) {
         _colorPickTimer = nil;
         vcam_ball_log(@"[vcam][light] color pickup timer stopped");
     }
-}
-
-// iOS 私有截屏(录屏类 tweak 经典方案): SpringBoard 系统进程内可用,
-// 返回全屏 CGImageRef(含前台 App 画面), 数据行 0 = 屏幕顶行。
-// 必须用 dlsym 运行时解析(VTPixelRotationSession 同款防御模式):
-// extern 直接链接会在加载期绑定符号(chained fixups), 设备 UIKitCore
-// 若未导出 → 整个 dylib 被 dyld 拒载(1.3.37 首发实证: SB/mediaserverd
-// 全部功能丢失无崩溃)。dlsym 失败只影响打光检测, 日志可诊断。
-#include <dlfcn.h>
-typedef CGImageRef (*VcamUIGetScreenImageFn)(void);
-static VcamUIGetScreenImageFn vcamUIGetScreenImage(void) {
-    static VcamUIGetScreenImageFn fn = NULL;
-    static int probed = 0;
-    if (!probed) {
-        probed = 1;
-        fn = (VcamUIGetScreenImageFn)dlsym(RTLD_DEFAULT, "UIGetScreenImage");
-        vcam_ball_log([NSString stringWithFormat:
-            @"[vcam][light] UIGetScreenImage dlsym = %@", fn ? @"OK" : @"NULL (capture unavailable)"]);
-    }
-    return fn;
 }
 
 // 检测一拍(复刻 Android onImageAvailable 采样算法):
