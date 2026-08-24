@@ -1501,9 +1501,18 @@ static void vcamApplyLightBiPlanar(CVPixelBufferRef buf, uint32_t rgb,
     if (!yPlane || !cPlane) return;
 
     // ===== Y 平面: 圆形渐变(中心实心 inner_r, 线性羽化到 radius) =====
+    // 1.3.45 卡顿优化(用户反馈开打光后画面卡顿掉帧):
+    // (1)除法预乘 —— alpha = maxAlpha*(radiusSq-distSq)/featherRange 的整数
+    //    除法改为 double 预乘 invAlpha(精度足够: 值域 ≤192), 内层纯乘法;
+    // (2)常数 alpha 快路径 —— [cx±innerR] 区间 alpha 恒为 maxAlpha256,
+    //    预计算 inv/blend 常量, 每像素 1 乘 1 加 1 移位, 省距离判定分支
     int radiusSq = radius * radius;
     int innerSq = innerR * innerR;
     int featherRange = radiusSq - innerSq;
+    double invAlphaY = (featherRange > 0) ? (double)maxAlpha256 / (double)featherRange : 0.0;
+    // 常数段混合常量: v' = (v*inv + colorY*alpha) >> 8
+    const int cInvA = 256 - maxAlpha256;
+    const int cAdd = colorY * maxAlpha256;
     int yStart = cy - radius; if (yStart < 0) yStart = 0;
     int yEnd = cy + radius;   if (yEnd > (int)fh) yEnd = (int)fh;
 
@@ -1521,17 +1530,27 @@ static void vcamApplyLightBiPlanar(CVPixelBufferRef buf, uint32_t rgb,
 
         int rxStart = cx - dxMax; if (rxStart < 0) rxStart = 0;
         int rxEnd = cx + dxMax;   if (rxEnd > (int)fw) rxEnd = (int)fw;
-        for (int x = rxStart; x < rxEnd; x++) {
+        // 常数 alpha 段边界(内圆在本行的投影, clamp 到行范围)
+        int cStart = cx - innerR; if (cStart < rxStart) cStart = rxStart;
+        int cEnd = cx + innerR;   if (cEnd > rxEnd) cEnd = rxEnd;
+        // 左羽化段
+        for (int x = rxStart; x < cStart; x++) {
             int dx = x - cx;
             int distSq = dx * dx + dySq;
-            int alpha256;
-            if (distSq <= innerSq) {
-                alpha256 = maxAlpha256;
-            } else if (distSq < radiusSq && featherRange > 0) {
-                alpha256 = maxAlpha256 * (radiusSq - distSq) / featherRange;
-            } else {
-                continue;
-            }
+            if (distSq <= innerSq || distSq >= radiusSq) continue;
+            int alpha256 = (int)((radiusSq - distSq) * invAlphaY);
+            row[x] = (uint8_t)((row[x] * (256 - alpha256) + colorY * alpha256) >> 8);
+        }
+        // 常数 alpha 段(内圆, 无距离计算)
+        for (int x = cStart; x < cEnd; x++) {
+            row[x] = (uint8_t)((row[x] * cInvA + cAdd) >> 8);
+        }
+        // 右羽化段
+        for (int x = cEnd; x < rxEnd; x++) {
+            int dx = x - cx;
+            int distSq = dx * dx + dySq;
+            if (distSq <= innerSq || distSq >= radiusSq) continue;
+            int alpha256 = (int)((radiusSq - distSq) * invAlphaY);
             row[x] = (uint8_t)((row[x] * (256 - alpha256) + colorY * alpha256) >> 8);
         }
     }
@@ -1545,6 +1564,10 @@ static void vcamApplyLightBiPlanar(CVPixelBufferRef buf, uint32_t rgb,
     int radius2Sq = radius2 * radius2;
     int inner2Sq = innerR2 * innerR2;
     int feather2 = radius2Sq - inner2Sq;
+    double invAlphaC = (feather2 > 0) ? (double)maxAlpha256 / (double)feather2 : 0.0;
+    const int cInvU = 256 - maxAlpha256;
+    const int cAddU = colorU * maxAlpha256;
+    const int cAddV = colorV * maxAlpha256;
 
     int y2Start = cy2 - radius2; if (y2Start < 0) y2Start = 0;
     int y2End = cy2 + radius2;   if (y2End > bh2) y2End = bh2;
@@ -1563,19 +1586,32 @@ static void vcamApplyLightBiPlanar(CVPixelBufferRef buf, uint32_t rgb,
 
         int rx2Start = cx2 - dxMax2; if (rx2Start < 0) rx2Start = 0;
         int rx2End = cx2 + dxMax2;   if (rx2End > bw2) rx2End = bw2;
-        for (int x = rx2Start; x < rx2End; x++) {
+        int c2Start = cx2 - innerR2; if (c2Start < rx2Start) c2Start = rx2Start;
+        int c2End = cx2 + innerR2;   if (c2End > rx2End) c2End = rx2End;
+        // 左羽化段
+        for (int x = rx2Start; x < c2Start; x++) {
             int dx = x - cx2;
             int distSq = dx * dx + dySq;
-            int alpha256;
-            if (distSq <= inner2Sq) {
-                alpha256 = maxAlpha256;
-            } else if (distSq < radius2Sq && feather2 > 0) {
-                alpha256 = maxAlpha256 * (radius2Sq - distSq) / feather2;
-            } else {
-                continue;
-            }
+            if (distSq <= inner2Sq || distSq >= radius2Sq) continue;
+            int alpha256 = (int)((radius2Sq - distSq) * invAlphaC);
+            int idx = x * 2;
+            row[idx]     = (uint8_t)((row[idx]     * (256 - alpha256) + colorU * alpha256) >> 8);
+            row[idx + 1] = (uint8_t)((row[idx + 1] * (256 - alpha256) + colorV * alpha256) >> 8);
+        }
+        // 常数 alpha 段
+        for (int x = c2Start; x < c2End; x++) {
             int idx = x * 2;
             // 420f plane1 = [Cb, Cr, Cb, Cr...] (UV 交织; NV21 是 VU, 顺序相反)
+            row[idx]     = (uint8_t)((row[idx]     * cInvU + cAddU) >> 8);
+            row[idx + 1] = (uint8_t)((row[idx + 1] * cInvU + cAddV) >> 8);
+        }
+        // 右羽化段
+        for (int x = c2End; x < rx2End; x++) {
+            int dx = x - cx2;
+            int distSq = dx * dx + dySq;
+            if (distSq <= inner2Sq || distSq >= radius2Sq) continue;
+            int alpha256 = (int)((radius2Sq - distSq) * invAlphaC);
+            int idx = x * 2;
             row[idx]     = (uint8_t)((row[idx]     * (256 - alpha256) + colorU * alpha256) >> 8);
             row[idx + 1] = (uint8_t)((row[idx + 1] * (256 - alpha256) + colorV * alpha256) >> 8);
         }
