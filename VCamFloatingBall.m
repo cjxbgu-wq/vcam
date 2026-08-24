@@ -1285,6 +1285,16 @@ static NSString *vcamLightColorName(uint32_t c) {
     if (_pickSuspended) return;
     if (_pickSkipCount > 0) { _pickSkipCount--; return; }
 
+    // tick 心跳诊断(1.3.40): 每秒一行, 定位 检测timer/捕获线程/看门狗 哪层没动
+    static long tickCount = 0;
+    if (++tickCount % 20 == 1) {  // 0.05s×20 = 1s
+        vcam_ball_log([NSString stringWithFormat:
+            @"[vcam][light] tick#%ld strat=%d alive=%d seq=%llu hbAge=%.2fs",
+            tickCount, gVcamPick.currentStrategy, gVcamPick.threadAlive,
+            (unsigned long long)gVcamPick.seq,
+            CFAbsoluteTimeGetCurrent() - gVcamPick.heartbeat]);
+    }
+
     static int diagTicks = 0;
     uint32_t detected = 0;
     NSString *detName = nil;
