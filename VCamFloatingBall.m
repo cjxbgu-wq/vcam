@@ -73,6 +73,53 @@ static void vcam_ball_log(NSString *msg) {
 
 @end
 
+#pragma mark - 屏幕取色点视图(1.3.37, 空心准星)
+// 中心完全透明(直径 ~28pt 区域): 检测采样取截屏中心 21px(~7pt), 准星本体
+// 绝不落入采样区 —— 截屏(CGWindowListCreateImage OnScreenOnly 含本窗口)
+// 不会把准星自己画进采样导致自污染。四条外刻度线 + 外圆环标记位置。
+@interface VCamPickDotView : UIView
+@end
+
+@implementation VCamPickDotView
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.backgroundColor = [UIColor clearColor];
+        self.userInteractionEnabled = YES;
+    }
+    return self;
+}
+
+- (void)drawRect:(CGRect)rect {
+    CGContextRef ctx = UIGraphicsGetCurrentContext();
+    if (!ctx) return;
+    CGPoint c = CGPointMake(rect.size.width / 2, rect.size.height / 2);
+    CGFloat r = 14;  // 外圆环半径(内缘 12.75, 中心 ~25pt 直径全透明)
+
+    // 双色描边圆环: 白环 + 黑外描, 任何背景(亮/暗)都清晰可见
+    CGContextSetLineWidth(ctx, 2.5);
+    CGContextSetStrokeColorWithColor(ctx, [UIColor colorWithWhite:0 alpha:0.85].CGColor);
+    CGContextStrokeEllipseInRect(ctx, CGRectMake(c.x - r, c.y - r, r * 2, r * 2));
+    CGContextSetLineWidth(ctx, 1.5);
+    CGContextSetStrokeColorWithColor(ctx, [UIColor whiteColor].CGColor);
+    CGContextStrokeEllipseInRect(ctx, CGRectMake(c.x - r + 0.5, c.y - r + 0.5, r * 2 - 1, r * 2 - 1));
+
+    // 四条外刻度线(上/右/下/左, 从半径 17 到 21): 标记圆心方位, 不进中心
+    CGContextSetLineWidth(ctx, 2);
+    CGContextSetStrokeColorWithColor(ctx, [UIColor colorWithWhite:0 alpha:0.85].CGColor);
+    for (int i = 0; i < 4; i++) {
+        double ang = i * M_PI / 2;
+        CGPoint p1 = CGPointMake(c.x + (CGFloat)cos(ang) * 17, c.y + (CGFloat)sin(ang) * 17);
+        CGPoint p2 = CGPointMake(c.x + (CGFloat)cos(ang) * 21, c.y + (CGFloat)sin(ang) * 21);
+        CGContextMoveToPoint(ctx, p1.x, p1.y);
+        CGContextAddLineToPoint(ctx, p2.x, p2.y);
+    }
+    CGContextStrokePath(ctx);
+}
+
+@end
+
 #pragma mark - 悬浮球视图(岐盛相机图标)
 
 @interface VCamBallView : UIView
@@ -154,6 +201,29 @@ static void vcam_ball_log(NSString *msg) {
 @property (nonatomic, assign) CGFloat settingsPageH;   // 设置页内容高度
 @property (nonatomic, assign) CGFloat lightPageH;      // 打光页内容高度
 @property (nonatomic, assign) NSInteger pickerSlot;      // 0=选择视频(vcam.mp4) 2/3=预设槽位
+
+// ===== 三色打光(1.3.37, 复刻 Android ControllerFragment 屏幕取色 + vcplax 注入) =====
+@property (nonatomic, strong) VCamPanelButton *pickColorBtn;  // 屏幕取色总开关
+@property (nonatomic, strong) UIView *lightColorSwatch;       // 检测颜色预览色块
+@property (nonatomic, strong) UILabel *lightColorLabel;       // 检测颜色名称/RGB
+@property (nonatomic, strong) UISlider *lightIntensitySlider; // 打光强度 0-100 (默认 30)
+@property (nonatomic, strong) UISlider *lightDiameterSlider;  // 打光直径 0-100 (默认 48)
+@property (nonatomic, strong) UISlider *lightXSlider;         // 横坐标 0-100 (默认 50)
+@property (nonatomic, strong) UISlider *lightYSlider;         // 纵坐标 0-100 (默认 50)
+@property (nonatomic, strong) UISlider *lightFeatherSlider;   // 边缘羽化 0-100 (默认 100)
+@property (nonatomic, strong) UILabel *lightIntensityValue;
+@property (nonatomic, strong) UILabel *lightDiameterValue;
+@property (nonatomic, strong) UILabel *lightXValue;
+@property (nonatomic, strong) UILabel *lightYValue;
+@property (nonatomic, strong) UILabel *lightFeatherValue;
+@property (nonatomic, strong) UIView *pickDotView;            // 屏幕取色点(空心准星, 可拖)
+@property (nonatomic, strong) dispatch_queue_t colorPickQueue;
+@property (nonatomic, strong) dispatch_source_t colorPickTimer;
+@property (nonatomic, assign) BOOL pickSuspended;             // 拖动取色点中暂停检测
+@property (nonatomic, assign) int pickSkipCount;              // 开启/拖动后跳拍数(残留帧防护)
+@property (nonatomic, assign) uint32_t lastDetectedColor;     // 上次检测色(变化才写 plist)
+@property (nonatomic, assign) BOOL lightFlushScheduled;       // 滑块节流写标记
+@property (nonatomic, assign) BOOL lightParamsDirty;          // 滑块待写标记
 @end
 
 @implementation VCamFloatingBall
@@ -200,12 +270,14 @@ static void vcam_ball_log(NSString *msg) {
 - (void)hideFloatingBall {
     if (!_isFloating) return;
     _isFloating = NO;
+    [self stopColorPickup];  // 检测线程随 window 一起停(1.3.37)
     dispatch_async(dispatch_get_main_queue(), ^{
         [self.overlayWindow removeFromSuperview];
         self.overlayWindow.hidden = YES;
         self.overlayWindow = nil;
         self.ballView = nil;
         self.panelView = nil;
+        self.pickDotView = nil;  // 旧 view 随 window 失效, 重建时新建
     });
     [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
@@ -331,8 +403,8 @@ static void vcam_ball_log(NSString *msg) {
     CGFloat controlH = cellH * 4 + gridGap * 3;          // 197
     // 设置页内容高度: 选择视频 + 预设2 + 预设3 + 前置修正 + 岐盛相机 5 整宽(38*5 + 8*4) + 10 + 水印(16)
     CGFloat settingsH = rowH * 5 + gap * 4 + 10 + 16;    // 248
-    // 打光页内容高度: 占位(功能后续版本接入)
-    CGFloat lightH = 60;
+    // 打光页内容高度(1.3.37): 取色按钮 38 + 6 + 颜色行 22 + 8 + 5 滑块行(30×5 + 6×4) + 4
+    CGFloat lightH = 38 + 6 + 22 + 8 + (30 * 5 + 6 * 4) + 4;  // 252
     // 面板高度跟随激活页签(2026-08-23): 初始=控制页(默认页), 切页动态动画调整,
     // 消除"设置页加高后控制页下方多出空白一行"
     CGFloat panelH = pageTop + controlH + pad;
@@ -506,17 +578,82 @@ static void vcam_ball_log(NSString *msg) {
         }
     }
 
-    // ===== 打光页: 占位(功能后续版本接入) =====
+    // ===== 打光页(1.3.37, 复刻 Android 三色打光): 屏幕取色 + 颜色预览 + 5 参数滑块 =====
+    // 数据流: 取色点(可拖) → 检测线程 0.1s 截屏采样多数表决 → vc.plist lightColor
+    //         → mediaserverd 轮询 → 预渲染圆形渐变光斑注入(公式同 Android vcplax)
     _lightPageView = [[UIView alloc] initWithFrame:CGRectMake(0, pageTop, panelW, lightH)];
     _lightPageView.backgroundColor = [UIColor clearColor];
     [_panelView addSubview:_lightPageView];
 
-    UILabel *lightTip = [[UILabel alloc] initWithFrame:CGRectMake(pad, 18, contentW, 24)];
-    lightTip.text = @"打光功能待接入";
-    lightTip.textColor = [UIColor colorWithRed:0.62 green:0.63 blue:0.65 alpha:1.0];
-    lightTip.textAlignment = NSTextAlignmentCenter;
-    lightTip.font = [UIFont systemFontOfSize:13];
-    [_lightPageView addSubview:lightTip];
+    // 屏幕取色总开关: 开 = 取色点显示 + 检测启动 + 打光启用(颜色跟屏幕闪烁)
+    _pickColorBtn = [self makeButton:@"屏幕取色: 关"
+                               frame:CGRectMake(pad, 0, contentW, rowH)
+                             selector:@selector(pickColorTapped)];
+    _pickColorBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    [_lightPageView addSubview:_pickColorBtn];
+
+    // 检测颜色预览行: 色块 + 名称/RGB
+    CGFloat colorRowY = rowH + 6;
+    _lightColorSwatch = [[UIView alloc] initWithFrame:CGRectMake(pad, colorRowY + 3, 16, 16)];
+    _lightColorSwatch.layer.cornerRadius = 3;
+    _lightColorSwatch.layer.borderWidth = 1;
+    _lightColorSwatch.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.4].CGColor;
+    _lightColorSwatch.backgroundColor = [UIColor colorWithWhite:1 alpha:0.12];
+    [_lightPageView addSubview:_lightColorSwatch];
+    _lightColorLabel = [[UILabel alloc] initWithFrame:CGRectMake(pad + 24, colorRowY, contentW - 24, 22)];
+    _lightColorLabel.text = @"颜色: 未检测";
+    _lightColorLabel.textColor = [UIColor colorWithRed:0.72 green:0.73 blue:0.75 alpha:1.0];
+    _lightColorLabel.font = [UIFont systemFontOfSize:12];
+    [_lightPageView addSubview:_lightColorLabel];
+
+    // 5 参数滑块行: 标题(56) + 滑块 + 值(42), 默认 强度30/直径48/X50/Y50/羽化100
+    CGFloat sliderX = pad + 56;
+    CGFloat sliderW = contentW - 56 - 42;
+    CGFloat sy = colorRowY + 22 + 8;
+    CGFloat rowStep = 30 + 6;
+    struct LightRow { NSString *title; UISlider **slider; UILabel **value; SEL action; };
+    struct LightRow rows[] = {
+        {@"打光强度", &_lightIntensitySlider, &_lightIntensityValue, @selector(lightIntensityChanged:)},
+        {@"打光直径", &_lightDiameterSlider, &_lightDiameterValue, @selector(lightDiameterChanged:)},
+        {@"横坐标",   &_lightXSlider,        &_lightXValue,        @selector(lightXChanged:)},
+        {@"纵坐标",   &_lightYSlider,        &_lightYValue,        @selector(lightYChanged:)},
+        {@"边缘羽化", &_lightFeatherSlider,  &_lightFeatherValue,  @selector(lightFeatherChanged:)},
+    };
+    // plist 已有值优先(跨进程持久化), 否则用默认值
+    int initVals[5] = {
+        [VCamNotify plistLightIntensity], [VCamNotify plistLightDiameter],
+        [VCamNotify plistLightX], [VCamNotify plistLightY],
+        [VCamNotify plistLightFeather]
+    };
+    for (int i = 0; i < 5; i++) {
+        CGFloat ry = sy + rowStep * i;
+        UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(pad, ry + 5, 56, 20)];
+        title.text = rows[i].title;
+        title.textColor = [UIColor colorWithRed:0.72 green:0.73 blue:0.75 alpha:1.0];
+        title.font = [UIFont systemFontOfSize:12];
+        [_lightPageView addSubview:title];
+
+        UISlider *slider = [[UISlider alloc] initWithFrame:CGRectMake(sliderX, ry + 1, sliderW, 28)];
+        slider.minimumValue = 0;
+        slider.maximumValue = 100;
+        int v = initVals[i];
+        if (v < 0) v = 0;
+        if (v > 100) v = 100;
+        slider.value = (float)v;
+        slider.minimumTrackTintColor = [UIColor colorWithRed:0.55 green:0.56 blue:0.58 alpha:1.0];
+        [slider addTarget:self action:rows[i].action forControlEvents:UIControlEventValueChanged];
+        [_lightPageView addSubview:slider];
+
+        UILabel *val = [[UILabel alloc] initWithFrame:CGRectMake(pad + contentW - 42, ry + 5, 42, 20)];
+        val.text = [NSString stringWithFormat:@"%d%%", v];
+        val.textColor = [UIColor whiteColor];
+        val.font = [UIFont systemFontOfSize:12];
+        val.textAlignment = NSTextAlignmentRight;
+        [_lightPageView addSubview:val];
+
+        *rows[i].slider = slider;
+        *rows[i].value = val;
+    }
 
     // ===== 设置页 =====
     _settingsPageView = [[UIView alloc] initWithFrame:CGRectMake(0, pageTop, panelW, settingsH)];
@@ -577,6 +714,18 @@ static void vcam_ball_log(NSString *msg) {
 
     // 面板先加, 悬浮球后加 → 球永远在面板上层, 即使重叠也能拖动/点击
     [_overlayWindow addSubview:_panelView];
+
+    // 打光状态恢复(1.3.37): respring 前取色模式开着 → 恢复取色点 + 检测。
+    // 必须在面板 addSubview 之后 → 取色点最后添加位于面板/球之上
+    if ([VCamNotify plistLightEnabled]) {
+        _lastDetectedColor = [VCamNotify plistLightColor];
+        _pickSkipCount = 3;
+        [self showPickDot];
+        [self startColorPickup];
+        [_pickColorBtn setTitle:@"屏幕取色: 开" forState:UIControlStateNormal];
+        [self updateColorPreview:_lastDetectedColor];
+        vcam_ball_log(@"[vcam][light] pickup state restored from plist");
+    }
 }
 
 - (void)refreshTabStyles {
@@ -621,6 +770,271 @@ static void vcam_ball_log(NSString *msg) {
     _settingsPageView.hidden = YES;
     [self refreshTabStyles];
     [self applyPanelContentHeight:_lightPageH];
+}
+
+#pragma mark - 三色打光(1.3.37, 复刻 Android 屏幕取色 → vc.plist → mediaserverd 注入)
+
+// 近似颜色名(检测预览显示用)
+static NSString *vcamLightColorName(uint32_t c) {
+    int r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
+    if (r > 200 && g < 80 && b < 80) return @"红";
+    if (r < 80 && g > 200 && b < 80) return @"绿";
+    if (r < 80 && g < 80 && b > 200) return @"蓝";
+    if (r > 200 && g > 200 && b < 80) return @"黄";
+    if (r < 80 && g > 200 && b > 200) return @"青";
+    if (r > 200 && g < 80 && b > 200) return @"紫";
+    if (r > 220 && g > 220 && b > 220) return @"白";
+    return @"自定义";
+}
+
+// 屏幕取色总开关: 开 = 取色点显示 + 检测启动 + 打光启用(光斑颜色跟屏幕闪烁);
+// 关 = 全链路熄灭(lightColor=0, mediaserverd 注入直通零开销)
+- (void)pickColorTapped {
+    BOOL on = ![VCamNotify plistLightEnabled];
+    [VCamNotify setPlistLightEnabled:on];
+    if (on) {
+        [VCamNotify setPlistLightColor:0];  // 复位, 检测到颜色再写(避免残留旧色)
+        _lastDetectedColor = 0;
+        _pickSkipCount = 3;  // 跳前 3 拍(Android FRAME_SKIP_ON_START: 避免残留状态误检)
+        [self showPickDot];
+        [self startColorPickup];
+        [_pickColorBtn setTitle:@"屏幕取色: 开" forState:UIControlStateNormal];
+        vcam_ball_log(@"[vcam][light] screen color pickup ON");
+    } else {
+        [self stopColorPickup];
+        [self hidePickDot];
+        [VCamNotify setPlistLightColor:0];
+        _lastDetectedColor = 0;
+        [self updateColorPreview:0];
+        [_pickColorBtn setTitle:@"屏幕取色: 关" forState:UIControlStateNormal];
+        vcam_ball_log(@"[vcam][light] screen color pickup OFF");
+    }
+}
+
+// 取色点(空心准星): 中心透明设计 → 截屏采样不受自身污染
+- (void)showPickDot {
+    if (!_overlayWindow) return;
+    if (_pickDotView) {
+        _pickDotView.hidden = NO;
+        return;
+    }
+    NSDictionary *pl = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath] ?: @{};
+    CGFloat px = [pl[@"lightPickX"] doubleValue];
+    CGFloat py = [pl[@"lightPickY"] doubleValue];
+    CGRect sb = _overlayWindow.bounds;
+    if (px <= 0 || py <= 0) { px = sb.size.width / 2; py = sb.size.height / 2; }
+    px = MAX(22, MIN(sb.size.width - 22, px));
+    py = MAX(22, MIN(sb.size.height - 22, py));
+    _pickDotView = [[VCamPickDotView alloc] initWithFrame:CGRectMake(px - 22, py - 22, 44, 44)];
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self
+                                                                          action:@selector(pickDotDragged:)];
+    [_pickDotView addGestureRecognizer:pan];
+    [_overlayWindow addSubview:_pickDotView];  // 最后添加 → 位于面板/球之上
+}
+
+- (void)hidePickDot {
+    _pickDotView.hidden = YES;
+}
+
+// 拖动取色点: 拖动中暂停检测(手指物理遮挡采样区, 采样无意义);
+// 松手写位置到 vc.plist(持久化 + 检测线程按最新位置采样)并跳 3 拍
+- (void)pickDotDragged:(UIPanGestureRecognizer *)g {
+    if (!_pickDotView) return;
+    CGPoint t = [g translationInView:_overlayWindow];
+    CGPoint c = CGPointMake(_pickDotView.center.x + t.x, _pickDotView.center.y + t.y);
+    c.x = MAX(22, MIN(_overlayWindow.bounds.size.width - 22, c.x));
+    c.y = MAX(22, MIN(_overlayWindow.bounds.size.height - 22, c.y));
+    _pickDotView.center = c;
+    [g setTranslation:CGPointZero inView:_overlayWindow];
+    if (g.state == UIGestureRecognizerStateBegan) {
+        _pickSuspended = YES;
+    }
+    if (g.state == UIGestureRecognizerStateEnded || g.state == UIGestureRecognizerStateCancelled) {
+        _pickSuspended = NO;
+        _pickSkipCount = 3;
+        NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithDictionary:
+            [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath] ?: @{}];
+        dict[@"lightPickX"] = @(c.x);
+        dict[@"lightPickY"] = @(c.y);
+        [dict writeToFile:VCamPlistPath atomically:YES];
+        vcam_ball_log([NSString stringWithFormat:@"[vcam][light] pick dot moved to (%.0f,%.0f)", c.x, c.y]);
+    }
+}
+
+// 检测线程: 0.1s 节拍 serial queue(独立于主线程, 截屏+采样不卡 UI)
+- (void)startColorPickup {
+    if (_colorPickTimer) return;
+    if (!_colorPickQueue) {
+        _colorPickQueue = dispatch_queue_create("vcam.colorpick", DISPATCH_QUEUE_SERIAL);
+    }
+    _colorPickTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _colorPickQueue);
+    dispatch_source_set_timer(_colorPickTimer,
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
+                              (uint64_t)(0.1 * NSEC_PER_SEC),
+                              (uint64_t)(0.05 * NSEC_PER_SEC));
+    __weak typeof(self) weakSelf = self;
+    dispatch_source_set_event_handler(_colorPickTimer, ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (strongSelf) [strongSelf colorPickTick];
+    });
+    dispatch_resume(_colorPickTimer);
+    vcam_ball_log(@"[vcam][light] color pickup timer started (0.1s)");
+}
+
+- (void)stopColorPickup {
+    if (_colorPickTimer) {
+        dispatch_source_cancel(_colorPickTimer);
+        _colorPickTimer = nil;
+        vcam_ball_log(@"[vcam][light] color pickup timer stopped");
+    }
+}
+
+// 检测一拍(复刻 Android onImageAvailable 采样算法):
+// 截取色点周围 44x44pt → 中心 21x21px 采样 → 饱和度过滤(max>180 且 max-min>60)
+// → RGB 量化 >>5 到 512 桶 → 多数表决(bestCount>=30) → 颜色变化写 vc.plist
+// 检测不到鲜艳色 → lightColor=0 = 打光熄灭(颜色跟随屏幕闪烁熄/亮)
+- (void)colorPickTick {
+    if (_pickSuspended) return;
+    if (_pickSkipCount > 0) { _pickSkipCount--; return; }
+
+    // 取色点位置(pt): 松手时写入; 未初始化用屏幕中心
+    NSDictionary *pl = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath] ?: @{};
+    CGFloat px = [pl[@"lightPickX"] doubleValue];
+    CGFloat py = [pl[@"lightPickY"] doubleValue];
+    CGRect sb = [UIScreen mainScreen].bounds;
+    if (px <= 0 || py <= 0) { px = sb.size.width / 2; py = sb.size.height / 2; }
+
+    // 截屏(小区域): SpringBoard 系统进程内 CGWindowListCreateImage 可用,
+    // 只合成取色点周围 44x44pt(GPU 小区域读回, 开销极低)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    CGImageRef img = CGWindowListCreateImage(
+        CGRectMake(px - 22, py - 22, 44, 44),
+        kCGWindowListOptionOnScreenOnly, kCGNullWindowID, kCGWindowImageDefault);
+#pragma clang diagnostic pop
+    if (!img) return;  // 截屏失败(罕见): 本拍跳过, 不熄灯(避免误闪)
+
+    const int S = 21;  // 采样边长(像素, ~7pt): 准星中心透明区内
+    size_t iw = CGImageGetWidth(img), ih = CGImageGetHeight(img);
+    if (iw >= (size_t)S && ih >= (size_t)S) {
+        CGImageRef crop = CGImageCreateWithImageInRect(img,
+            CGRectMake((CGFloat)(iw - S) / 2.0, (CGFloat)(ih - S) / 2.0, S, S));
+        if (crop) {
+            CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+            CGContextRef bctx = CGBitmapContextCreate(NULL, S, S, 8, S * 4, cs,
+                                                      kCGBitmapByteOrder32Big | kCGImageAlphaPremultipliedLast);
+            if (bctx) {
+                CGContextDrawImage(bctx, CGRectMake(0, 0, S, S), crop);
+                const uint8_t *rgba = (const uint8_t *)CGBitmapContextGetData(bctx);
+
+                // 量化多数表决(Android 同款: 8x8x8=512 桶, 每通道 >>5)
+                int counts[512] = {0};
+                int sumR[512] = {0}, sumG[512] = {0}, sumB[512] = {0};
+                for (int y = 0; y < S; y++) {
+                    for (int x = 0; x < S; x++) {
+                        const uint8_t *p = rgba + (y * S + x) * 4;
+                        int r = p[0], g = p[1], b = p[2];
+                        int maxc = MAX(MAX(r, g), b), minc = MIN(MIN(r, g), b);
+                        if (maxc < 180 || maxc - minc < 60) continue;  // 饱和度过滤
+                        int idx = ((r >> 5) << 6) | ((g >> 5) << 3) | (b >> 5);
+                        counts[idx]++; sumR[idx] += r; sumG[idx] += g; sumB[idx] += b;
+                    }
+                }
+                int bestIdx = 0, bestCount = 0;
+                for (int i = 0; i < 512; i++) {
+                    if (counts[i] > bestCount) { bestCount = counts[i]; bestIdx = i; }
+                }
+                uint32_t detected = 0;
+                if (bestCount >= 30) {  // 441 像素的 ~7%(对齐 Android 10/121)
+                    int r = sumR[bestIdx] / bestCount;
+                    int g = sumG[bestIdx] / bestCount;
+                    int b = sumB[bestIdx] / bestCount;
+                    detected = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+                }
+
+                if (detected != _lastDetectedColor) {
+                    _lastDetectedColor = detected;
+                    [VCamNotify setPlistLightColor:detected];  // 0=熄灭
+                    uint32_t d = detected;
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [self updateColorPreview:d];
+                    });
+                    vcam_ball_log([NSString stringWithFormat:
+                        @"[vcam][light] color detected: 0x%06x %@", d, vcamLightColorName(d)]);
+                }
+                CGContextRelease(bctx);
+            }
+            CGColorSpaceRelease(cs);
+            CFRelease(crop);
+        }
+    }
+    CFRelease(img);
+}
+
+// 主线程更新颜色预览
+- (void)updateColorPreview:(uint32_t)color {
+    if (color == 0) {
+        _lightColorSwatch.backgroundColor = [UIColor colorWithWhite:1 alpha:0.12];
+        _lightColorLabel.text = @"颜色: 未检测";
+    } else {
+        _lightColorSwatch.backgroundColor = [UIColor colorWithRed:((color >> 16) & 0xFF) / 255.0
+                                                             green:((color >> 8) & 0xFF) / 255.0
+                                                              blue:(color & 0xFF) / 255.0 alpha:1];
+        _lightColorLabel.text = [NSString stringWithFormat:@"颜色: %@ (%d,%d,%d)",
+                                 vcamLightColorName(color),
+                                 (int)((color >> 16) & 0xFF),
+                                 (int)((color >> 8) & 0xFF),
+                                 (int)(color & 0xFF)];
+    }
+}
+
+// ===== 打光参数滑块(节流写: 拖动中 0.12s 合并落盘一次, Android 同款思路) =====
+- (void)lightIntensityChanged:(UISlider *)s {
+    _lightIntensityValue.text = [NSString stringWithFormat:@"%d%%", (int)lroundf(s.value)];
+    [self scheduleLightParamsFlush];
+}
+- (void)lightDiameterChanged:(UISlider *)s {
+    _lightDiameterValue.text = [NSString stringWithFormat:@"%d%%", (int)lroundf(s.value)];
+    [self scheduleLightParamsFlush];
+}
+- (void)lightXChanged:(UISlider *)s {
+    _lightXValue.text = [NSString stringWithFormat:@"%d%%", (int)lroundf(s.value)];
+    [self scheduleLightParamsFlush];
+}
+- (void)lightYChanged:(UISlider *)s {
+    _lightYValue.text = [NSString stringWithFormat:@"%d%%", (int)lroundf(s.value)];
+    [self scheduleLightParamsFlush];
+}
+- (void)lightFeatherChanged:(UISlider *)s {
+    _lightFeatherValue.text = [NSString stringWithFormat:@"%d%%", (int)lroundf(s.value)];
+    [self scheduleLightParamsFlush];
+}
+
+- (void)scheduleLightParamsFlush {
+    _lightParamsDirty = YES;
+    if (_lightFlushScheduled) return;
+    _lightFlushScheduled = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        _lightFlushScheduled = NO;
+        if (_lightParamsDirty) {
+            _lightParamsDirty = NO;
+            [self flushLightParams];
+        }
+    });
+}
+
+// 5 参数一次读改写批量落盘(0.12s 节流上限, 拖动全程打光实时跟随)
+- (void)flushLightParams {
+    if (!_lightIntensitySlider) return;
+    NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithDictionary:
+        [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath] ?: @{}];
+    dict[@"lightIntensity"] = @((int)lroundf(_lightIntensitySlider.value));
+    dict[@"lightDiameter"] = @((int)lroundf(_lightDiameterSlider.value));
+    dict[@"lightX"] = @((int)lroundf(_lightXSlider.value));
+    dict[@"lightY"] = @((int)lroundf(_lightYSlider.value));
+    dict[@"lightFeather"] = @((int)lroundf(_lightFeatherSlider.value));
+    [dict writeToFile:VCamPlistPath atomically:YES];
 }
 
 - (void)settingsTabTapped {
