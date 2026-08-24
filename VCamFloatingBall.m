@@ -892,8 +892,24 @@ static NSString *vcamLightColorName(uint32_t c) {
 }
 
 // iOS 私有截屏(录屏类 tweak 经典方案): SpringBoard 系统进程内可用,
-// 返回全屏 CGImageRef(含前台 App 画面), 数据行 0 = 屏幕顶行
-extern CGImageRef UIGetScreenImage(void);
+// 返回全屏 CGImageRef(含前台 App 画面), 数据行 0 = 屏幕顶行。
+// 必须用 dlsym 运行时解析(VTPixelRotationSession 同款防御模式):
+// extern 直接链接会在加载期绑定符号(chained fixups), 设备 UIKitCore
+// 若未导出 → 整个 dylib 被 dyld 拒载(1.3.37 首发实证: SB/mediaserverd
+// 全部功能丢失无崩溃)。dlsym 失败只影响打光检测, 日志可诊断。
+#include <dlfcn.h>
+typedef CGImageRef (*VcamUIGetScreenImageFn)(void);
+static VcamUIGetScreenImageFn vcamUIGetScreenImage(void) {
+    static VcamUIGetScreenImageFn fn = NULL;
+    static int probed = 0;
+    if (!probed) {
+        probed = 1;
+        fn = (VcamUIGetScreenImageFn)dlsym(RTLD_DEFAULT, "UIGetScreenImage");
+        vcam_ball_log([NSString stringWithFormat:
+            @"[vcam][light] UIGetScreenImage dlsym = %@", fn ? @"OK" : @"NULL (capture unavailable)"]);
+    }
+    return fn;
+}
 
 // 检测一拍(复刻 Android onImageAvailable 采样算法):
 // UIGetScreenImage 全屏 → UIGraphicsImageRenderer 只重绘取色点周围 44x44pt
@@ -911,8 +927,10 @@ extern CGImageRef UIGetScreenImage(void);
     CGRect sb = [UIScreen mainScreen].bounds;
     if (px <= 0 || py <= 0) { px = sb.size.width / 2; py = sb.size.height / 2; }
 
-    // 全屏截屏(SpringBoard 权限)
-    CGImageRef full = UIGetScreenImage();
+    // 全屏截屏(SpringBoard 权限; dlsym 运行时解析, 不可用则本拍跳过)
+    VcamUIGetScreenImageFn capFn = vcamUIGetScreenImage();
+    if (!capFn) return;
+    CGImageRef full = capFn();
     if (!full) return;  // 截屏失败(罕见): 本拍跳过, 不熄灯(避免误闪)
     UIImage *fullImg = [UIImage imageWithCGImage:full];
     CFRelease(full);
