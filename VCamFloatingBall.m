@@ -1131,7 +1131,14 @@ static NSString *vcamLightColorName(uint32_t c) {
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self
                                                                           action:@selector(pickDotDragged:)];
     [_pickDotView addGestureRecognizer:pan];
-    [_overlayWindow addSubview:_pickDotView];  // 最后添加 → 位于面板/球之上
+    // 1.3.43: 层级改为 屏幕内容之上、悬浮窗 UI 之下 —— 同一 overlay window
+    // (window 本身 Alert+100 已高于全部屏幕内容), 但插到悬浮球/面板的下层。
+    // 命中测试按逆 z 序遍历, 准星未被面板盖住时触摸仍可命中(可拖动)。
+    if (_ballView) {
+        [_overlayWindow insertSubview:_pickDotView belowSubview:_ballView];
+    } else {
+        [_overlayWindow insertSubview:_pickDotView atIndex:1];  // rootVC.view 之上
+    }
 }
 
 - (void)hidePickDot {
@@ -1330,6 +1337,14 @@ static NSString *vcamLightColorName(uint32_t c) {
             [self launchPickCaptureThread];  // 下一策略或 UICSI 模式
         }
     }
+
+    // 1.3.43 遮挡掩蔽: 采样点被悬浮球/面板盖住 → 本拍不检测不消费不写色,
+    // 保持上一检测色(光斑持续稳定)。面板 UI 像素(按钮按下高亮/颜色预览块/
+    // 滑块)不再进入采样 —— 断开"预览块显示检测色 → 采到预览色"的自反馈环,
+    // 点击任何按键(含"复")都不影响已打到画面上的光。
+    CGPoint pickPt = CGPointMake(gVcamPick.px, gVcamPick.py);
+    if (_ballView && CGRectContainsPoint(_ballView.frame, pickPt)) return;
+    if (_panelView && !_panelView.hidden && CGRectContainsPoint(_panelView.frame, pickPt)) return;
 
     if (gVcamPick.currentStrategy >= 0 && gVcamPick.threadAlive) {
         // ===== CARS 模式: 消费捕获线程结果 =====
