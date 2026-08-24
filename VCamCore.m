@@ -1250,8 +1250,9 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
     vcam_core_log(@"[vcam] State polling timer started");
 
     __weak typeof(self) weakSelf = self;
-    // 0.15s 轮询: 悬浮球按钮(转/镜/播/切源)生效延迟降到最长 0.15s(平均 75ms),
+    // 0.15s 主轮询: 悬浮球按钮(转/镜/播/切源)生效延迟降到最长 0.15s(平均 75ms),
     // 单次 plist 读取 ~0.1ms 开销可忽略, 读取在后台 notify 队列不占主线程
+    // (打光 7 键 1.3.45 起拆到下方 0.04s 快速轮询 —— 跟随屏幕闪烁)
     [[VCamNotify sharedInstance] startPollingWithInterval:0.15 callback:^(BOOL enabled) {
         VCamCore *strongSelf = weakSelf;
         if (!strongSelf) return;
@@ -1402,43 +1403,8 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                 plistPanX, plistPanY, panSgn < 0 ? @"[front-fix]" : @"", plistZoom]);
         }
 
-        // 三色打光同步(1.3.37): 悬浮球屏幕取色检测写 vc.plist(lightColor 跟随屏幕
-        // 闪烁 0.1s 级变化), 此处轮询同步到 gpuProcessor; 变化时预渲染线程重新
-        // 产出帧(跳过判定含打光签名) → 光斑实时跟随。参数签名打包比较, 任一变化
-        // 即整体刷新(避免 7 字段逐个比较的冗长代码)
-        {
-            static uint64_t lastLightSig = 0;
-            BOOL lEnabled = [pl[@"lightEnabled"] boolValue];
-            uint32_t lColor = (uint32_t)[pl[@"lightColor"] unsignedIntValue];
-            int lX = [pl[@"lightX"] intValue];
-            int lY = [pl[@"lightY"] intValue];
-            int lInt = [pl[@"lightIntensity"] intValue];
-            int lDia = [pl[@"lightDiameter"] intValue];
-            int lFea = [pl[@"lightFeather"] intValue];
-            if (lX <= 0 || lX > 100) lX = 50;      // 缺失/非法回默认
-            if (lY <= 0 || lY > 100) lY = 50;
-            if (lInt < 0 || lInt > 100) lInt = 30;
-            if (lDia <= 0 || lDia > 100) lDia = 48;
-            if (lFea < 0 || lFea > 100) lFea = 100;
-            uint64_t sig = ((uint64_t)(lEnabled ? 1 : 0) << 59)
-                         | ((uint64_t)(lColor & 0xFFFFFF) << 35)
-                         | ((uint64_t)lX << 28) | ((uint64_t)lY << 21)
-                         | ((uint64_t)lInt << 14) | ((uint64_t)lDia << 7)
-                         | (uint64_t)lFea;
-            if (sig != lastLightSig) {
-                strongSelf.gpuProcessor.lightEnabled = lEnabled;
-                strongSelf.gpuProcessor.lightColorRGB = lColor;
-                strongSelf.gpuProcessor.lightX = lX;
-                strongSelf.gpuProcessor.lightY = lY;
-                strongSelf.gpuProcessor.lightIntensity = lInt;
-                strongSelf.gpuProcessor.lightDiameter = lDia;
-                strongSelf.gpuProcessor.lightFeather = lFea;
-                lastLightSig = sig;
-                vcam_core_log([NSString stringWithFormat:
-                    @"[vcam] light synced: on=%d color=0x%06x pos(%d,%d) int=%d dia=%d fea=%d",
-                    (int)lEnabled, lColor, lX, lY, lInt, lDia, lFea]);
-            }
-        }
+        // 三色打光同步(1.3.45): 挪到 0.04s 专用快速轮询(见 startLightPolling
+        // 回调), lightColor 跟随屏幕闪烁 0.1s 级变化, 0.15s 主节拍跟不上
 
         // 视频源切换(悬浮球 1/2/3 键): activePlaybackPath 变化 → 自动重载新视频
         // (无需 toggle enabled, 轮询 0.15s 内生效; 路径写入由悬浮球完成)
@@ -1507,10 +1473,51 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
             lastRestartToken = restartToken;
         }
     }];
+
+    // 三色打光快速轮询(1.3.45): 0.04s 节拍(25Hz)同步打光 7 键到 gpuProcessor。
+    // 延迟链: 悬浮球检测 0.04s → 写 plist → 本轮询 ≤0.04s → 预渲染跳过判定
+    // 看到 lightSig 变化 → 重产出帧 → render。原 0.15s 主轮询是闪烁跟不上
+    // 的延迟大头(最坏 150ms, 现 ≤40ms)。timer 与主轮询同串行队列天然互斥
+    [[VCamNotify sharedInstance] startLightPollingWithInterval:0.04 callback:^(NSDictionary *pl) {
+        VCamCore *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        static uint64_t lastLightSig = 0;
+        BOOL lEnabled = [pl[@"lightEnabled"] boolValue];
+        uint32_t lColor = (uint32_t)[pl[@"lightColor"] unsignedIntValue];
+        int lX = [pl[@"lightX"] intValue];
+        int lY = [pl[@"lightY"] intValue];
+        int lInt = [pl[@"lightIntensity"] intValue];
+        int lDia = [pl[@"lightDiameter"] intValue];
+        int lFea = [pl[@"lightFeather"] intValue];
+        if (lX <= 0 || lX > 100) lX = 50;      // 缺失/非法回默认
+        if (lY <= 0 || lY > 100) lY = 50;
+        if (lInt < 0 || lInt > 100) lInt = 30;
+        if (lDia <= 0 || lDia > 100) lDia = 48;
+        if (lFea < 0 || lFea > 100) lFea = 100;
+        uint64_t sig = ((uint64_t)(lEnabled ? 1 : 0) << 59)
+                     | ((uint64_t)(lColor & 0xFFFFFF) << 35)
+                     | ((uint64_t)lX << 28) | ((uint64_t)lY << 21)
+                     | ((uint64_t)lInt << 14) | ((uint64_t)lDia << 7)
+                     | (uint64_t)lFea;
+        if (sig != lastLightSig) {
+            strongSelf.gpuProcessor.lightEnabled = lEnabled;
+            strongSelf.gpuProcessor.lightColorRGB = lColor;
+            strongSelf.gpuProcessor.lightX = lX;
+            strongSelf.gpuProcessor.lightY = lY;
+            strongSelf.gpuProcessor.lightIntensity = lInt;
+            strongSelf.gpuProcessor.lightDiameter = lDia;
+            strongSelf.gpuProcessor.lightFeather = lFea;
+            lastLightSig = sig;
+            vcam_core_log([NSString stringWithFormat:
+                @"[vcam] light synced: on=%d color=0x%06x pos(%d,%d) int=%d dia=%d fea=%d",
+                (int)lEnabled, lColor, lX, lY, lInt, lDia, lFea]);
+        }
+    }];
 }
 
 - (void)stopStatePolling {
     [[VCamNotify sharedInstance] stopPolling];
+    [[VCamNotify sharedInstance] stopLightPolling];
     _pollingActive = NO;
 }
 
