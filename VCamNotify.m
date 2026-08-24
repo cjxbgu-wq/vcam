@@ -368,4 +368,83 @@ static void vcam_darwin_callback(CFNotificationCenterRef center, void *observer,
     [dict writeToFile:VCamPlistPath atomically:YES];
 }
 
+#pragma mark - 三色打光(1.3.37, 跨进程: 悬浮球检测写, mediaserverd 轮询应用)
+
+// 检测颜色高频写(0.1s 节拍且仅变化时): 单键写, 与既有 per-key 模式一致
++ (BOOL)plistLightEnabled {
+    NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath];
+    return [dict[@"lightEnabled"] boolValue];
+}
++ (void)setPlistLightEnabled:(BOOL)enabled {
+    NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithDictionary:
+        [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath] ?: @{}];
+    dict[@"lightEnabled"] = @(enabled);
+    [dict writeToFile:VCamPlistPath atomically:YES];
+}
++ (uint32_t)plistLightColor {
+    NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath];
+    return (uint32_t)[dict[@"lightColor"] unsignedIntValue];
+}
++ (void)setPlistLightColor:(uint32_t)color {
+    NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithDictionary:
+        [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath] ?: @{}];
+    dict[@"lightColor"] = @(color);
+    [dict writeToFile:VCamPlistPath atomically:YES];
+}
++ (int)plistLightX {
+    NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath];
+    NSNumber *v = dict[@"lightX"];
+    return v ? [v intValue] : 50;
+}
++ (void)setPlistLightX:(int)x {
+    NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithDictionary:
+        [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath] ?: @{}];
+    dict[@"lightX"] = @(x);
+    [dict writeToFile:VCamPlistPath atomically:YES];
+}
++ (int)plistLightY {
+    NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath];
+    NSNumber *v = dict[@"lightY"];
+    return v ? [v intValue] : 50;
+}
++ (void)setPlistLightY:(int)y {
+    NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithDictionary:
+        [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath] ?: @{}];
+    dict[@"lightY"] = @(y);
+    [dict writeToFile:VCamPlistPath atomically:YES];
+}
++ (int)plistLightIntensity {
+    NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath];
+    NSNumber *v = dict[@"lightIntensity"];
+    return v ? [v intValue] : 30;
+}
++ (void)setPlistLightIntensity:(int)v {
+    NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithDictionary:
+        [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath] ?: @{}];
+    dict[@"lightIntensity"] = @(v);
+    [dict writeToFile:VCamPlistPath atomically:YES];
+}
++ (int)plistLightDiameter {
+    NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath];
+    NSNumber *v = dict[@"lightDiameter"];
+    return v ? [v intValue] : 48;
+}
++ (void)setPlistLightDiameter:(int)v {
+    NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithDictionary:
+        [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath] ?: @{}];
+    dict[@"lightDiameter"] = @(v);
+    [dict writeToFile:VCamPlistPath atomically:YES];
+}
++ (int)plistLightFeather {
+    NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath];
+    NSNumber *v = dict[@"lightFeather"];
+    return v ? [v intValue] : 100;
+}
++ (void)setPlistLightFeather:(int)v {
+    NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithDictionary:
+        [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath] ?: @{}];
+    dict[@"lightFeather"] = @(v);
+    [dict writeToFile:VCamPlistPath atomically:YES];
+}
+
 @end
