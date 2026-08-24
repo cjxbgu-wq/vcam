@@ -175,9 +175,20 @@ static VcamUICreateScreenImageFn vcamUICreateScreenImage(void) {
 static const uint32_t vcamKnownLights[7] = {
     0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0x00FFFF, 0xFF00FF, 0xFFFFFF
 };
-static NSString *const vcamKnownLightNames[7] = {
-    @"红", @"绿", @"蓝", @"黄", @"青", @"紫", @"白"
-};
+// 名称 getter 函数(非静态数组: 混淆器把字符串字面量换成运行时解密调用,
+// 全局数组的非常量初始化器编译不过 —— 工程既有约束, 同 ovfN 模式)
+static NSString *vcamKnownLightName(int idx) {
+    switch (idx) {
+        case 0: return @"红";
+        case 1: return @"绿";
+        case 2: return @"蓝";
+        case 3: return @"黄";
+        case 4: return @"青";
+        case 5: return @"紫";
+        case 6: return @"白";
+    }
+    return @"?";
+}
 
 // RGBA 像素数组 → 已知色匹配。返回 0=无匹配, 否则标准色值; outName/outCount 诊断
 static uint32_t vcamMatchKnownLight(const uint8_t *rgba, int n, NSString **outName, int *outCount) {
@@ -202,7 +213,7 @@ static uint32_t vcamMatchKnownLight(const uint8_t *rgba, int n, NSString **outNa
         if (counts[k] > bestC) { bestC = counts[k]; bestK = k; }
     }
     if (bestK >= 0 && bestC >= 30) {  // 441 像素的 ~7%
-        if (outName) *outName = vcamKnownLightNames[bestK];
+        if (outName) *outName = vcamKnownLightName(bestK);
         if (outCount) *outCount = bestC;
         return vcamKnownLights[bestK];
     }
