@@ -190,6 +190,9 @@ static void vcam_core_log(NSString *msg) {
 @property (nonatomic, assign) double lastPrerenderPanX;
 @property (nonatomic, assign) double lastPrerenderPanY;
 @property (nonatomic, assign) double lastPrerenderZoom;
+// 三色打光签名(1.3.37)也纳入跳过判定: 暂停状态下检测颜色跳变/滑块调节时
+// 必须重新产出(注入新光斑)。签名打包: enabled(1) color(24) x/y/int/dia/fea(7×5)
+@property (nonatomic, assign) uint64_t lastPrerenderLightSig;
 
 // ===== 相机空闲门控(2026-08-16 发热优化) =====
 // 根因: 替换开启期间解码+预渲染按视频帧率 30fps 常转, 而相机流只在 App 打开相机时
@@ -1076,21 +1079,32 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                 }
 
                 // 重复源跳过: 无新帧入队(frameCount 未变, 如解码间隙/暂停回退当前帧)且
-                // 总旋转(视频自带+用户手动)/镜像未变时, 下一拍已产出相同内容 → 跳过旋转+VT 转换
-                // (用解码器单调递增的 frameCount 判断, 不用指针: 解码器会回收复用 buffer 指针)
+                // 总旋转(视频自带+用户手动)/镜像/打光未变时, 下一拍已产出相同内容 →
+                // 跳过旋转+VT 转换(用解码器单调递增的 frameCount 判断, 不用指针:
+                // 解码器会回收复用 buffer 指针)。1.3.37: 打光签名加入判定 —— 暂停状态
+                // 下检测颜色跳变/滑块调节也即时重产出(与 pan/zoom 同款处理)
                 strongSelf.gpuProcessor.sourceRotation = strongSelf.videoPlayer.preferredRotation;
                 int curRot = (strongSelf.gpuProcessor.sourceRotation + strongSelf.gpuProcessor.rotationAngle) % 360;
                 BOOL curMirror = strongSelf.gpuProcessor.mirrored;
                 double curPanX = strongSelf.gpuProcessor.userPanX;
                 double curPanY = strongSelf.gpuProcessor.userPanY;
                 double curZoom = strongSelf.gpuProcessor.userZoom;
+                uint64_t curLightSig =
+                    ((uint64_t)(strongSelf.gpuProcessor.lightEnabled ? 1 : 0) << 59)
+                  | ((uint64_t)(strongSelf.gpuProcessor.lightColorRGB & 0xFFFFFF) << 35)
+                  | ((uint64_t)(strongSelf.gpuProcessor.lightX & 0x7F) << 28)
+                  | ((uint64_t)(strongSelf.gpuProcessor.lightY & 0x7F) << 21)
+                  | ((uint64_t)(strongSelf.gpuProcessor.lightIntensity & 0x7F) << 14)
+                  | ((uint64_t)(strongSelf.gpuProcessor.lightDiameter & 0x7F) << 7)
+                  | (uint64_t)(strongSelf.gpuProcessor.lightFeather & 0x7F);
                 uint64_t curCount = strongSelf.videoPlayer.frameCount;
                 if (curCount == strongSelf->_lastPrerenderSrcGen &&
                     curRot == strongSelf->_lastPrerenderRot &&
                     curMirror == strongSelf->_lastPrerenderMirror &&
                     curPanX == strongSelf->_lastPrerenderPanX &&
                     curPanY == strongSelf->_lastPrerenderPanY &&
-                    curZoom == strongSelf->_lastPrerenderZoom) {
+                    curZoom == strongSelf->_lastPrerenderZoom &&
+                    curLightSig == strongSelf->_lastPrerenderLightSig) {
                     CVPixelBufferRelease(frame);
                     continue;
                 }
@@ -1100,6 +1114,7 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                 strongSelf->_lastPrerenderPanX = curPanX;
                 strongSelf->_lastPrerenderPanY = curPanY;
                 strongSelf->_lastPrerenderZoom = curZoom;
+                strongSelf->_lastPrerenderLightSig = curLightSig;
 
                 // 1. 旋转/镜像（如需要, 视频原尺寸; 解码帧为 420f, 旋转保持 420f）
                 CVPixelBufferRef rotated = [strongSelf.gpuProcessor rotateAndMirrorIfNeeded:frame];
@@ -1113,6 +1128,14 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                 CVPixelBufferRef baked = [strongSelf.gpuProcessor bakeUserTransformIntoCanvas:rotated];
                 CVPixelBufferRelease(rotated);
                 if (!baked) continue;
+
+                // 1.6 三色打光注入(1.3.37, 复刻 Android vcplax): 屏幕取色检测到的
+                // 颜色以圆形渐变光斑注入帧内(内部 3 槽画布副本, 不污染旋转/bake 池)。
+                // 关闭/无色时直通零开销; 打光签名参与上方跳过判定
+                CVPixelBufferRef lit = [strongSelf.gpuProcessor injectLightIntoFrame:baked];
+                CVPixelBufferRelease(baked);
+                if (!lit) continue;
+                baked = lit;
 
                 // 2. 懒 BGRA(产能优化): 不再每帧预转 BGRA —— 旋转+转换两个 VT 调用
                 //    每帧 ~68ms > 41.6ms(24fps 帧间隔), 预渲染只跑出 14.6fps → 卡顿。
@@ -1377,6 +1400,44 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
             vcam_core_log([NSString stringWithFormat:
                 @"[vcam] transform synced: pan(%.2f,%.2f)%@ zoom=%.2f",
                 plistPanX, plistPanY, panSgn < 0 ? @"[front-fix]" : @"", plistZoom]);
+        }
+
+        // 三色打光同步(1.3.37): 悬浮球屏幕取色检测写 vc.plist(lightColor 跟随屏幕
+        // 闪烁 0.1s 级变化), 此处轮询同步到 gpuProcessor; 变化时预渲染线程重新
+        // 产出帧(跳过判定含打光签名) → 光斑实时跟随。参数签名打包比较, 任一变化
+        // 即整体刷新(避免 7 字段逐个比较的冗长代码)
+        {
+            static uint64_t lastLightSig = 0;
+            BOOL lEnabled = [pl[@"lightEnabled"] boolValue];
+            uint32_t lColor = (uint32_t)[pl[@"lightColor"] unsignedIntValue];
+            int lX = [pl[@"lightX"] intValue];
+            int lY = [pl[@"lightY"] intValue];
+            int lInt = [pl[@"lightIntensity"] intValue];
+            int lDia = [pl[@"lightDiameter"] intValue];
+            int lFea = [pl[@"lightFeather"] intValue];
+            if (lX <= 0 || lX > 100) lX = 50;      // 缺失/非法回默认
+            if (lY <= 0 || lY > 100) lY = 50;
+            if (lInt < 0 || lInt > 100) lInt = 30;
+            if (lDia <= 0 || lDia > 100) lDia = 48;
+            if (lFea < 0 || lFea > 100) lFea = 100;
+            uint64_t sig = ((uint64_t)(lEnabled ? 1 : 0) << 59)
+                         | ((uint64_t)(lColor & 0xFFFFFF) << 35)
+                         | ((uint64_t)lX << 28) | ((uint64_t)lY << 21)
+                         | ((uint64_t)lInt << 14) | ((uint64_t)lDia << 7)
+                         | (uint64_t)lFea;
+            if (sig != lastLightSig) {
+                strongSelf.gpuProcessor.lightEnabled = lEnabled;
+                strongSelf.gpuProcessor.lightColorRGB = lColor;
+                strongSelf.gpuProcessor.lightX = lX;
+                strongSelf.gpuProcessor.lightY = lY;
+                strongSelf.gpuProcessor.lightIntensity = lInt;
+                strongSelf.gpuProcessor.lightDiameter = lDia;
+                strongSelf.gpuProcessor.lightFeather = lFea;
+                lastLightSig = sig;
+                vcam_core_log([NSString stringWithFormat:
+                    @"[vcam] light synced: on=%d color=0x%06x pos(%d,%d) int=%d dia=%d fea=%d",
+                    (int)lEnabled, lColor, lX, lY, lInt, lDia, lFea]);
+            }
         }
 
         // 视频源切换(悬浮球 1/2/3 键): activePlaybackPath 变化 → 自动重载新视频
