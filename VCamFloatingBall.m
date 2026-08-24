@@ -104,8 +104,12 @@ static void vcamIOSurfaceInit(void) {
     }
 }
 
-// CARenderServerCaptureDisplay 探测(一次性): dlsym + (port, display) 组合试捕。
-// 签名自 iOS 9 起稳定(QuartzCore), 众多录屏 tweak 在 iOS 15/16 使用同款。
+// CARenderServerCaptureDisplay 探测(一次性)。
+// 教训(1.3.38 首发实测): port 传 MACH_PORT_NULL/mach_task_self 会触发内部
+// mach_msg 无限等待 → 首次 tick 阻塞 → 检测线程假死(千拍零日志)。port 必须
+// 用 SBSSpringBoardServerPort() 返回的 render server 有效端口(录屏 tweak
+// 标准姿势, RecordMyScreen 同款); display 错值快速返回错误码无阻塞风险,
+// 只试 0/1。任一环节失败 → 永久放弃 CARS 路径, 走 UICreateScreenImage 回退。
 static VcamCARSCaptureFn sVcamCARSFn = NULL;
 static mach_port_t sVcamCARSPort = MACH_PORT_NULL;
 static uint32_t sVcamCARSDisplay = 0;
@@ -121,27 +125,34 @@ static VcamIOSurfaceRef vcamCaptureDisplaySurface(void) {
             vcam_ball_log(@"[vcam][light] CARenderServerCaptureDisplay dlsym NULL, fallback UICreateScreenImage");
             return NULL;
         }
+        typedef mach_port_t (*VcamSBSPortFn)(void);
+        VcamSBSPortFn sbsPortFn = (VcamSBSPortFn)dlsym(RTLD_DEFAULT, "SBSSpringBoardServerPort");
+        if (!sbsPortFn) {
+            vcam_ball_log(@"[vcam][light] SBSSpringBoardServerPort dlsym NULL, CARS disabled");
+            return NULL;
+        }
+        mach_port_t port = sbsPortFn();
+        if (!MACH_PORT_VALID(port)) {
+            vcam_ball_log(@"[vcam][light] SBSSpringBoardServerPort invalid, CARS disabled");
+            return NULL;
+        }
         CGRect sb = [UIScreen mainScreen].bounds;
         CGFloat sc = [UIScreen mainScreen].scale;
         uint32_t pw = (uint32_t)(sb.size.width * sc), ph = (uint32_t)(sb.size.height * sc);
-        mach_port_t ports[] = {MACH_PORT_NULL, mach_task_self()};
         uint32_t displays[] = {0, 1};
-        for (int pi = 0; pi < 2 && !sVcamCARSPort; pi++) {
-            for (int di = 0; di < 2; di++) {
-                VcamIOSurfaceRef t = NULL;
-                if (sVcamCARSFn(ports[pi], displays[di], 0, 0, pw, ph, 0, &t) == KERN_SUCCESS && t) {
-                    CFRelease(t);  // 探测成功, 记组合(真捕获由调用方做)
-                    sVcamCARSPort = ports[pi];
-                    sVcamCARSDisplay = displays[di];
-                    vcam_ball_log([NSString stringWithFormat:
-                        @"[vcam][light] CARS ok (port=%d display=%u %ux%u)",
-                        pi, displays[di], pw, ph]);
-                    break;
-                }
+        for (int di = 0; di < 2; di++) {
+            VcamIOSurfaceRef t = NULL;
+            if (sVcamCARSFn(port, displays[di], 0, 0, pw, ph, 0, &t) == KERN_SUCCESS && t) {
+                CFRelease(t);  // 探测成功, 记 display(真捕获由调用方做)
+                sVcamCARSPort = port;
+                sVcamCARSDisplay = displays[di];
+                vcam_ball_log([NSString stringWithFormat:
+                    @"[vcam][light] CARS ok (display=%u %ux%u)", displays[di], pw, ph]);
+                break;
             }
         }
         if (!sVcamCARSPort) {
-            vcam_ball_log(@"[vcam][light] CARS combos all failed, fallback UICreateScreenImage");
+            vcam_ball_log(@"[vcam][light] CARS display 0/1 both failed, fallback UICreateScreenImage");
         }
     }
     if (!sVcamCARSFn || !sVcamCARSPort) return NULL;
