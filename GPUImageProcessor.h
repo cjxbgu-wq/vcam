@@ -45,6 +45,17 @@
 // 第二条流起只做格式转换, render CPU 减半(管线饱和 → 卡顿/黑屏优化)
 @property (nonatomic, assign) uint64_t frameToken;
 
+// 三色打光注入(1.3.37, 复刻 Android vcplax apply_color_injection_nv21):
+// SpringBoard 屏幕取色检测写 vc.plist, mediaserverd 轮询同步到此处,
+// 预渲染线程对 live 帧做 Y/CbCr 圆形渐变光斑注入(公式与 Android 一致)
+@property (nonatomic, assign) BOOL lightEnabled;        // 总开关(屏幕取色开启时 YES)
+@property (nonatomic, assign) uint32_t lightColorRGB;  // 0x00RRGGBB, 0=无色(熄灭)
+@property (nonatomic, assign) int lightX;              // 光斑中心横坐标 0-100% (默认 50)
+@property (nonatomic, assign) int lightY;              // 光斑中心纵坐标 0-100% (默认 50)
+@property (nonatomic, assign) int lightIntensity;      // 打光强度 0-100% (默认 30)
+@property (nonatomic, assign) int lightDiameter;       // 打光直径 0-100% (默认 48)
+@property (nonatomic, assign) int lightFeather;        // 边缘羽化 0-100% (默认 100)
+
 // 核心处理方法
 - (CVPixelBufferRef)processPixelBuffer:(CVPixelBufferRef)input
                                 toWidth:(size_t)width
@@ -63,6 +74,12 @@
 // zoom>1 画布=源窗口(纯 memcpy, 下游 Trim 放大); zoom<=1 画布=黑底+画面区域
 // (平移自由, 出界露黑)。默认(无变换)直通返回原帧零开销。画布池内部 3 槽轮转。
 - (CVPixelBufferRef)bakeUserTransformIntoCanvas:(CVPixelBufferRef)input CF_RETURNS_RETAINED;
+
+// 预渲染用: 三色打光注入(1.3.37)。lightEnabled 且颜色非 0 时, 把源帧内容
+// 复制进内部 3 槽注入画布(不污染旋转/烘焙缓存池), 在画布上做圆形渐变光斑
+// Y/CbCr 注入(公式复刻 Android vcplax: inner_r=radius*(100-feather)*80/10000,
+// max_alpha=intensity*192/100)。关闭/无色时直通 retain 原帧零开销。
+- (CVPixelBufferRef)injectLightIntoFrame:(CVPixelBufferRef)input CF_RETURNS_RETAINED;
 
 // 预渲染用: 同尺寸格式转换(如 BGRA -> 420f), VT 主路径 + CoreImage 回退
 - (CVPixelBufferRef)convertFormat:(CVPixelBufferRef)input toFormat:(OSType)format CF_RETURNS_RETAINED;
