@@ -130,22 +130,40 @@ static NSString *vcamKnownLightName(int idx) {
 }
 
 // RGBA 像素数组 → 已知色匹配。返回 0=无匹配, 否则标准色值; outName/outCount 诊断
-static uint32_t vcamMatchKnownLight(const uint8_t *rgba, int n, NSString **outName, int *outCount) {
+// 1.3.46 匹配算法重写(RGB 欧氏距离 → HSV 色相分档):
+// 紫色打不上是 RGB 距离的盲区 —— 屏幕实际"紫"很少是纯品红 FF00FF,
+// 深紫(800080)亮度<180 被饱和度过滤直接丢弃, 系统紫(AF52DE)/蓝紫(8A2BE2)
+// 离纯紫 RGB 距离>120, 全部 miss(实测 0/441)。红绿蓝黄青是极端色,
+// 渲染偏差后仍在 120 半径内, 所以只有紫全灭。
+// HSV 色相每 60° 一档(区间无重叠无间隙): [330,30)红 [30,90)黄 [90,150)绿
+// [150,210)青 [210,270)蓝 [270,330)紫 —— 亮度/深浅变化不改变色相,
+// 暗紫/亮紫/偏蓝紫/偏红紫全命中; 白/灰 delta=0 仍被滤(白光移除语义不变)。
+// outAvg: 未命中诊断(采样区平均 RGB, 打进熄灭日志, 下次再 miss 直接看像素值)
+static uint32_t vcamMatchKnownLight(const uint8_t *rgba, int n, NSString **outName, int *outCount, uint32_t *outAvg) {
     int counts[6] = {0};
+    long sr = 0, sg = 0, sb = 0;
     for (int i = 0; i < n; i++) {
         int r = rgba[i * 4], g = rgba[i * 4 + 1], b = rgba[i * 4 + 2];
+        sr += r; sg += g; sb += b;
         int maxc = MAX(MAX(r, g), b), minc = MIN(MIN(r, g), b);
-        if (maxc < 180 || maxc - minc < 60) continue;  // 饱和度过滤(同 Android; 白/灰被滤)
-        int best = -1, bestD2 = 120 * 120;
-        for (int k = 0; k < 6; k++) {
-            int dr = r - (int)((vcamKnownLights[k] >> 16) & 0xFF);
-            int dg = g - (int)((vcamKnownLights[k] >> 8) & 0xFF);
-            int db = b - (int)(vcamKnownLights[k] & 0xFF);
-            int d2 = dr * dr + dg * dg + db * db;
-            if (d2 < bestD2) { bestD2 = d2; best = k; }
-        }
-        if (best >= 0) counts[best]++;
+        int delta = maxc - minc;
+        if (maxc < 60 || delta < 60) continue;  // V/S 门限: 黑/白/灰/淡色滤除
+        // 色相(0..360)
+        double h;
+        if (maxc == r)      h = 60.0 * (double)(g - b) / (double)delta;
+        else if (maxc == g) h = 60.0 * (2.0 + (double)(b - r) / (double)delta);
+        else                h = 60.0 * (4.0 + (double)(r - g) / (double)delta);
+        if (h < 0) h += 360.0;
+        int idx;
+        if (h < 30.0 || h >= 330.0)      idx = 0;  // 红(0/360 环绕)
+        else if (h < 90.0)               idx = 3;  // 黄
+        else if (h < 150.0)              idx = 1;  // 绿
+        else if (h < 210.0)              idx = 4;  // 青
+        else if (h < 270.0)              idx = 2;  // 蓝
+        else                             idx = 5;  // 紫
+        counts[idx]++;
     }
+    if (outAvg) *outAvg = (uint32_t)(((sr / n) << 16) | ((sg / n) << 8) | (sb / n));
     int bestK = -1, bestC = 0;
     for (int k = 0; k < 6; k++) {
         if (counts[k] > bestC) { bestC = counts[k]; bestK = k; }
@@ -259,6 +277,7 @@ typedef struct {
     volatile uint32_t color;         // 检测颜色(0=熄灭)
     volatile int count;              // 票数
     volatile int nameIdx;            // 颜色名 idx(-1=熄灭)
+    volatile uint32_t avg;           // 采样区平均 RGB(熄灭诊断, 1.3.46)
     volatile double heartbeat;       // 捕获线程心跳(看门狗依据)
 } VcamPickCaptureState;
 static VcamPickCaptureState gVcamPick = {0};
@@ -298,6 +317,7 @@ static void *vcamPickCaptureMain(void *ctx) {
                             int bestCnt = 0;
                             uint32_t bestColor = 0;
                             int bestIdx = -1;
+                            uint32_t lastAvg = 0;
                             for (int ci = 0; ci < 2; ci++) {
                                 int y0 = candY[ci];
                                 if (y0 < 0 || y0 + S > (int)sh) continue;
@@ -315,10 +335,12 @@ static void *vcamPickCaptureMain(void *ctx) {
                                 }
                                 NSString *nm = nil;
                                 int c2 = 0;
-                                uint32_t cc = vcamMatchKnownLight(buf, 441, &nm, &c2);
+                                uint32_t avg = 0;
+                                uint32_t cc = vcamMatchKnownLight(buf, 441, &nm, &c2, &avg);
+                                lastAvg = avg;
                                 if (cc != 0 && c2 > bestCnt) {
                                     bestCnt = c2; bestColor = cc;
-                                    for (int k = 0; k < 7; k++) {
+                                    for (int k = 0; k < 6; k++) {  // 1.3.46: <7 越界修复(数组 6 元素)
                                         if (vcamKnownLights[k] == cc) { bestIdx = k; break; }
                                     }
                                 }
@@ -326,6 +348,7 @@ static void *vcamPickCaptureMain(void *ctx) {
                             detected = bestColor;
                             cnt = bestCnt;
                             nameIdx = detected ? bestIdx : -1;
+                            gVcamPick.avg = lastAvg;  // 熄灭诊断(1.3.46)
                         }
                         sVcamIOS.unlock(surf, 0x1, NULL);
                     }
@@ -1293,7 +1316,9 @@ static NSString *vcamLightColorName(uint32_t c) {
                 CGContextDrawImage(bctx, CGRectMake(0, 0, S, S), crop);
                 const uint8_t *rgba = (const uint8_t *)CGBitmapContextGetData(bctx);
                 if (rgba) {
-                    detected = vcamMatchKnownLight(rgba, 441, outName, outCount);
+                    uint32_t avg = 0;
+                    detected = vcamMatchKnownLight(rgba, 441, outName, outCount, &avg);
+                    gVcamPick.avg = avg;  // 熄灭诊断(1.3.46)
                 }
                 CGContextRelease(bctx);
             }
@@ -1406,8 +1431,8 @@ static NSString *vcamLightColorName(uint32_t c) {
             [self updateColorPreview:d];
         });
         vcam_ball_log([NSString stringWithFormat:
-            @"[vcam][light] color detected: 0x%06x %@ (%d/441)", d,
-            detName ?: @"熄灭", detCount]);
+            @"[vcam][light] color detected: 0x%06x %@ (%d/441) avg=0x%06x", d,
+            detName ?: @"熄灭", detCount, gVcamPick.avg]);
     }
 }
 
