@@ -188,6 +188,11 @@ static void vcam_core_log(NSString *msg) {
 // 预渲染重复源跳过: 无新帧入队(解码计数未变)且旋转/镜像未变时, 跳过重复的旋转+格式转换
 @property (nonatomic, assign) uint64_t lastPrerenderSrcGen;
 @property (nonatomic, assign) int lastPrerenderRot;
+// 1.3.49 打光快速响应: 光色/参数变化立即唤醒预渲染线程出拍 —— 早醒拍只
+// 重产出当前帧(不消费解码队列), 绝对时间节拍器自愈, 帧率不受影响;
+// sem 替代 NSThread sleep(超时等待=正常节拍, signal=光变化即时出拍)
+@property (nonatomic, strong) dispatch_semaphore_t prerenderWakeSem;
+@property (nonatomic, assign) BOOL prerenderWakeEarly;
 @property (nonatomic, assign) BOOL lastPrerenderMirror;
 // 用户画面变换(箭头/＋/−/复)也纳入跳过判定: 暂停/图片模式下 frameCount 不变,
 // 但悬浮球改了 pan/zoom 时必须重新产出(把新 cleanAperture 附件烘焙进 live 帧)
@@ -280,6 +285,7 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
         _lastProcessedHeight = 0;
         _lastProcessedFormat = 0;
         _prerenderActive = NO;
+        _prerenderWakeSem = dispatch_semaphore_create(0);  // 1.3.49 打光早醒
 
         // 初始化组件 —— SpringBoard 轻量化(2026-08-15):
         // SB 只记录状态(悬浮球按钮全走 vc.plist, 替换渲染在 mediaserverd),
@@ -1045,7 +1051,16 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                 nextTick += 1.0 / fps;
                 double wait = nextTick - CFAbsoluteTimeGetCurrent();
                 if (wait > 0.0005) {
-                    [NSThread sleepForTimeInterval:wait];
+                    // 1.3.49 打光快速响应: NSThread sleep → 信号量超时等待。
+                    // 超时=正常节拍(帧率约束零改动); signal(光色/参数变化时由
+                    // light 轮询回调发出) → 立即出拍重产出当前帧(新光斑)。
+                    // 早醒拍后 nextTick 逻辑自然自愈, 不丢帧不重帧
+                    if (strongSelf->_prerenderWakeSem) {
+                        dispatch_semaphore_wait(strongSelf->_prerenderWakeSem,
+                            dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * NSEC_PER_SEC)));
+                    } else {
+                        [NSThread sleepForTimeInterval:wait];
+                    }
                 } else {
                     nextTick = CFAbsoluteTimeGetCurrent();  // 已落后(转换耗时超帧间隔), 重置基线
                 }
@@ -1056,13 +1071,22 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                 // 下一拍取到积压帧 = 周期性"重复-紧接"节奏(拍频微卡顿)。
                 // 修: 队列空时短等(≤1/3 帧间隔)让解码先产出。
                 // 图片模式/暂停(解码不再产出)等待自然超时走当前帧回退, 行为不变
-                CVPixelBufferRef frame = [strongSelf.videoPlayer.frameQueue dequeuePixelBuffer];
-                if (!frame) {
-                    CFAbsoluteTime waitStart = CFAbsoluteTimeGetCurrent();
-                    double waitBudget = (1.0 / fps) / 3.0;
-                    while (!frame && CFAbsoluteTimeGetCurrent() - waitStart < waitBudget) {
-                        [NSThread sleepForTimeInterval:0.002];
-                        frame = [strongSelf.videoPlayer.frameQueue dequeuePixelBuffer];
+                // 1.3.49 早醒拍(光色/参数变化唤醒): 只重产出当前帧, 不消费解码
+                // 队列 —— 1:1 FIFO 出帧节律完全不受影响(帧率稳定硬约束),
+                // 早醒拍与正常拍唯一差别 = 烘焙了新打光签名的同一源帧
+                BOOL earlyWake = strongSelf->_prerenderWakeEarly;
+                if (earlyWake) strongSelf->_prerenderWakeEarly = NO;
+
+                CVPixelBufferRef frame = NULL;
+                if (!earlyWake) {
+                    frame = [strongSelf.videoPlayer.frameQueue dequeuePixelBuffer];
+                    if (!frame) {
+                        CFAbsoluteTime waitStart = CFAbsoluteTimeGetCurrent();
+                        double waitBudget = (1.0 / fps) / 3.0;
+                        while (!frame && CFAbsoluteTimeGetCurrent() - waitStart < waitBudget) {
+                            [NSThread sleepForTimeInterval:0.002];
+                            frame = [strongSelf.videoPlayer.frameQueue dequeuePixelBuffer];
+                        }
                     }
                 }
                 if (frame) {
@@ -1486,11 +1510,12 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
         }
     }];
 
-    // 三色打光快速轮询(1.3.45): 0.04s 节拍(25Hz)同步打光 7 键到 gpuProcessor。
-    // 延迟链: 悬浮球检测 0.04s → 写 plist → 本轮询 ≤0.04s → 预渲染跳过判定
-    // 看到 lightSig 变化 → 重产出帧 → render。原 0.15s 主轮询是闪烁跟不上
-    // 的延迟大头(最坏 150ms, 现 ≤40ms)。timer 与主轮询同串行队列天然互斥
-    [[VCamNotify sharedInstance] startLightPollingWithInterval:0.04 callback:^(NSDictionary *pl) {
+    // 三色打光快速轮询(1.3.45→1.3.49 提频): 0.02s 节拍(50Hz)同步打光 7 键到
+    // gpuProcessor。延迟链: 悬浮球检测(自适应 0.02/0.04s) → 写 plist → 本轮询
+    // ≤0.02s → 变化时 signal 预渲染早醒信号量 → 立即重产出当前帧(新光斑)
+    // → render。相比 1.3.45: 轮询相位延迟 20ms→10ms, 预渲染等待下一拍
+    // (最坏 41ms@24fps) → 即时出拍。plist 读 ~0.15ms, 50Hz ≈ 0.75% 单核
+    [[VCamNotify sharedInstance] startLightPollingWithInterval:0.02 callback:^(NSDictionary *pl) {
         VCamCore *strongSelf = weakSelf;
         if (!strongSelf) return;
         static uint64_t lastLightSig = 0;
@@ -1520,6 +1545,12 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
             strongSelf.gpuProcessor.lightDiameter = lDia;
             strongSelf.gpuProcessor.lightFeather = lFea;
             lastLightSig = sig;
+            // 1.3.49 早醒: 光色/参数变化 → 立即唤醒预渲染线程重产出当前帧,
+            // 不等下一节拍(24fps 下最坏 41ms) —— 光斑跟手的最后一段延迟消除
+            strongSelf->_prerenderWakeEarly = YES;
+            if (strongSelf->_prerenderWakeSem) {
+                dispatch_semaphore_signal(strongSelf->_prerenderWakeSem);
+            }
             vcam_core_log([NSString stringWithFormat:
                 @"[vcam] light synced: on=%d color=0x%06x pos(%d,%d) int=%d dia=%d fea=%d",
                 (int)lEnabled, lColor, lX, lY, lInt, lDia, lFea]);
