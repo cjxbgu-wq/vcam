@@ -670,8 +670,11 @@ static size_t vcam_decode_max_edge(void) {
                     _frameCount++;
                     // 按视频帧率绝对节拍输出(参考逆向: 按时间戳输出帧)
                     // effectiveFps = PTS 实测(校准 nominalFrameRate 低估导致的慢放卡顿)
-                    // CPU 降载期上限 ~20fps(接近流畅下限; render 冻结帧兜底)
-                    double effFps = MIN([self effectiveFps], _lowPowerDecode ? 20.0 : 240.0);
+                    // 1.3.47 帧率稳定硬约束(用户要求: 替换视频永不掉帧):
+                    // 移除 20fps 降载上限 —— 解码必须忠实按源帧率产出, 任何解码端
+                    // 节流都等于把掉帧烙进内容源; CPU 治理交给 render 端 staging
+                    // 去重 + 不可见流节流 + hardTrip 紧急档(VCamCore), 不动内容帧率
+                    double effFps = [self effectiveFps];
                     double frameInterval = 1.0 / effFps;
                     nextTick += frameInterval;
                     double wait = nextTick - CFAbsoluteTimeGetCurrent();
