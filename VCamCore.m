@@ -653,19 +653,19 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                     // 180s 均值配额吃得下; 旧 110 绕过豁免立即压 → 切模式短窗口
                     // 全程 20fps 卡顿。真失控(接近 2 核满载)豁免期内仍立即压
                     BOOL hardTrip = (emaPct > (sessionExempt ? 170.0 : 110.0));
-                    // 退出后再进冷却(见 lastThrottleExit 声明): OFF 后 6s 稳定窗
-                    BOOL exitCooldownOk = (lastThrottleExit == 0 ||
-                                           (nowT - lastThrottleExit) > 6.0);
-                    // 阈值(2026-08-18): 72% 提前介入给 runningboardd 留余量;
-                    // 退出线 55→62(2026-08-20 帧数修复): 正常运行区间实测 45-58%,
-                    // 旧退出线 55 落在正常带内部 —— 稳态 56-58% 时一旦因尖峰进入
-                    // 降载(20fps)就永远退不出(需 <55), 替换视频被长期压在 20fps =
-                    // "帧数不稳定"直接来源。62 在正常带顶(58)之上, 与 72 进入线构成
-                    // 10 点滞回带(对齐 2026-08-17 教训: 退出线必须高于正常带顶)
-                    if ((emaPct > 72.0 || hardTrip) && !lowPower && (minHoldOk || hardTrip) && (!sessionExempt || hardTrip) && (exitCooldownOk || hardTrip)) {
+                    // 阈值(1.3.47 帧率稳定硬约束重构): 旧 72% 进入线在正常运行带
+                    // (45-58%)之上但远低于多流高压带(80-86%), EMA 徘徊 72-86 时
+                    // 内容被压 20fps 且退出线 62 难以到达 = "长期卡顿"直接来源;
+                    // 72↔62 边缘横跳 = "帧数不稳定"另一来源。用户硬性要求: 替换
+                    // 视频永不掉帧。重构: 常规压力(≤110%)永不降载 —— staging 去重
+                    // (同 gen 跳 stage1) + 不可见流节流已覆盖 CPU 治理, 内容帧率
+                    // 不再作为降载牺牲品; 仅 hardTrip(EMA>110, 豁免期 170)真失控
+                    // (逼近 2 核, 进程将被杀 = 相机全黑)时紧急介入, 保命优先。
+                    // 退出线 62 不变(hardTrip 压下 CPU 后自然退出)
+                    if (hardTrip && !lowPower) {
                         lowPower = YES;
                         lastModeSwitch = nowT;
-                        vcam_core_log([NSString stringWithFormat:@"[vcam] CPU %.0f%% (ema) >72%%, EMERGENCY throttle ON", emaPct]);
+                        vcam_core_log([NSString stringWithFormat:@"[vcam] CPU %.0f%% (ema) hardTrip, SURVIVAL throttle ON", emaPct]);
                     } else if (emaPct < 62.0 && lowPower && minHoldOk && !graceOn) {
                         lowPower = NO;
                         lastModeSwitch = nowT;
@@ -1032,10 +1032,12 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                     continue;
                 }
 
-                // effectiveFps = PTS 实测帧率(校准 nominalFrameRate 低估导致的节拍慢放);
-                // CPU 降载期上限 20fps(接近流畅下限; 15fps 肉眼可见卡顿)
-                double fps = MIN(strongSelf.videoPlayer.effectiveFps,
-                                 strongSelf.lowPowerDecode ? 20.0 : 240.0);
+                // effectiveFps = PTS 实测帧率(校准 nominalFrameRate 低估导致的节拍慢放)
+                // 1.3.47 帧率稳定硬约束(用户要求: 替换视频永不掉帧):
+                // 移除 20fps 降载上限 —— 预渲染按源帧率产出, 内容帧率永不打折;
+                // CPU 治理由 render 端 staging 去重(同 gen 跳过) + 不可见流节流 +
+                // hardTrip 紧急档(render 窗)承担, 不再压解码/预渲染节拍
+                double fps = strongSelf.videoPlayer.effectiveFps;
                 nextTick += 1.0 / fps;
                 double wait = nextTick - CFAbsoluteTimeGetCurrent();
                 if (wait > 0.0005) {
