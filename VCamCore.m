@@ -20,6 +20,10 @@
 // 日志令牌桶(定义见下方 vcam_log_budget_take, 全进程共享磁盘写入预算)
 BOOL vcam_log_budget_take(void);
 
+// 车道记忆全量重置(定义在 GPUImageProcessor.m, 1.3.48 视频切换时调用:
+// 新视频不继承旧视频的直转/stage/split/熔断失败记忆)
+extern void vcamLaneResetAllMemos(void);
+
 // ===== 资源自监控(2026-08-16 黑屏取证 v2: +CPU% +按流渲染统计) =====
 // mediaserverd 周期性被杀(相机替换活跃 ~150s)但无 .ips 落盘, 系统侧无法判死因。
 // v2 探针每 30s 记一行: 内存(已证平稳)/进程 CPU%(所有线程 user+system 累计差分)/
@@ -1434,6 +1438,12 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                 lastSyncedPanX = 0.0;
                 lastSyncedPanY = 0.0;
                 lastSyncedZoom = 1.0;
+                // 1.3.48 视频切换重置车道记忆(新视频不继承旧失败): 直转/stage/
+                // split/熔断 memo 全清零 —— 新视频尺寸/时序组合不同, 旧视频上
+                // 的 -12902/-12905 失败记忆(甚至熔断态 keep camera)会让新视频
+                // 一起不替换; 清零后新视频首帧重新探测各车道
+                vcamLaneResetAllMemos();
+                vcam_core_log(@"[vcam] lane memo reset on video switch (1.3.48)");
                 // 异步重载(同步加载阻塞轮询线程 → watchdog 崩溃)
                 __weak typeof(strongSelf) wSelf = strongSelf;
                 dispatch_async(strongSelf.processingQueue, ^{
