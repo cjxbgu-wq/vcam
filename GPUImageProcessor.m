@@ -403,14 +403,65 @@ typedef struct {
 static VCamYuvLaneSlot gVcamYuvLane[kVcamYuvLaneMax];
 
 // 车道熔断 memo: 热路径零装箱查表; 熔断写入时刷新对应槽
+// 1.3.48 熔断自动恢复: 旧版 CIRCUIT-BROKEN 永久禁用(进程重启前 keep camera
+// 永不替换) —— 设备实证(14:38:19 p420 熔断后 0x7c787630 流全部 keep camera
+// = "相机不替换"直接来源)。-12902/-12905 失败常是时序/尺寸组合临时性
+// (视频切换/会话竞态), 永久熔断过于激进。改: 熔断 30s 后自动重试;
+// 失败计数成功时清零(旧版只增不减, 隔很久的 2 次失败也误熔断)
 static uint32_t gVcamLaneMemoFmt[4] = {0, 0, 0, 0};
 static BOOL gVcamLaneMemoOff[4] = {NO, NO, NO, NO};
+static CFAbsoluteTime gVcamLaneMemoOffAt[4] = {0, 0, 0, 0};
 static void vcamLaneMemoInvalidate(uint32_t fmt, BOOL off) {
     for (int i = 0; i < 4; i++) {
-        if (gVcamLaneMemoFmt[i] == fmt) { gVcamLaneMemoOff[i] = off; return; }
+        if (gVcamLaneMemoFmt[i] == fmt) {
+            if (off && !gVcamLaneMemoOff[i]) gVcamLaneMemoOffAt[i] = CFAbsoluteTimeGetCurrent();
+            gVcamLaneMemoOff[i] = off; return;
+        }
     }
     gVcamLaneMemoFmt[fmt & 3] = fmt;
+    if (off) gVcamLaneMemoOffAt[fmt & 3] = CFAbsoluteTimeGetCurrent();
     gVcamLaneMemoOff[fmt & 3] = off;
+}
+// 熔断是否已过期(30s 自动恢复探测窗口)
+static BOOL vcamLaneMemoExpired(uint32_t fmt) {
+    for (int i = 0; i < 4; i++) {
+        if (gVcamLaneMemoFmt[i] == fmt) {
+            return gVcamLaneMemoOff[i] && gVcamLaneMemoOffAt[i] > 0 &&
+                   (CFAbsoluteTimeGetCurrent() - gVcamLaneMemoOffAt[i]) > 30.0;
+        }
+    }
+    return NO;
+}
+
+// 1.3.48 失败计数文件级化(成功即清零, 防隔很久的 2 次失败误熔断):
+// 热路径无锁 int32 写(启发式计数, 竞态无害); _laneDisabled 字典只表达
+// 熔断开关, 计数以此数组为准
+static int32_t gVcamLaneFailCnt[4] = {0, 0, 0, 0};
+static int vcamLaneFailSlot(uint32_t fmt) {
+    for (int i = 0; i < 4; i++) {
+        if (gVcamLaneMemoFmt[i] == fmt) return i;
+    }
+    return (int)(fmt & 3);
+}
+static void vcamLaneNoteSuccess(uint32_t fmt) {
+    gVcamLaneFailCnt[vcamLaneFailSlot(fmt)] = 0;
+}
+
+// 1.3.48 视频切换重置车道记忆(新视频不继承旧失败): 直转/stage/split/
+// 熔断 memo 全清零, 新视频首帧重新探测各车道。VCamCore 切源时调用
+void vcamLaneResetAllMemos(void) {
+    memset(gVcamYuvDirectFmt, 0, sizeof(gVcamYuvDirectFmt));
+    memset(gVcamYuvDirectOk, 0, sizeof(gVcamYuvDirectOk));
+    memset(gVcamYuvDirectFails, 0, sizeof(gVcamYuvDirectFails));
+    memset(gVcamYuvDirectFailAt, 0, sizeof(gVcamYuvDirectFailAt));
+    memset(gVcamYuvStageFmt, 0, sizeof(gVcamYuvStageFmt));
+    memset(gVcamYuvStageOk, 0, sizeof(gVcamYuvStageOk));
+    memset(gVcamYuvSplitFmt, 0, sizeof(gVcamYuvSplitFmt));
+    memset(gVcamYuvSplitOk, 0, sizeof(gVcamYuvSplitOk));
+    memset(gVcamLaneMemoFmt, 0, sizeof(gVcamLaneMemoFmt));
+    memset(gVcamLaneMemoOff, 0, sizeof(gVcamLaneMemoOff));
+    memset(gVcamLaneMemoOffAt, 0, sizeof(gVcamLaneMemoOffAt));
+    memset(gVcamLaneFailCnt, 0, sizeof(gVcamLaneFailCnt));
 }
 
 @implementation GPUImageProcessor
@@ -2141,6 +2192,20 @@ static void vcamApplyLightBiPlanar(CVPixelBufferRef buf, uint32_t rgb,
             laneOff = [_laneDisabled[@(dstFormat)] boolValue];
             vcamLaneMemoInvalidate((uint32_t)dstFormat, laneOff);  // 建槽并缓存
         }
+        // 1.3.48 熔断自动恢复: 过期(30s)后解除熔断 + 清失败计数, 给一次重试
+        // 窗口 —— -12902/-12905 常是视频切换/会话竞态的临时态, 永久 keep
+        // camera = "相机不替换"直接来源。重试再失败会重新计数熔断(自愈闭环)
+        if (laneOff && vcamLaneMemoExpired((uint32_t)dstFormat)) {
+            vcamLaneMemoInvalidate((uint32_t)dstFormat, NO);
+            gVcamLaneFailCnt[vcamLaneFailSlot((uint32_t)dstFormat)] = 0;
+            @synchronized(self) {
+                _laneDisabled[@(dstFormat)] = @NO;
+            }
+            laneOff = NO;
+            vcam_gpu_log([NSString stringWithFormat:
+                @"[vcam] lane 0x%x circuit-broken expired, retry enabled (1.3.48)",
+                (unsigned)dstFormat]);
+        }
         if (laneOff) return NO;
     }
 
@@ -2193,6 +2258,7 @@ static void vcamApplyLightBiPlanar(CVPixelBufferRef buf, uint32_t rgb,
                             @"[vcam] lane direct YUV->0x%x OK (fast path, BGRA detour skipped)",
                             (unsigned)dstFormat]);
                     }
+                    vcamLaneNoteSuccess((uint32_t)dstFormat);
                     [self noteStreamRenderFmt:(uint32_t)dstFormat w:(uint32_t)dstW h:(uint32_t)dstH pixels:(uint64_t)dstW * dstH];
                     [_laneLockPrivate unlock];
                     return YES;
@@ -2376,15 +2442,16 @@ static void vcamApplyLightBiPlanar(CVPixelBufferRef buf, uint32_t rgb,
         [_laneLockPrivate unlock];
 
         if (ok) {
+            vcamLaneNoteSuccess((uint32_t)dstFormat);
             [self noteStreamRenderFmt:(uint32_t)dstFormat w:(uint32_t)dstW h:(uint32_t)dstH pixels:(uint64_t)dstW * dstH];
             return YES;
         }
-        // 失败计数/熔断(按格式): 同 fourcc 连续 2 次 → 永久跳过(同步刷新上面的 memo)
-        @synchronized(self) {
-            NSInteger fails = [_laneFailCounts[@(dstFormat)] integerValue] + 1;
-            _laneFailCounts[@(dstFormat)] = @(fails);
+        // 失败计数/熔断(按格式, 1.3.48 计数文件级+成功清零): 连续 2 次 →
+        // 熔断(30s 自动恢复, 同步刷新 memo)
+        {
+            int32_t fails = ++gVcamLaneFailCnt[vcamLaneFailSlot((uint32_t)dstFormat)];
             if (fails >= 2) {
-                _laneDisabled[@(dstFormat)] = @YES;
+                @synchronized(self) { _laneDisabled[@(dstFormat)] = @YES; }
                 vcamLaneMemoInvalidate(dstFormat, YES);
                 vcam_gpu_log([NSString stringWithFormat:@"[vcam] lane CIRCUIT-BROKEN format %u (err, keep camera)", (unsigned)dstFormat]);
             }
@@ -2408,15 +2475,16 @@ static void vcamApplyLightBiPlanar(CVPixelBufferRef buf, uint32_t rgb,
     [laneLock unlock];
 
     if (status == noErr) {
+        vcamLaneNoteSuccess((uint32_t)dstFormat);
         [self noteStreamRenderFmt:(uint32_t)dstFormat w:(uint32_t)dstW h:(uint32_t)dstH pixels:(uint64_t)dstW * dstH];
         return YES;
     }
-    // 失败计数/熔断(按格式)
-    @synchronized(self) {
-        NSInteger fails = [_laneFailCounts[@(dstFormat)] integerValue] + 1;
-        _laneFailCounts[@(dstFormat)] = @(fails);
+    // 失败计数/熔断(按格式, 1.3.48 计数文件级+成功清零): 连续 2 次 →
+    // 熔断(30s 自动恢复)
+    {
+        int32_t fails = ++gVcamLaneFailCnt[vcamLaneFailSlot((uint32_t)dstFormat)];
         if (fails >= 2) {
-            _laneDisabled[@(dstFormat)] = @YES;
+            @synchronized(self) { _laneDisabled[@(dstFormat)] = @YES; }
             vcamLaneMemoInvalidate(dstFormat, YES);
             vcam_gpu_log([NSString stringWithFormat:@"[vcam] lane CIRCUIT-BROKEN format %u (err %d, keep camera)",
                           (unsigned)dstFormat, (int)status]);
