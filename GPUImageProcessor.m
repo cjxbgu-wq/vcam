@@ -2469,8 +2469,46 @@ static void vcamApplyLightBiPlanar(CVPixelBufferRef buf, uint32_t rgb,
     if (!session || !laneLock) return NO;
 
     [laneLock lock];
+
+    // 1.3.50 视频模式预览绿边修复(标准 YUV 车道): BGRA 源 → YUV420 dst 且 Trim
+    // crop offset 非整数时, RGB→YUV 转换 UV 平面边界半像素越界 → 左缘 UV=0 →
+    // 绿色竖条(与 1.3.3 录像绿线同机理 —— 当时 v2 修复只接在私有两步法 lane,
+    // 标准车道漏接)。视频模式预览流(p420 1080x2340) YUV 直转失败走 lazy BGRA
+    // 路径(404x720 BGRA → 1080x2340, crop off=35.85 非偶数), 1.3.48 熔断自愈
+    // 恢复替换后暴露; 拍照流尺寸组合不同不受影响。修法同 v2: 偶数中心预裁剪
+    // (自有 CPU buffer memcpy) + Normal 等比缩放(比例匹配无 crop 无边界重采样)。
+    // cropStagingForRatio/normalTransferSession 归 _laneLockPrivate 保护(私有
+    // lane 同款), 锁序 laneLock→Private 单向, 与私有 lane(_laneLockPrivate 内
+    // 不取 laneLock)无倒置
+    CVPixelBufferRef xferSrc = src;
+    VTPixelTransferSessionRef xferSess = session;
+    if (isYuvLane && !isBgraLane &&
+        CVPixelBufferGetPixelFormatType(src) == kCVPixelFormatType_32BGRA) {
+        BOOL fixH = NO, fixV = NO;
+        vcamTrimFractionalCrop(src, dst, &fixH, &fixV);
+        if (fixH || fixV) {
+            [_laneLockPrivate lock];
+            CVPixelBufferRef cropped = [self cropStagingForRatio:src dst:dst srcToken:token];
+            if (cropped) {
+                VTPixelTransferSessionRef ns = [self normalTransferSession];
+                if (ns) {
+                    xferSrc = cropped;
+                    xferSess = ns;
+                    static BOOL loggedOnce = NO;
+                    if (!loggedOnce) {
+                        loggedOnce = YES;
+                        vcam_gpu_log([NSString stringWithFormat:
+                            @"[vcam] green-edge fix: BGRA->YUV lane fractional crop, pre-crop %zux%zu (1.3.50)",
+                            CVPixelBufferGetWidth(cropped), CVPixelBufferGetHeight(cropped)]);
+                    }
+                }
+            }
+            [_laneLockPrivate unlock];
+        }
+    }
+
     CFAbsoluteTime tOp = CFAbsoluteTimeGetCurrent();
-    OSStatus status = VTPixelTransferSessionTransferImage(session, src, dst);
+    OSStatus status = VTPixelTransferSessionTransferImage(xferSess, xferSrc, dst);
     [self noteStageTimingFmt:(uint32_t)dstFormat w:(uint32_t)dstW h:(uint32_t)dstH stage:2 ms:(CFAbsoluteTimeGetCurrent() - tOp) * 1000.0];
     [laneLock unlock];
 
