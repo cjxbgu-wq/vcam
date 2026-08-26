@@ -546,6 +546,10 @@ static void *vcamPickCaptureMain(void *ctx) {
 @property (nonatomic, assign) uint64_t lastPickSeq;           // 已消费的捕获结果序号(1.3.39)
 @property (nonatomic, assign) BOOL lightFlushScheduled;       // 滑块节流写标记
 @property (nonatomic, assign) BOOL lightParamsDirty;          // 滑块待写标记
+// 1.3.49 自适应检测节拍: 颜色活跃(0.5s 内有跳变)→快档 0.02s(50Hz)压低检测
+// 相位延迟(闪烁跟随正是活跃期); 稳定 ≥0.5s →回落 0.04s(25Hz)省主线程
+@property (nonatomic, assign) BOOL pickFastMode;
+@property (nonatomic, assign) CFAbsoluteTime lastPickChangeAt;
 @end
 
 @implementation VCamFloatingBall
@@ -1188,6 +1192,7 @@ static NSString *vcamLightColorName(uint32_t c) {
     if (g.state == UIGestureRecognizerStateEnded || g.state == UIGestureRecognizerStateCancelled) {
         _pickSuspended = NO;
         _pickSkipCount = 3;
+        _lastPickChangeAt = CFAbsoluteTimeGetCurrent();  // 1.3.49 拖动后进快档快速重检
         gVcamPick.px = c.x;   // 共享位置同步(捕获线程下一拍即用新位置)
         gVcamPick.py = c.y;
         NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithDictionary:
@@ -1261,20 +1266,24 @@ static NSString *vcamLightColorName(uint32_t c) {
         // (读共享变量, UICSI 模式 ~3ms)
         _colorPickQueue = dispatch_get_main_queue();
     }
-    // 1.3.45: 0.05s → 0.04s(25Hz) —— 用户反馈打光跟不上屏幕闪烁速度,
-    // 检测节拍提频压低检测相位延迟(平均 20ms), 主线程成本 ~6%→7.5% 可接受
+    // 1.3.45: 0.05s → 0.04s(25Hz)。1.3.49: 自适应双档 —— 颜色活跃(0.5s 内
+    // 有跳变, 闪烁跟随正是活跃期)快档 0.02s(50Hz, 检测相位延迟平均 10ms,
+    // 主线程 ~15% 但相机 App 前台时 SB 主线程基本空闲); 稳定后回落 25Hz。
+    // 开启即快档: 第一抹颜色最快出现
+    _pickFastMode = YES;
+    _lastPickChangeAt = CFAbsoluteTimeGetCurrent();
     _colorPickTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _colorPickQueue);
     dispatch_source_set_timer(_colorPickTimer,
-                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.04 * NSEC_PER_SEC)),
-                              (uint64_t)(0.04 * NSEC_PER_SEC),
-                              (uint64_t)(0.015 * NSEC_PER_SEC));
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.02 * NSEC_PER_SEC)),
+                              (uint64_t)(0.02 * NSEC_PER_SEC),
+                              (uint64_t)(0.008 * NSEC_PER_SEC));
     __weak typeof(self) weakSelf = self;
     dispatch_source_set_event_handler(_colorPickTimer, ^{
         __strong typeof(weakSelf) strongSelf = weakSelf;
         if (strongSelf) [strongSelf colorPickTick];
     });
     dispatch_resume(_colorPickTimer);
-    vcam_ball_log(@"[vcam][light] color pickup started (0.04s, main queue)");
+    vcam_ball_log(@"[vcam][light] color pickup started (adaptive 50/25Hz, main queue, 1.3.49)");
 }
 
 - (void)stopColorPickup {
@@ -1340,14 +1349,34 @@ static NSString *vcamLightColorName(uint32_t c) {
     if (_pickSuspended) return;
     if (_pickSkipCount > 0) { _pickSkipCount--; return; }
 
-    // tick 心跳诊断(1.3.40): 每秒一行, 定位 检测timer/捕获线程/看门狗 哪层没动
+    // tick 心跳诊断(1.3.40, 1.3.49 改时间驱动): 每秒一行, 定位 检测timer/
+    // 捕获线程/看门狗 哪层没动(自适应节拍下 tick 数不再与秒数对应)
     static long tickCount = 0;
-    if (++tickCount % 25 == 1) {  // 0.04s×25 = 1s
+    static double lastTickLog = 0;
+    tickCount++;
+    if (CFAbsoluteTimeGetCurrent() - lastTickLog > 1.0) {
+        lastTickLog = CFAbsoluteTimeGetCurrent();
         vcam_ball_log([NSString stringWithFormat:
-            @"[vcam][light] tick#%ld strat=%d alive=%d seq=%llu hbAge=%.2fs",
-            tickCount, gVcamPick.currentStrategy, gVcamPick.threadAlive,
+            @"[vcam][light] tick#%ld(%@) strat=%d alive=%d seq=%llu hbAge=%.2fs",
+            tickCount, _pickFastMode ? @"50Hz" : @"25Hz",
+            gVcamPick.currentStrategy, gVcamPick.threadAlive,
             (unsigned long long)gVcamPick.seq,
             CFAbsoluteTimeGetCurrent() - gVcamPick.heartbeat]);
+    }
+
+    // 1.3.49 自适应节拍: 颜色活跃(0.5s 内有跳变)→快档, 稳定→回落。
+    // 切换在主队列 timer handler 内改 timer 参数(dispatch 允许, 线程正确)
+    BOOL wantFast = (CFAbsoluteTimeGetCurrent() - _lastPickChangeAt) < 0.5;
+    if (wantFast != _pickFastMode) {
+        _pickFastMode = wantFast;
+        double iv = wantFast ? 0.02 : 0.04;
+        dispatch_source_set_timer(_colorPickTimer,
+                                  dispatch_time(DISPATCH_TIME_NOW, (int64_t)(iv * NSEC_PER_SEC)),
+                                  (uint64_t)(iv * NSEC_PER_SEC),
+                                  (uint64_t)((wantFast ? 0.008 : 0.015) * NSEC_PER_SEC));
+        vcam_ball_log([NSString stringWithFormat:
+            @"[vcam][light] pick cadence -> %@ (%@)", wantFast ? @"50Hz" : @"25Hz",
+            wantFast ? @"color active" : @"stable"]);
     }
 
     static int diagTicks = 0;
@@ -1425,6 +1454,7 @@ static NSString *vcamLightColorName(uint32_t c) {
 
     if (detected != _lastDetectedColor) {
         _lastDetectedColor = detected;
+        _lastPickChangeAt = CFAbsoluteTimeGetCurrent();  // 1.3.49 维持快档
         [VCamNotify setPlistLightColor:detected];  // 0=熄灭(闪烁消失/无匹配)
         uint32_t d = detected;
         dispatch_async(dispatch_get_main_queue(), ^{
