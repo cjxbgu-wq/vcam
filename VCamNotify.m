@@ -1320,18 +1320,31 @@ typedef CGImageRef (*VcamUICreateScreenImageFn)(void);
     // 无需任何映射。slot 编号同时写(诊断/日志用)。
     uint32_t color = (bestIdx >= 0 && bestIdx < 6) ? kKnown[bestIdx] : 0;
     int slot = (bestIdx >= 0 && bestIdx < 6) ? bestIdx + 1 : 0;
-    // 1.3.71 变色去抖: 连续 2 拍同 slot 才发布变化 —— 颜色边界抖动/闪烁
-    // 过渡期(红↔灭 交替)会以 40ms 周期触发 md sig 变化 → 早醒风暴打断
-    // 24fps 预渲染节拍 → 视频一卡一卡(设备实测症状)。去抖后噪声翻拍被
-    // 吸收, 真实变色只延迟 1 拍(40ms, 人眼无感)。
+    // 1.3.73 光稳定滞回(闪烁根修): 1.3.71 的 2 拍去抖只能滤单拍噪声;
+    // 检测源闪烁(红↔灭 交替块, 半周期≥80ms)每 2-3 拍同色 → 透过去抖 →
+    // 稳定 slot 红灭翻转 → 光斑一直闪烁跳动(1.3.72 移除早醒后光斑每拍
+    // 烘焙最新色, 抖动直接透传, 症状显性化)。滞回策略:
+    //   有色: 连续 2 拍同色 → 确认切换(真实红→绿切换 80ms 确认)
+    //   无色: 连续 5 拍(200ms) 才灭光, 期间保持最近有效颜色
+    //         (检测源亮灭闪烁半周期 <200ms → 光稳定不闪)
+    // 两有色交替(红绿红绿边界抖动)永不连续 → 保持当前色, 同样防闪。
     static int sPrevSlot = -2;    // 上一拍原始 slot
     static int sStableSlot = -2;  // 已确认的稳定 slot
-    if (slot == sPrevSlot) {
-        if (slot != sStableSlot) {
-            sStableSlot = slot;
+    static int sBlankRun = 0;     // 连续无色(0)拍数
+    if (slot >= 1 && slot <= 6) {
+        sBlankRun = 0;
+        if (slot == sPrevSlot) {
+            sStableSlot = slot;   // 连续 2 拍同色: 确认
+        } else {
+            sPrevSlot = slot;     // 候选, 下一拍确认
         }
     } else {
-        sPrevSlot = slot;  // 与上拍不同: 候选, 下一拍确认
+        // 无色滞回: 短暂灭(闪烁半周期)不灭光, 保持当前稳定色
+        if (sBlankRun < 5) sBlankRun++;
+        if (sBlankRun >= 5) {
+            sStableSlot = 0;      // 连续 200ms 无色: 真消失, 灭光
+            sPrevSlot = 0;
+        }
     }
     int outSlot = sStableSlot;
     uint32_t outColor = (outSlot >= 1 && outSlot <= 6) ? kKnown[outSlot - 1] : 0;
