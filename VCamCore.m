@@ -807,16 +807,18 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                     }
                 } else if (nowT >= bootGraceUntil) {
                     bootGraceDone = YES;
-                    // 交接线 62→72(2026-08-20 首开卡顿修复): 62-72 是正常运行带
-                    // (稳态实测 45-58% + 余量), grace 强制期结束后 EMA 在此区间
-                    // 不应继续保持降载 —— 旧版等 <62 才退, 多流负载 EMA 在 62 边缘
-                    // 徘徊时用户被压 20fps 近 1 分钟(设备实证 18:13:16 ended →
-                    // 18:14:02 才 OFF, 首开 59s 低帧率)。ema 未测得(极端快启动)或
-                    // ≥72(真过载)时保守走正常保持, 由 CPU 闭环接管
-                    if (emaInit && emaPct < 72.0 && lowPower) {
+                    // 交接线 72→110(1.3.75 视频播放卡顿根修): 冷启动相机风暴
+                    // (管线init+媒体重载+预填)是一次性成本, EMA 45-110 区间是
+                    // 风暴尾/正常运行带 —— 旧 72 线让风暴尾(EMA 72-110)在 grace
+                    // 结束后继续压 20fps, 叠加首采样毒化后 EMA 天文数字, 用户
+                    // 整个观看期(实测 30s)全程 20fps = "视频播放后卡顿掉帧"。
+                    // 110 = hardTrip 线: grace 结束时 EMA<110 立即 OFF 恢复源帧率
+                    // (帧率稳定硬约束); ≥110(真失控, 逼近 2 核)保持降载, hardTrip
+                    // 判定同线接续, 保命(进程被杀=相机全黑)优先。
+                    if (emaInit && emaPct < 110.0 && lowPower) {
                         lowPower = NO;
                         lastModeSwitch = nowT - 11.0;  // 免保持, 允许闭环立即再评估
-                        vcam_core_log([NSString stringWithFormat:@"[vcam] boot grace ended, EMA %.0f%% in normal band, immediate OFF", emaPct]);
+                        vcam_core_log([NSString stringWithFormat:@"[vcam] boot grace ended, EMA %.0f%% below hardTrip line, immediate OFF", emaPct]);
                     } else {
                         lastModeSwitch = nowT;
                         vcam_core_log(@"[vcam] boot grace ended, CPU loop takes over");
@@ -918,10 +920,19 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                     }
                     }
                 }
-                if (lastCpuSec > 0 && nowT > lastCpuSample && delta >= 0) {
+                // 1.3.75 首采样修复: lastCpuSec==0 时 delta = 进程启动以来全部
+                // 累计 CPU 秒 → pct = 累计/0.8s*100 = 天文数字(日志实证 923893%,
+                // 11292399%) → EMA 被毒化 → hardTrip 误触发 SURVIVAL throttle +
+                // grace 结束后 EMA 长期 >62 不退出 → 内容被压 20fps 十几秒 =
+                // "视频播放后卡顿掉帧"直接来源。修: 首采样只建基线不算 pct;
+                // 另 pct>400 视为采样异常(单进程真实上限 ~200-300%)丢弃不更新
+                // EMA(下轮重算), 只推进时间基线。
+                if (lastCpuSec > 0 && lastCpuSample > 0 && nowT > lastCpuSample && delta >= 0) {
                     double pct = delta / (nowT - lastCpuSample) * 100.0;
+                    if (pct < 400.0) {
                     emaPct = emaInit ? (emaPct * 0.5 + pct * 0.5) : pct;  // 0.6/0.4→0.5/0.5 更灵敏
                     emaInit = YES;
+                    }
                     // 进入快(2s)/退出 hold 5s(1.3.36 卡顿修复): 旧 10s 保持期让
                     // 短活跃窗口(切模式/速览, 实测 8s)整窗被压 20fps 从未退出;
                     // 退出后 6s exitCooldown 防横跳仍在, 5s+6s 振荡周期可接受
