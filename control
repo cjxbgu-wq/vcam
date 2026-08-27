@@ -1,6 +1,6 @@
 Package: com.vcam.plus
 Name: 岐盛相机
-Version: 1.3.68
+Version: 1.3.69
 Architecture: iphoneos-arm64e
 Description: 岐盛ios免费相机
 Maintainer: vcam
