@@ -1320,30 +1320,40 @@ typedef CGImageRef (*VcamUICreateScreenImageFn)(void);
     // 无需任何映射。slot 编号同时写(诊断/日志用)。
     uint32_t color = (bestIdx >= 0 && bestIdx < 6) ? kKnown[bestIdx] : 0;
     int slot = (bestIdx >= 0 && bestIdx < 6) ? bestIdx + 1 : 0;
-    // 1.3.74 光稳定滑窗多数票(闪烁根修 v2): 1.3.73 滞回只防"色↔灭"交替;
-    // 检测源在两种颜色间交替闪烁切换时, 每色块连续 ≥2 拍仍周期性满足
-    // 确认条件 → 稳定色红↔绿翻转 → 光斑时而替换时而回退一直跳动(设备
-    // 实测症状)。滑窗多数票(对任意闪烁模式稳态不跳):
-    //   最近 12 拍(480ms@25Hz)里某 slot 占 ≥8 拍才发布为当前色;
-    //   不足 8 拍(交替闪烁/过渡噪声/色块<320ms) → 保持当前色不变。
-    //   交替闪烁(红绿/色灭, 占空比≈50%)永不过阈 → 光钉在当前色稳定
-    //   新色持续 ≥320ms → 干净切换(光色 ~300ms 延迟人眼无感)
-    //   持续无色 ≥320ms → 灭光
+    // 1.3.76 光稳定 v3(灭光跳动根修): 1.3.74 滑窗多数票把 slot=0(无色)和
+    // 有色放在同一阈值竞争 —— 快速闪烁切换时过渡帧(混合色/暗帧)采样失败
+    // → slot=0 混入滑窗, 周期性占到多数(≥8/12) → 灭光, 随后有效色又占
+    // 多数 → 亮光 → 光"时而打时而不打"(设备实测症状)。
+    // 修: 有色与无色不对称判定 ——
+    //   有色: 最近 12 拍(480ms@25Hz)里某色占 ≥8 拍才切换(维持 1.3.74)
+    //   无色: 必须连续 8 拍(320ms)全部无色才灭光 —— 闪烁期窗内总夹着
+    //         有效色拍, 连 0 被打断 → 光钉住永不灭; 光源真正消失
+    //         320ms 后才灭(与前版本灭光时延一致)
     static int sWin[12] = {0};    // 滑窗原始 slot(初值 0=无色)
     static int sWinPos = 0;
     static int sStableSlot = -2;  // 已发布的稳定 slot
+    static int sZeroRun = 0;      // 连续无色(0)拍数
     sWin[sWinPos] = slot;
     sWinPos = (sWinPos + 1) % 12;
-    int cnt[7] = {0};             // slot 0..6 计票
-    for (int i = 0; i < 12; i++) {
-        if (sWin[i] >= 0 && sWin[i] <= 6) cnt[sWin[i]]++;
-    }
-    int majSlot = 0, majCnt = 0;
-    for (int s = 0; s <= 6; s++) {
-        if (cnt[s] > majCnt) { majCnt = cnt[s]; majSlot = s; }
-    }
-    if (majCnt >= 8 && majSlot != sStableSlot) {
-        sStableSlot = majSlot;    // 窗内 ≥8/12 过半: 确认切换(或灭)
+    if (slot >= 1 && slot <= 6) {
+        sZeroRun = 0;             // 有效色拍打断连续无色计数
+        int cnt[7] = {0};         // slot 1..6 有色计票
+        for (int i = 0; i < 12; i++) {
+            if (sWin[i] >= 1 && sWin[i] <= 6) cnt[sWin[i]]++;
+        }
+        int majSlot = 0, majCnt = 0;
+        for (int s = 1; s <= 6; s++) {
+            if (cnt[s] > majCnt) { majCnt = cnt[s]; majSlot = s; }
+        }
+        if (majCnt >= 8 && majSlot != sStableSlot) {
+            sStableSlot = majSlot;  // 窗内 ≥8/12 过半: 确认切换
+        }
+    } else {
+        // 无色滞回(硬条件): 连续 8 拍全无色才灭, 单拍/交替混入的 0 无效
+        if (sZeroRun < 8) sZeroRun++;
+        if (sZeroRun >= 8 && sStableSlot != 0) {
+            sStableSlot = 0;        // 连续 320ms 无任何有效色: 真消失, 灭光
+        }
     }
     int outSlot = (sStableSlot >= 0 && sStableSlot <= 6) ? sStableSlot : 0;
     uint32_t outColor = (outSlot >= 1 && outSlot <= 6) ? kKnown[outSlot - 1] : 0;
