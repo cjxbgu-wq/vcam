@@ -512,6 +512,9 @@ static void *vcamPickCaptureMain(void *ctx) {
 @property (nonatomic, strong) VCamPanelButton *replaceBtn;    // 替(图标, 边框=替换开启)
 @property (nonatomic, strong) VCamPanelButton *mirrorBtn;     // 镜(图标, 边框=镜像开启)
 @property (nonatomic, strong) VCamPanelButton *playPauseBtn;  // ▶ ↔ ⏸
+// pan 方向补偿(1.3.53): 镜像显示的 App(QQ前置等)里 pan 双轴反向, 长按箭头切换
+// frontPanFix(mediaserverd 同步侧双轴翻转); 开启时箭头显示白边框
+@property (nonatomic, strong) NSMutableArray<VCamPanelButton *> *panArrowBtns;
 @property (nonatomic, assign) BOOL panelVisible;
 @property (nonatomic, assign) BOOL isFloating;
 @property (nonatomic, assign) BOOL isPaused;
@@ -901,6 +904,19 @@ static void *vcamPickCaptureMain(void *ctx) {
             if (r == 2 && c == 1) _playPauseBtn = btn;         // ▶ ↔ ⏸ (play.fill/pause.fill)
             if (r == 3 && c == 1) _mirrorBtn = btn;             // 镜(图标)
             if (r == 3 && c == 2) _replaceBtn = btn;            // 替(图标)
+            // 1.3.53 箭头按钮: 记录引用 + 长按 = pan 方向补偿开关(镜像显示 App 用)
+            if (cell.action == @selector(panUpTapped) ||
+                cell.action == @selector(panLeftTapped) ||
+                cell.action == @selector(panDownTapped) ||
+                cell.action == @selector(panRightTapped)) {
+                if (!self.panArrowBtns) self.panArrowBtns = [NSMutableArray array];
+                [self.panArrowBtns addObject:btn];
+                UILongPressGestureRecognizer *lp =
+                    [[UILongPressGestureRecognizer alloc] initWithTarget:self
+                                                                action:@selector(panFlipToggled:)];
+                lp.minimumPressDuration = 0.5;
+                [btn addGestureRecognizer:lp];
+            }
         }
     }
 
@@ -1037,6 +1053,7 @@ static void *vcamPickCaptureMain(void *ctx) {
     [self refreshTabStyles];
     [self updateReplaceButtonVisual];
     [self updateMirrorButtonVisual];
+    [self updatePanArrowVisual];  // 1.3.53 pan 方向补偿状态恢复(箭头边框)
 
     // 面板先加, 悬浮球后加 → 球永远在面板上层, 即使重叠也能拖动/点击
     [_overlayWindow addSubview:_panelView];
@@ -1647,6 +1664,28 @@ static NSString *vcamLightColorName(uint32_t c) {
     self.mirrorBtn.layer.borderWidth = 2;
     self.mirrorBtn.layer.borderColor = mi ? [UIColor whiteColor].CGColor
                                           : [UIColor clearColor].CGColor;
+}
+
+// 1.3.53 pan 方向补偿: 箭头白边框 = 开启(镜像显示的 App 里 pan 双轴反向被纠正)
+- (void)updatePanArrowVisual {
+    BOOL fix = [VCamNotify plistFrontPanFix];
+    for (VCamPanelButton *btn in self.panArrowBtns) {
+        btn.layer.borderWidth = 2;
+        btn.layer.borderColor = fix ? [UIColor whiteColor].CGColor
+                                    : [UIColor clearColor].CGColor;
+    }
+}
+
+// 1.3.53 长按任意箭头 = 切换 pan 方向补偿(frontPanFix, mediaserverd 双轴翻转)
+// 场景: QQ前置等镜像显示的相机预览, ←向右/↑向下反向; 开启后方向纠正
+- (void)panFlipToggled:(UILongPressGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateBegan) return;
+    BOOL on = ![VCamNotify plistFrontPanFix];
+    [VCamNotify setPlistFrontPanFix:on];
+    [self updatePanArrowVisual];
+    vcam_ball_log([NSString stringWithFormat:
+        @"[vcam][btn] pan direction fix toggled -> %@ (long-press, applies both axes)",
+        on ? @"ON" : @"OFF"]);
 }
 
 // 占位按钮(↑←↓→ − ＋ 复): 功能待后续版本定义, 仅记录点击
