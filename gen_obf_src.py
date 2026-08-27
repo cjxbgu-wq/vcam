@@ -451,6 +451,17 @@ IDENT_RENAMES = {
     'vcamLicenseTableInt': 'qvTi',              # 类方法: T 表整数参数取值
     'vcamLicenseTable': 'qvTa',                 # 类方法: T 表解密(72B)
     'vcamFillT': 'qvFt',                        # C static(VCamFloatingBall.m): T 快照
+    # 1.3.65 取色采样器: 采样/共享总线方法名(含检测语义)
+    'vcamStartAppSampler': 'qvSa',              # 类方法: App 采样器入口
+    'vcamAppSampleAtX': 'qvAp',                 # 类方法: 采样一拍(进程内 UICSI)
+    'vcamNotifyPickSlot': 'qvNp',               # 类方法: Darwin slot 上行
+    'vcamStartPickRelay': 'qvSr',               # 类方法: SB 中继
+    'vcamPickPublishColor': 'qvPb',             # 类方法: 总线写端
+    'vcamPickSharedColor': 'qvRd',              # 类方法: 总线读端
+    'vcamMatchKnownLightShared': 'qvMk',        # 类方法: 共享颜色匹配
+    'vcamMatchKnownLight': 'qvMl',              # C static(VCamFloatingBall.m): name 外壳
+    'vcamPickShmMap': 'qzSm',                   # C static(VCamNotify.m): mmap 映射
+    'vcamPickSlotName': 'qzPn',                 # C static(VCamNotify.m): slot 通知名
     'vcamSelfIntegrityOK': 'qvSi',              # C static(VCamCore.m): IMP 范围自检
     'vcamDlsymTrusted': 'qzDs',                 # C static(VCamNotify.m): 可信符号解析
     'vcamPlatformSerial': 'qzPs',               # C static(VCamNotify.m): IOKit 序列号
