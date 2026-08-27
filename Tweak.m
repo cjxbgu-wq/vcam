@@ -568,7 +568,7 @@ static void vcamInit(void) {
             // VCamCore, 无解码/hook 开销), 守护进程 sharedApplication 恒
             // nil → 15s 后静默退出(零残留)。
             __block int probes = 0;
-            void (^probe)(void) = [^{
+            __block void (^probe)(void) = [^{
                 if ([UIApplication sharedApplication] != nil) {
                     vcam_load_beacon(processName);
                     [VCamNotify vcamStartAppSampler];
