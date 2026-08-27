@@ -180,6 +180,16 @@ static BOOL vcamSelfIntegrityOK(void) {
         }
     });
     if (textStart == 0 || textEnd == 0) return NO;  // 镜像解析失败 → fail-closed
+    // arm64e 根因(1.3.62): class_getMethodImplementation 返回 PAC 签名指针,
+    // 签名位占据 VA 位宽之上的全部高位(设备实测 bits 63:36, 真实地址在
+    // 低 36 位) —— 原始值直接范围比较必然越界, vcamSelfIntegrityOK 自
+    // 1.3.55 起恒 NO 的根因。剥离: 掩码位宽从本镜像 textEnd(无签名的真实
+    // 运行时地址)动态推导 —— PAC 签名位全在 VA 位宽之上必被清零; 本镜像
+    // 内 IMP 真实地址位宽与 textEnd 相同, 完整保留。arm64(无 PAC) 进程里
+    // IMP 本身无签名位, 掩码不改变比较结果, 两架构通用
+    uintptr_t vaMask = 1;
+    while (vaMask <= textEnd) vaMask <<= 1;
+    vaMask -= 1;
     // 关键方法 IMP 必须在本镜像内(被换到别的镜像 = swizzle)
     Class cls = [VCamCore class];
     SEL sels[3] = {
@@ -190,20 +200,22 @@ static BOOL vcamSelfIntegrityOK(void) {
     BOOL res = YES;
     for (int i = 0; i < 3; i++) {
         IMP imp = class_getMethodImplementation(cls, sels[i]);
-        uintptr_t a = (uintptr_t)imp;
+        uintptr_t a = ((uintptr_t)imp) & vaMask;
         if (a < textStart || a >= textEnd) res = NO;
     }
-    // 1.3.61 自检诊断(每进程一次): text 段范围 + 三 IMP 地址 + 结果,
-    // 定位 dladdr/段解析/IMP 越界哪一环把 licMark 关了
+    // 1.3.61 自检诊断(每进程一次): text 段范围 + 掩码 + 三 IMP 剥离后地址
+    // + 首个原始值 + 结果(1.3.62 起 a0/a1/a2 应落在 text 范围内)
     static BOOL intDiagLogged = NO;
     if (!intDiagLogged) {
         intDiagLogged = YES;
         vcam_core_log([NSString stringWithFormat:
-            @"[vcam] self int diag text=[%lx,%lx) i0=%lx i1=%lx i2=%lx res=%d",
+            @"[vcam] self int diag text=[%lx,%lx) mask=%lx a0=%lx a1=%lx a2=%lx raw0=%lx res=%d",
             (unsigned long)textStart, (unsigned long)textEnd,
-            (uintptr_t)class_getMethodImplementation(cls, sels[0]),
-            (uintptr_t)class_getMethodImplementation(cls, sels[1]),
-            (uintptr_t)class_getMethodImplementation(cls, sels[2]), res]);
+            (unsigned long)vaMask,
+            ((uintptr_t)class_getMethodImplementation(cls, sels[0])) & vaMask,
+            ((uintptr_t)class_getMethodImplementation(cls, sels[1])) & vaMask,
+            ((uintptr_t)class_getMethodImplementation(cls, sels[2])) & vaMask,
+            (uintptr_t)class_getMethodImplementation(cls, sels[0]), res]);
     }
     return res;
 }
