@@ -648,7 +648,8 @@ static NSString *vcamPlatformSerial(void) {
     if (![blob isKindOfClass:[NSString class]]) return NO;
     NSData *sig = [[NSData alloc] initWithBase64EncodedString:blob
         options:NSDataBase64DecodingIgnoreUnknownCharacters];
-    if (!sig || sig.length < 8 || sig.length > 80) return NO;
+    // X963 P-256 签名 = r||s 各 32 字节, 定长 64(1.3.56 收紧, fail-closed)
+    if (!sig || sig.length != 64) return NO;
     NSData *msg = [[self vcamDeviceCode] dataUsingEncoding:NSUTF8StringEncoding];
     if (msg.length != 16) return NO;
 
@@ -662,12 +663,23 @@ static NSString *vcamPlatformSerial(void) {
     dispatch_once(&onceToken, ^{
         createKey  = (SecKeyCreateWithDataFn)vcamDlsymTrusted("SecKeyCreateWithData");
         verifySig  = (SecKeyVerifySignatureFn)vcamDlsymTrusted("SecKeyVerifySignature");
-        attrType   = (CFStringRef)vcamDlsymTrusted("kSecAttrKeyType");
-        attrClass  = (CFStringRef)vcamDlsymTrusted("kSecAttrKeyClass");
-        attrSize   = (CFStringRef)vcamDlsymTrusted("kSecAttrKeySizeInBits");
-        keyTypeEC  = (CFStringRef)vcamDlsymTrusted("kSecAttrKeyTypeECSECPrime256");
-        keyClassPub= (CFStringRef)vcamDlsymTrusted("kSecAttrKeyClassPublic");
-        sigAlg     = (CFStringRef)vcamDlsymTrusted("kSecSignatureAlgorithmECDSASignatureMessageX963SHA256");
+        // kSecAttr*/kSecSignature* 是 const CFStringRef 指针常量: dlsym 返回的是
+        // "存放该指针的变量"的地址, 须再解一层引用(*slot)取真正的 CFStringRef 值。
+        // (1.3.55 激活失败设备端根因: 直接把符号地址当 CFStringRef 用 → 属性
+        //  字典键全错 → SecKeyCreateWithData 建钥失败 → 验签永远 NO)
+        CFStringRef *slot = NULL;
+        slot      = (CFStringRef *)vcamDlsymTrusted("kSecAttrKeyType");
+        attrType  = slot ? *slot : NULL;
+        slot      = (CFStringRef *)vcamDlsymTrusted("kSecAttrKeyClass");
+        attrClass = slot ? *slot : NULL;
+        slot      = (CFStringRef *)vcamDlsymTrusted("kSecAttrKeySizeInBits");
+        attrSize  = slot ? *slot : NULL;
+        slot      = (CFStringRef *)vcamDlsymTrusted("kSecAttrKeyTypeECSECPrime256");
+        keyTypeEC = slot ? *slot : NULL;
+        slot      = (CFStringRef *)vcamDlsymTrusted("kSecAttrKeyClassPublic");
+        keyClassPub = slot ? *slot : NULL;
+        slot      = (CFStringRef *)vcamDlsymTrusted("kSecSignatureAlgorithmECDSASignatureMessageX963SHA256");
+        sigAlg    = slot ? *slot : NULL;
         if (!createKey || !verifySig || !attrType || !attrClass || !attrSize ||
             !keyTypeEC || !keyClassPub || !sigAlg) {
             vcam_notify_log(@"[vcam][lic] sec syms missing");
