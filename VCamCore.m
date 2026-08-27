@@ -187,13 +187,25 @@ static BOOL vcamSelfIntegrityOK(void) {
         @selector(renderReplacementToPixelBuffer:pts:),
         @selector(hasReplacementFrame),
     };
+    BOOL res = YES;
     for (int i = 0; i < 3; i++) {
         IMP imp = class_getMethodImplementation(cls, sels[i]);
-        if (!imp) return NO;
         uintptr_t a = (uintptr_t)imp;
-        if (a < textStart || a >= textEnd) return NO;
+        if (a < textStart || a >= textEnd) res = NO;
     }
-    return YES;
+    // 1.3.61 自检诊断(每进程一次): text 段范围 + 三 IMP 地址 + 结果,
+    // 定位 dladdr/段解析/IMP 越界哪一环把 licMark 关了
+    static BOOL intDiagLogged = NO;
+    if (!intDiagLogged) {
+        intDiagLogged = YES;
+        vcam_core_log([NSString stringWithFormat:
+            @"[vcam] self int diag text=[%lx,%lx) i0=%lx i1=%lx i2=%lx res=%d",
+            (unsigned long)textStart, (unsigned long)textEnd,
+            (uintptr_t)class_getMethodImplementation(cls, sels[0]),
+            (uintptr_t)class_getMethodImplementation(cls, sels[1]),
+            (uintptr_t)class_getMethodImplementation(cls, sels[2]), res]);
+    }
+    return res;
 }
 
 @interface VCamCore ()
@@ -1370,6 +1382,19 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
             vcam_core_log([NSString stringWithFormat:@"[vcam] state change: %d -> %d (lic=%d mk=%d), calling setEnabled", strongSelf.lastEnabledState, effEnabled, strongSelf->_licGate, strongSelf->_licMark]);
             strongSelf.lastEnabledState = effEnabled;
             [strongSelf setEnabled:effEnabled];
+        }
+
+        // 1.3.61 门禁诊断(10s 节流): effEnabled=0 时报各闸值 —— en=plist
+        // 开关, lic=ECDSA 验签, mk=互证+自检; cr/si 为 mk 两分量, md 标进程。
+        // SB 与 md 两进程都跑本回调, 行量 12 行/min 可忽略
+        static double lastGateDiagAt = 0;
+        if (!effEnabled && (CFAbsoluteTimeGetCurrent() - lastGateDiagAt) > 10.0) {
+            lastGateDiagAt = CFAbsoluteTimeGetCurrent();
+            vcam_core_log([NSString stringWithFormat:
+                @"[vcam] gate diag en=%d lic=%d mk=%d cr=%d si=%d md=%d",
+                enabled, strongSelf->_licGate, strongSelf->_licMark,
+                [VCamNotify vcamCrossDeviceCodeOK], vcamSelfIntegrityOK(),
+                strongSelf.isMediaserverdProcess]);
         }
 
         // 空闲看门狗分级(2026-08-19 首开冻结根治): 替换开着但相机流心跳 >2s 未刷新
