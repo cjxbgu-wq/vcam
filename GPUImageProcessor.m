@@ -6,6 +6,7 @@
 //
 
 #import "GPUImageProcessor.h"
+#import "VCamNotify.h"
 #import <CoreImage/CoreImage.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <dlfcn.h>
@@ -1534,8 +1535,17 @@ static void vcamApplyLightBiPlanar(CVPixelBufferRef buf, uint32_t rgb,
     int minDim = (int)((fw < fh) ? fw : fh);
     int radius = (int)((int64_t)diameter * minDim / 200);
     if (radius < 2) return;
-    int innerR = radius * (100 - feather) * 80 / 10000;
-    int maxAlpha256 = intensity * 192 / 100;
+    // 1.3.63 方案A: 羽化/强度映射系数从许可 T 表解密取(idx14 羽化分子,
+    // idx15 羽化分母, idx16 强度分子) —— 跳过验证 = 垃圾值 → 光斑形状/强度
+    // 错乱。防除零不修正行为(值仍错)。
+    int featherK = (int)[VCamNotify vcamLicenseTableInt:14];
+    int featherScale = (int)[VCamNotify vcamLicenseTableInt:15];
+    int intensityK = (int)[VCamNotify vcamLicenseTableInt:16];
+    if (featherScale <= 0) featherScale = 1;  // 防除零(垃圾参数语义保留)
+    if (intensityK < 0) intensityK = 0;
+    int innerR = radius * (100 - feather) * featherK / featherScale;
+    if (innerR < 0) innerR = 0;   // 垃圾负值钳 0(羽化满半径, 画面错但不崩)
+    int maxAlpha256 = intensity * intensityK / 100;
 
     uint8_t r = (rgb >> 16) & 0xFF;
     uint8_t g = (rgb >> 8) & 0xFF;
