@@ -354,6 +354,20 @@ static void vcam_darwin_callback(CFNotificationCenterRef center, void *observer,
     [dict writeToFile:VCamPlistPath atomically:YES];
 }
 
+// 1.3.53 pan 方向补偿(镜像显示的 App 用): mediaserverd 同步侧已实现 frontPanFix
+// 双轴翻转(panX/panY 各乘 -1), 此处补 UI 读写入口
++ (BOOL)plistFrontPanFix {
+    NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath];
+    return dict[@"frontPanFix"] ? [dict[@"frontPanFix"] boolValue] : NO;
+}
+
++ (void)setPlistFrontPanFix:(BOOL)on {
+    NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithDictionary:
+        [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath] ?: @{}];
+    dict[@"frontPanFix"] = @(on);
+    [dict writeToFile:VCamPlistPath atomically:YES];
+}
+
 + (void)resetPlistTransform {
     NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithDictionary:
         [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath] ?: @{}];
