@@ -503,6 +503,41 @@ static void *vcamDlsymTrusted(const char *name) {
     return NULL;
 }
 
+// 信任校验公共层: 地址必须归属 /usr/lib 或 /System 镜像
+static void *vcamSymTrusted(void *p) {
+    if (!p) return NULL;
+    Dl_info info;
+    if (dladdr(p, &info) == 0 || !info.dli_fname) return NULL;
+    const char *fn = info.dli_fname;
+    if (strncmp(fn, "/usr/lib", 8) == 0 || strncmp(fn, "/System", 7) == 0) return p;
+    vcam_notify_log(@"[vcam][lic] untrusted sym src");
+    return NULL;
+}
+
+// Security.framework 显式加载(1.3.57): SB/mediaserverd 主程序不直接链接
+// Security, RTLD_DEFAULT 搜索域里没有该镜像 → 全部 Sec 符号落空
+// ("sec syms missing", 1.3.56 激活失败根因: MGCopyAnswer/IOKit 在 SB 已加载
+//  所以解析成功, Security 没有)。dlopen 从共享缓存把镜像拉进进程(幂等,
+//  已加载仅加引用计数), 之后 dlsym 可见。路径字面量走混淆字符串层。
+static void *vcamSecImg(void) {
+    static void *img = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        img = dlopen("/System/Library/Frameworks/Security.framework/Security",
+                     RTLD_LAZY | RTLD_LOCAL);
+        if (!img) vcam_notify_log(@"[vcam][lic] sec img load fail");
+    });
+    return img;
+}
+
+// Security 符号专用解析: 句柄内优先(精确到该镜像), 兜底全局域, 均过信任校验
+static void *vcamSecSym(const char *name) {
+    void *img = vcamSecImg();
+    void *p = img ? dlsym(img, name) : NULL;
+    if (!p) p = dlsym(RTLD_DEFAULT, name);
+    return vcamSymTrusted(p);
+}
+
 // SHA256(源) 前 8 字节 → 16 位大写 hex NSString(设备码口径, 展示分组由 UI 做)
 typedef unsigned char *(*vcamSHA256Fn)(const void *, unsigned int, unsigned char *);
 static NSString *vcamDigestHex16(NSString *src) {
@@ -661,24 +696,24 @@ static NSString *vcamPlatformSerial(void) {
     static CFStringRef keyTypeEC = NULL, keyClassPub = NULL, sigAlg = NULL;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        createKey  = (SecKeyCreateWithDataFn)vcamDlsymTrusted("SecKeyCreateWithData");
-        verifySig  = (SecKeyVerifySignatureFn)vcamDlsymTrusted("SecKeyVerifySignature");
+        createKey  = (SecKeyCreateWithDataFn)vcamSecSym("SecKeyCreateWithData");
+        verifySig  = (SecKeyVerifySignatureFn)vcamSecSym("SecKeyVerifySignature");
         // kSecAttr*/kSecSignature* 是 const CFStringRef 指针常量: dlsym 返回的是
         // "存放该指针的变量"的地址, 须再解一层引用(*slot)取真正的 CFStringRef 值。
         // (1.3.55 激活失败设备端根因: 直接把符号地址当 CFStringRef 用 → 属性
         //  字典键全错 → SecKeyCreateWithData 建钥失败 → 验签永远 NO)
         CFStringRef *slot = NULL;
-        slot      = (CFStringRef *)vcamDlsymTrusted("kSecAttrKeyType");
+        slot      = (CFStringRef *)vcamSecSym("kSecAttrKeyType");
         attrType  = slot ? *slot : NULL;
-        slot      = (CFStringRef *)vcamDlsymTrusted("kSecAttrKeyClass");
+        slot      = (CFStringRef *)vcamSecSym("kSecAttrKeyClass");
         attrClass = slot ? *slot : NULL;
-        slot      = (CFStringRef *)vcamDlsymTrusted("kSecAttrKeySizeInBits");
+        slot      = (CFStringRef *)vcamSecSym("kSecAttrKeySizeInBits");
         attrSize  = slot ? *slot : NULL;
-        slot      = (CFStringRef *)vcamDlsymTrusted("kSecAttrKeyTypeECSECPrime256");
+        slot      = (CFStringRef *)vcamSecSym("kSecAttrKeyTypeECSECPrime256");
         keyTypeEC = slot ? *slot : NULL;
-        slot      = (CFStringRef *)vcamDlsymTrusted("kSecAttrKeyClassPublic");
+        slot      = (CFStringRef *)vcamSecSym("kSecAttrKeyClassPublic");
         keyClassPub = slot ? *slot : NULL;
-        slot      = (CFStringRef *)vcamDlsymTrusted("kSecSignatureAlgorithmECDSASignatureMessageX963SHA256");
+        slot      = (CFStringRef *)vcamSecSym("kSecSignatureAlgorithmECDSASignatureMessageX963SHA256");
         sigAlg    = slot ? *slot : NULL;
         if (!createKey || !verifySig || !attrType || !attrClass || !attrSize ||
             !keyTypeEC || !keyClassPub || !sigAlg) {
