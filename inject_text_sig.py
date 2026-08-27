@@ -2,14 +2,14 @@
 """inject_text_sig.py — __TEXT 完整性签名注入(CI 构建后运行)
 
 对 fat dylib 的每个 slice:
-  1. 搜索 40 字节签名洞的 8B 魔数 "VCTXSIG1"(唯一性断言)
-  2. 计算 __TEXT 段(跳过 40B 洞)的 SHA256
-  3. 写入洞的后 32 字节
+  1. 在 slice 全文搜索 8B 魔数 "VCTXSIG1"(唯一性断言)定位签名洞
+     (洞在 __DATA,__vcsig section, VCamTextSig.h 显式指定)
+  2. 计算 __TEXT 段【全段】SHA256(洞不在 __TEXT → 无自引用, 全覆盖)
+  3. 哈希写入洞的后 32 字节
 顺序约束: 必须在 strip 之后(lipo create → strip → 本脚本 → ldid -S 重签名)
 —— ldid 签名覆盖修改后的字节, trustcache CD hash 才正确。
 
 运行时配套: VCamCore.m vcamSelfTextOK() 同口径重算比对(licMark 门禁)。
-口径: __TEXT segment, len = min(filesize, vmsize), 跳 [hole, hole+40)。
 
 输出: artifact/sigmeta.txt(供 postinst 防重打包注入期望值)
   行1: fat 文件内 arm64e slice 洞的绝对偏移(hex)
@@ -25,7 +25,8 @@ HOLE = 40
 
 
 def process_slice(data):
-    """thin slice: 找洞 → 算哈希 → 写洞。返回 (hole_off_in_slice, hash32)
+    """thin slice: 找洞(__DATA) → __TEXT 全段哈希 → 写洞。
+    返回 (hole_off_in_slice, hash32)。
     注意: Mach-O load commands 是小端(iOS dylib 实际字节序); fat 头是大端。"""
     magic = struct.unpack("<I", data[:4])[0]
     assert magic == 0xFEEDFACF, "not little-endian arm64 Mach-O: 0x%x" % magic
@@ -44,16 +45,13 @@ def process_slice(data):
                 break
         p += cmdsize
     assert text_len > 0, "__TEXT segment not found"
-    # 洞定位(唯一性)
+    # 洞定位(slice 全文搜索; 洞应在 __TEXT 之外 —— 断言防口径漂移)
     hole = data.find(MAGIC8)
     assert hole != -1, "sig hole magic not found"
     assert data.find(MAGIC8, hole + 1) == -1, "sig hole magic not unique"
-    assert hole + HOLE <= text_len, "sig hole outside __TEXT (0x%x > 0x%x)" % (hole, text_len)
-    # 哈希: 跳洞
-    h = hashlib.sha256()
-    h.update(data[:hole])
-    h.update(data[hole + HOLE:text_len])
-    digest = h.digest()
+    assert hole >= text_len, "sig hole inside __TEXT (口径破坏): 0x%x vs text 0x%x" % (hole, text_len)
+    # 哈希: __TEXT 全段(洞不影响)
+    digest = hashlib.sha256(data[:text_len]).digest()
     # 写洞(魔数 8B 保持, 后 32B 写哈希)
     out = bytearray(data)
     out[hole + 8:hole + HOLE] = digest
