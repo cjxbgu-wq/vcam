@@ -1065,8 +1065,8 @@ static NSString *vcamPlatformSerial(void) {
 
 typedef struct {
     uint32_t magic;
-    uint32_t slot;   // 1.3.67: 色档编号(0=熄灭, 1-6=红绿蓝黄青紫) —— 色值
-                     // 映射挪到 md 端(SB T 表解密失败实锤; md ok=1 实锤)
+    uint32_t slot;   // 色档编号(0=熄灭, 1-6=红绿蓝黄青紫; 诊断用)
+    uint32_t color;  // 1.3.69 原版逻辑: 检测端直接给标准纯色(不经 T 表)
     uint32_t count;
     uint32_t avg;
     double   ts;
@@ -1090,6 +1090,7 @@ static VCamPickShm *vcamPickShmMap(void) {
             // 首次映射(或异版本残留): 初始化; magic 先置 0 再置值防半初始化读入
             mapped->magic = 0;
             mapped->slot = 0;
+            mapped->color = 0;
             mapped->count = 0;
             mapped->avg = 0;
             mapped->ts = 0;
@@ -1101,12 +1102,14 @@ static VCamPickShm *vcamPickShmMap(void) {
     return (mapped == MAP_FAILED) ? NULL : mapped;
 }
 
-// 写端: 采样器(App/SB 进程)调用; slot=色档(0 熄灭, 1-6); timestamp 最后写
-+ (void)vcamPickPublishSlot:(int)slot count:(int)cnt avg:(uint32_t)avg {
+// 写端: 采样器(App/SB 进程)调用; slot=色档, color=标准纯色(检测端自带);
+// timestamp 最后写(seqlock 发布点)
++ (void)vcamPickPublishSlot:(int)slot color:(uint32_t)color count:(int)cnt avg:(uint32_t)avg {
     VCamPickShm *shm = vcamPickShmMap();
     if (!shm) return;
     __sync_synchronize();
     shm->slot = (uint32_t)MAX(0, MIN(6, slot));
+    shm->color = color;
     shm->count = (uint32_t)cnt;
     shm->avg = avg;
     shm->pid = (uint32_t)getpid();
@@ -1114,32 +1117,30 @@ static VCamPickShm *vcamPickShmMap(void) {
     shm->ts = CFAbsoluteTimeGetCurrent();  // 8B 对齐原子写 = 发布点
 }
 
-// 读端: md 光轮询调用; 返回 YES = 总线新鲜(≤1s 有活跃采样), outSlot 色档;
-// NO = 无采样 → 调用方 fallback plist。色值映射由 md 端 T 表完成。
-+ (BOOL)vcamPickSharedSlot:(int *)outSlot count:(int *)outCount {
-    if (outSlot) *outSlot = 0;
+// 读端: md 光轮询调用; 返回 YES = 总线新鲜(≤1s 有活跃采样), outColor 直接
+// 是可打光的标准色(检测端已给, md 无需映射); NO = 无采样 → fallback plist。
++ (BOOL)vcamPickSharedColor:(uint32_t *)outColor count:(int *)outCount {
+    if (outColor) *outColor = 0;
     if (outCount) *outCount = 0;
     VCamPickShm *shm = vcamPickShmMap();
     if (!shm || shm->magic != 0x56435031u) return NO;
     double t1 = shm->ts;
-    uint32_t slot = shm->slot;
+    uint32_t color = shm->color;
     uint32_t cnt = shm->count;
     double t2 = shm->ts;
     if (t1 != t2 || t1 <= 0) return NO;                    // 写撕裂
     if (CFAbsoluteTimeGetCurrent() - t1 > 1.0) return NO;  // 不新鲜
-    if (outSlot) *outSlot = (int)MIN(6u, slot);
+    if (outColor) *outColor = color;
     if (outCount) *outCount = (int)cnt;
     return YES;
 }
 
 // ===== 共享颜色匹配(算法从 VCamFloatingBall 移入, 供 SB/App 两侧共用) =====
 // HSV 色相分档(1.3.46): [330,30)红 [30,90)黄 [90,150)绿 [150,210)青
-// [210,270)蓝 [270,330)紫; V/S 门限与计票阈值取许可 T 表 idx7/idx8,
-// 色值取 idx1-6 —— 未激活/跳过验签 = 色值恒 0(熄灭语义)。
-// outBestIdx: 命中色档(0-5); outAvg: 采样均值诊断。
-// 1.3.65 沙盒降级: T 表不可得(App 沙盒拒读 plist/验签链路不通)时
-// 门限退内置保守值(60/30, 仅分档判断用) —— 色值仍返回 0(色档经
-// Darwin 通知上行, SB 端用真 T 表映射色值), 光色正确性不降级。
+// [210,270)蓝 [270,330)紫; V/S 门限 60 / 计票阈值 30(441 像素口径)。
+// 1.3.69 回退原版逻辑(用户指令): 色表/门限全部内置常量, 检测命中直接
+// 返回标准纯色 —— 不再经密钥 T 表中转(SB 端 T 表解密失败导致光永远
+// 不亮的教训)。密钥体系只保留激活门禁(licGate 双变量), 不参与打光参数。
 + (uint32_t)vcamMatchKnownLightShared:(const uint8_t *)rgba
                                     n:(int)n
                             outBestIdx:(int *)outBestIdx
@@ -1149,23 +1150,11 @@ static VCamPickShm *vcamPickShmMap(void) {
     if (outCount) *outCount = 0;
     if (outAvg) *outAvg = 0;
     if (!rgba || n <= 0) return 0;
-    // T 表快照(18 u32; nil → 门限退内置, 色值 0)
-    uint32_t t[18];
-    memset(t, 0, sizeof(t));
-    BOOL tOK = NO;
-    NSData *td = [self vcamLicenseTable];
-    if (td && td.length == 72) {
-        tOK = YES;
-        const uint8_t *b = (const uint8_t *)td.bytes;
-        for (int i = 0; i < 18; i++) {
-            t[i] = ((uint32_t)b[i * 4] << 24) | ((uint32_t)b[i * 4 + 1] << 16) |
-                   ((uint32_t)b[i * 4 + 2] << 8) | (uint32_t)b[i * 4 + 3];
-        }
-    }
-    int hsvGate = tOK ? (int)t[7] : 60;
-    int voteGate = tOK ? (int)t[8] : 30;
-    if (hsvGate < 0) hsvGate = 0;
-    if (voteGate < 0) voteGate = 0;
+    static const uint32_t kKnown[6] = {
+        0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0x00FFFF, 0xFF00FF
+    };
+    const int hsvGate = 60;
+    const int voteGate = 30;
     int counts[6] = {0};
     long sr = 0, sg = 0, sb = 0;
     for (int i = 0; i < n; i++) {
@@ -1194,10 +1183,10 @@ static VCamPickShm *vcamPickShmMap(void) {
         if (counts[k] > bestC) { bestC = counts[k]; bestK = k; }
     }
     BOOL matched = (bestK >= 0 && bestC >= voteGate);
-    if (outBestIdx) *outBestIdx = matched ? bestK : -1;  // 仅命中时有效(slot 语义)
+    if (outBestIdx) *outBestIdx = matched ? bestK : -1;
     if (outCount) *outCount = bestC;
     if (matched) {
-        return t[bestK + 1];  // 标准纯色(T 表 idx1-6; T 无来源=0, 档位仍上行)
+        return kKnown[bestK];  // 标准纯色(内置, 原版行为)
     }
     return 0;
 }
@@ -1240,11 +1229,14 @@ static NSString *vcamPickCfgName(BOOL on) {
 }
 
 // SB 端中继(Tweak.m initializeInSpringBoard 调用): 注册 7 名 → 收到 →
-// 写 mmap 总线 slot(色值映射在 md 端做 —— SB 的 T 表解密失败实锤,
-// 不能在 SB 查色值)。App post 频率 = 色档变化频率。
+// 写 mmap 总线(色值由内置表映射, 原版逻辑, 不经 T 表)。App 每拍 post。
 + (void)vcamStartPickRelay {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
+        static const uint32_t kKnown[7] = {
+            0x000000,  // slot 0: 熄灭
+            0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0x00FFFF, 0xFF00FF
+        };
         for (int slot = 0; slot <= 6; slot++) {
             int token = -1;
             int capturedSlot = slot;
@@ -1252,7 +1244,8 @@ static NSString *vcamPickCfgName(BOOL on) {
                 dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
                 ^(int t) {
                     (void)t;
-                    [VCamNotify vcamPickPublishSlot:capturedSlot count:0 avg:0];
+                    [VCamNotify vcamPickPublishSlot:capturedSlot
+                        color:kKnown[capturedSlot] count:0 avg:0];
                 });
         }
         vcam_notify_log(@"[vcam][light] pick relay armed (7 slots, Darwin notify)");
@@ -1263,14 +1256,12 @@ static NSString *vcamPickCfgName(BOOL on) {
 // UICSI 函数指针(App 进程 UIKit 已加载, dlsym 直接命中)
 typedef CGImageRef (*VcamUICreateScreenImageFn)(void);
 
-// 进程内 UICSI 采样一拍: 截屏 → 全屏网格采样 → 分档匹配 → 写总线。
-// 1.3.68: 坐标通道全断(notify_set_state per-token 实锤 px=0, mmap 沙盒拒)
-// → 改全屏最强已知色扫描, 无坐标依赖。语义: App 内任何位置颜色跳动都打光
-// (对齐"无论在哪个 App 检测到颜色跳动就打光"); 取色点保留为视觉指示。
-// 阈值按比例: ≥12% 采样点同档才命中(防零散鲜艳 UI 元素误触发);
-// 满屏纯色图 ≈ 60%+ 命中。HSV 分档与共享算法同口径(60° 档, V/S 门限 60)。
+// 进程内 UICSI 采样一拍: 截屏 → 全屏网格采样 → 分档匹配 → 色值直写总线。
+// 1.3.69 原版逻辑回退: 命中档位直接映射内置标准纯色(不经 T 表) —— SB 端
+// T 表解密失败的教训, 检测端自带完整色表, 光色在源头就正确。
+// 1.3.68 遗产: 全屏最强色扫描(无坐标依赖), ≥12% 采样点同档才命中。
 + (int)vcamAppSampleSlotAtX:(double)px Y:(double)py {
-    (void)px; (void)py;  // 1.3.68: 坐标不再使用(全屏扫描)
+    (void)px; (void)py;  // 全屏扫描, 坐标不再使用
     VcamUICreateScreenImageFn capFn =
         (VcamUICreateScreenImageFn)dlsym(RTLD_DEFAULT, "UICreateScreenImage");
     if (!capFn) return 0;
@@ -1283,6 +1274,9 @@ typedef CGImageRef (*VcamUICreateScreenImageFn)(void);
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     CGContextRef bctx = CGBitmapContextCreate(NULL, GW, GH, 8, GW * 4, cs,
                                               kCGBitmapByteOrder32Big | kCGImageAlphaPremultipliedLast);
+    static const uint32_t kKnown[6] = {
+        0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0x00FFFF, 0xFF00FF
+    };
     int bestIdx = -1;
     int bestCnt = 0;
     if (bctx) {
@@ -1290,14 +1284,14 @@ typedef CGImageRef (*VcamUICreateScreenImageFn)(void);
         CGContextDrawImage(bctx, CGRectMake(0, 0, GW, GH), full);
         const uint8_t *rgba = (const uint8_t *)CGBitmapContextGetData(bctx);
         if (rgba) {
-            // HSV 分档计票(与 vcamMatchKnownLightShared 同口径, 阈值独立)
+            // HSV 分档计票(60° 档, V/S 门限 60, 与共享算法同口径)
             const int n = GW * GH;
             int counts[6] = {0};
             for (int i = 0; i < n; i++) {
                 int r = rgba[i * 4], g = rgba[i * 4 + 1], b = rgba[i * 4 + 2];
                 int maxc = MAX(MAX(r, g), b), minc = MIN(MIN(r, g), b);
                 int delta = maxc - minc;
-                if (maxc < 60 || delta < 60) continue;  // V/S 门限
+                if (maxc < 60 || delta < 60) continue;
                 double h;
                 if (maxc == r)      h = 60.0 * (double)(g - b) / (double)delta;
                 else if (maxc == g) h = 60.0 * (2.0 + (double)(b - r) / (double)delta);
@@ -1322,12 +1316,13 @@ typedef CGImageRef (*VcamUICreateScreenImageFn)(void);
     }
     CGColorSpaceRelease(cs);
     CFRelease(full);
+    // 1.3.69: 色档 + 内置色值一起上总线 —— 检测源头直接给正确色, md 端
+    // 无需任何映射。slot 编号同时写(诊断/日志用)。
+    uint32_t color = (bestIdx >= 0 && bestIdx < 6) ? kKnown[bestIdx] : 0;
     int slot = (bestIdx >= 0 && bestIdx < 6) ? bestIdx + 1 : 0;
-    // 通道A: mmap 直写(每拍, 时间戳保活; App 沙盒拒 mmap 时静默失败)
-    [self vcamPickPublishSlot:slot count:bestCnt avg:0];
+    [self vcamPickPublishSlot:slot color:color count:bestCnt avg:0];
     // 通道B: Darwin slot 通知 —— 每拍 post(25Hz 心跳): relay 每次收到都写
-    // 总线刷新时间戳, 颜色稳定也能保活新鲜度(1s 窗口); 只变化时 post 会让
-    // 稳定色 1s 后"过期"→ md fallback 熄灭(1.3.68 修复)
+    // 总线刷新时间戳, 颜色稳定也能保活新鲜度(1s 窗口)
     [self vcamNotifyPickSlot:slot];
     return slot;
 }
