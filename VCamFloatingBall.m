@@ -342,6 +342,10 @@ static void *vcamPickCaptureMain(void *ctx) {
                             cxPx = MAX(10, MIN((int)sw - 11, cxPx));
                             cyPx = MAX(10, MIN((int)sh - 11, cyPx));
                             int candY[2] = { cyPx - 10, (int)sh - cyPx - 11 };
+                            // 1.3.63: 颜色表从许可 T 表取(idx1-6), 用于
+                            // 检测结果 → 名称索引映射(打光预览显示)
+                            uint32_t tKnown[18];
+                            vcamFillT(tKnown);
                             int bestCnt = 0;
                             uint32_t bestColor = 0;
                             int bestIdx = -1;
@@ -369,7 +373,7 @@ static void *vcamPickCaptureMain(void *ctx) {
                                 if (cc != 0 && c2 > bestCnt) {
                                     bestCnt = c2; bestColor = cc;
                                     for (int k = 0; k < 6; k++) {  // 1.3.46: <7 越界修复(数组 6 元素)
-                                        if (vcamKnownLights[k] == cc) { bestIdx = k; break; }
+                                        if (tKnown[k + 1] == cc) { bestIdx = k; break; }
                                     }
                                 }
                             }
