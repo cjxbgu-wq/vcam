@@ -103,4 +103,18 @@ typedef void(^VCamNotifyCallback)(NSString *name);
 + (int)plistLightFeather;
 + (void)setPlistLightFeather:(int)v;
 
+#pragma mark - 密钥验证(1.3.54, 绑定设备 / 激活后永久)
+// 设备码: 硬件 UDID(MobileGestalt, dlsym 运行时解析; SB 与 mediaserverd 均
+// root 可读, 两进程算出一致值)SHA256 派生 16 位大写 hex —— 返回 raw 无横线,
+// 展示时由 UI 格式化 4-4-4-4。UDID 拿不到时回退 vc.plist 持久 UUID(两进程
+// 同读同值, 首次缺省时生成)。
+// 期望密钥: 设备码再派生 16 位 hex(算法盐在混淆字符串层)。
+// 激活: 输入密钥规范化(去横线/空格+大写)与期望比对, 通过写 vc.plist
+// licenseKey/activated —— 每次验证都重算比对, 单独伪造 activated 无效。
+// 密钥绑定设备: 换设备 UDID 变 → 设备码变 → 密钥失效。无月/年逻辑。
++ (NSString *)vcamDeviceCode;                     // 16 hex 大写(设备码 raw)
++ (NSString *)vcamLicenseExpected;                // 16 hex 大写(期望密钥 raw)
++ (BOOL)vcamLicenseValid;                         // 当前设备是否已激活(重算校验)
++ (BOOL)vcamActivateLicense:(NSString *)input;    // 激活(成功写 plist)
+
 @end
