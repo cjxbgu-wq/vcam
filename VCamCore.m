@@ -222,17 +222,16 @@ static BOOL vcamSelfIntegrityOK(void) {
 }
 
 // ===== __TEXT 哈希自校验(1.3.70 防破解加强) =====
-// 原理: 构建期 inject_text_sig.py 对 dylib 每个 slice 的 __TEXT 段跳过
-// 40 字节"签名洞"(vcamTextSig: 8B 魔数 + 32B 哈希)计算 SHA256 写入洞内;
-// 本函数运行时用完全相同口径重算(洞相对偏移 = &vcamTextSig - 本镜像
-// header, __TEXT fileoff=0 且段连续映射, 相对偏移即文件偏移)。任何对
-// __TEXT 的字节修改(改跳转/NOP 门禁/patch 常量)→ 哈希失配 → licMark
-// 关门禁。绕过路径只剩"同时改洞内哈希"—— 需先逆向整个校验链, 且 md/SB
-// 两进程独立计算, 单侧 patch 无效。
-// SHA256 走 CommonCrypto 流式 API(dlsym + dladdr 验来源镜像, 与设备码
-// 同款可信解析策略: 只信任 /usr/lib 与 /System 前缀镜像导出的符号)。
-// 开销: ~1.5MB __TEXT 的两段 Update ≈ 5ms, 30s 节流一次, 结果缓存。
-// 洞内哈希为全 0(本地未注入构建)→ 跳过校验(开发语义), 不误伤。
+// 原理: 构建期 inject_text_sig.py 对 dylib 每个 slice 的 __TEXT 段【全段】
+// 计算 SHA256, 写入 __DATA,__vcsig 段的"签名洞"(vcamTextSig: 8B 魔数 +
+// 32B 哈希; 洞不在 __TEXT → 无自引用, 哈希 100% 覆盖代码字节)。本函数
+// 运行时同口径重算: 任何对 __TEXT 的字节修改(改跳转/NOP 门禁/patch 常量)
+// → 哈希失配 → licMark 关门禁 → 替换/打光静默失效。
+// 洞在 __DATA(运行时只读映射), 篡改需 vm_protect 绕过; 且 md/SB 两侧
+// 独立计算, 单侧 patch 无效。
+// SHA256 走 CommonCrypto 流式 API(dlopen 显式加载 + dlsym)。
+// 开销: ~0.4MB __TEXT ≈ 2ms, 30s 节流一次, 结果缓存。
+// 洞内哈希全 0(本地未注入构建)→ 跳过校验(开发语义), 不误伤。
 static BOOL vcamSelfTextOK(void) {
     static BOOL cached = NO;
     static BOOL hasCache = NO;
@@ -259,7 +258,7 @@ static BOOL vcamSelfTextOK(void) {
         return cached;
     }
 
-    // 可信解析 CommonCrypto 流式 API
+    // CommonCrypto 流式 API(显式加载)
     typedef int (*Sha256InitFn)(void *);
     typedef int (*Sha256UpdateFn)(void *, const void *, size_t);
     typedef int (*Sha256FinalFn)(void *, unsigned char *);
@@ -293,7 +292,8 @@ static BOOL vcamSelfTextOK(void) {
         if (lc->cmd == LC_SEGMENT_64) {
             struct segment_command_64 *seg = (struct segment_command_64 *)p;
             if (strncmp(seg->segname, "__TEXT", 6) == 0) {
-                // 洞在 __TEXT 内且 fileoff=0 → 文件长度 = min(filesize, vmsize)
+                // __TEXT fileoff=0 → 文件长度 = min(filesize, vmsize)
+                // (与 inject_text_sig.py 口径严格一致)
                 textLen = (size_t)(seg->filesize < seg->vmsize ? seg->filesize : seg->vmsize);
                 break;
             }
@@ -301,19 +301,21 @@ static BOOL vcamSelfTextOK(void) {
         p += lc->cmdsize;
     }
     if (textLen == 0) return NO;
-
-    // 洞偏移(相对 header; __TEXT fileoff=0 段连续, 与构建脚本口径一致)
+    // 洞必须在 __TEXT 之外(__DATA,__vcsig) —— 口径漂移防护
     const uint8_t *base = (const uint8_t *)hdr;
     size_t holeOff = (size_t)((const uint8_t *)vcamTextSig - base);
-    if (holeOff < 64 || holeOff + 40 > textLen) return NO;  // 洞不在 __TEXT 内 = 异常
+    if (holeOff < textLen) {
+        vcam_core_log([NSString stringWithFormat:
+            @"[vcam] text sig: hole unexpectedly inside __TEXT (off=%zu len=%zu), fail-closed",
+            holeOff, textLen]);
+        return NO;
+    }
 
-    // 流式 SHA256: 洞前段 + 洞后段(跳过 40B 洞 —— 与 inject 口径严格一致)
+    // __TEXT 全段流式 SHA256
     uint8_t digest[32];
     _Alignas(16) unsigned char ctxBuf[128];  // CC_SHA256_CTX(arm64 ~104B, 给足)
     if (shaInit(ctxBuf) != 1) return NO;
-    if (holeOff > 0 && shaUpdate(ctxBuf, base, holeOff) != 1) return NO;
-    size_t tailLen = textLen - holeOff - 40;
-    if (tailLen > 0 && shaUpdate(ctxBuf, base + holeOff + 40, tailLen) != 1) return NO;
+    if (shaUpdate(ctxBuf, base, textLen) != 1) return NO;
     if (shaFinal(digest, ctxBuf) != 1) return NO;
 
     cached = (memcmp(digest, expect, 32) == 0);
