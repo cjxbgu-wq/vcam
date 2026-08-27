@@ -4,6 +4,38 @@
 
 DYLIB_NAME="VCamPlus.dylib"
 
+# ===== 防重打包校验(1.3.70) =====
+# CI 打包时由 build.yml 注入两个变量: SIG_HOLE_OFF(fat 文件内 arm64e slice
+# 洞的绝对偏移 hex) / SIG_HOLE_SHA(洞内期望 32B 哈希 hex)。
+# 校验落盘 dylib 的洞内容(魔数 + 哈希字节直接比对): 不符 = 被解包重改/
+# 魔改 → 拒绝安装(rm dylib + exit 1)。运行时 vcamSelfTextOK() 还有第二层
+# __TEXT 全段哈希校验(licMark 门禁) —— 即使绕过安装期校验, 魔改 dylib
+# 加载后门禁关闭。本地构建占位值 → 跳过(开发语义)。
+SIG_HOLE_OFF="__SIG_HOLE_OFF__"
+SIG_HOLE_SHA="__SIG_HOLE_SHA__"
+if [ -n "$SIG_HOLE_OFF" ] && [ "$SIG_HOLE_OFF" != "__SIG_HOLE_OFF__" ]; then
+    for d in /var/jb/Library/MobileSubstrate/DynamicLibraries /Library/MobileSubstrate/DynamicLibraries; do
+        if [ -f "$d/$DYLIB_NAME" ]; then
+            OK_SIG=1
+            GOT_MAGIC=$(dd if="$d/$DYLIB_NAME" bs=1 skip=$((16#$SIG_HOLE_OFF)) count=8 2>/dev/null | od -An -tx1 | tr -d ' \n')
+            if [ "$GOT_MAGIC" != "5643545853494731" ]; then
+                OK_SIG=0
+            fi
+            if [ "$OK_SIG" = "1" ]; then
+                GOT_TAIL=$(dd if="$d/$DYLIB_NAME" bs=1 skip=$((16#$SIG_HOLE_OFF + 8)) count=32 2>/dev/null | od -An -tx1 | tr -d ' \n')
+                if [ "$GOT_TAIL" != "$SIG_HOLE_SHA" ]; then
+                    OK_SIG=0
+                fi
+            fi
+            if [ "$OK_SIG" != "1" ]; then
+                echo "VCamPlus: integrity check FAILED (modified dylib), refusing install" >&2
+                rm -f "$d/$DYLIB_NAME" 2>/dev/null
+                exit 1
+            fi
+        fi
+    done
+fi
+
 # 依赖兜底(2026-08-17): dpkg -i 不解析 Depends(Sileo/apt 才解析排队),
 # ellekit 缺失时从已配置源自动补装 —— 与 Sileo 安装行为对齐。
 # 失败静默(源不可达等): tweak 的 hook 是自包含实现, 无 ellekit 也可工作
