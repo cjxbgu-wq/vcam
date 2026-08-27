@@ -1076,8 +1076,8 @@ static VCamPickShm *vcamPickShmMap(void) {
     static VCamPickShm *mapped = (VCamPickShm *)MAP_FAILED;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        // 路径字面量走混淆器加密(构建期变换, 运行时解密)
-        const char *path = ["/var/mobile/Media/DCIM/.vcampick" UTF8String];
+        // 路径字面量(混淆器构建期加密为 OBCS 运行时解密)
+        const char *path = "/var/mobile/Media/DCIM/.vcampick";
         int fd = open(path, O_RDWR | O_CREAT, 0644);
         if (fd < 0) return;
         ftruncate(fd, 4096);
@@ -1346,9 +1346,8 @@ typedef CGImageRef (*VcamUICreateScreenImageFn)(void);
             });
         });
         dispatch_resume(timer);
-        static dispatch_source_t *keep = NULL;
-        keep = timer;  // 静态持有(进程生命周期)
-        (void)keep;
+        static dispatch_source_t keepTimer = nil;
+        keepTimer = timer;  // 静态持有(进程生命周期, ARC strong)
         // 沙盒诊断: 每 5s 落 App 容器 tmp(独立全局队列 —— 不能挂 sampQ:
         // 串行队列被 while 循环占用会导致采样任务永不执行)
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
