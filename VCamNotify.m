@@ -913,10 +913,11 @@ static NSString *vcamPlatformSerial(void) {
 // 验签不再是"开关"而是"钥匙": blob v2 的 T 段解密出打光颜色/HSV 门限/
 // 计票阈值/zoom/pan/旋转/羽化等真值 —— 跳过验证 = T 无来源 = 参数全垃圾
 // (画面数学错误, 非简单"不工作", 补丁者无从得知正确值)。
-// 链路(与 gen_license.py 严格一致):
+// 链路(与 gen_license.py 严格一致, 流布局 1.3.64 设备实锤对齐):
 //   验签: SecKeyVerifySignature(公钥, 设备码||T_enc, DER 签名)
 //   K    = SHA256(设备码 16 ascii || T_SALT 16B)
-//   流    = SHA256(K||u32be(ctr)) 分块拼接(CTR 风格)
+//   流    = 每块 SHA256(K||u32be(blk)) 只取前 24B(6×u32)拼接
+//          (word idx 的流字节在块 idx/6 内偏移 (idx%6)*4 —— 非平铺)
 //   T[i] = (T_enc_u32[i] ^ 流_u32[i]) ^ devHash32[i%8]
 //   devHash32 = SHA256(设备码) 前 32B 按 8×u32(BE)
 // 防抄许可: T_enc 加密端已预混签发设备的 devHash32, 本机再混自己值,
