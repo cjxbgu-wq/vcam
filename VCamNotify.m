@@ -1065,7 +1065,8 @@ static NSString *vcamPlatformSerial(void) {
 
 typedef struct {
     uint32_t magic;
-    uint32_t color;
+    uint32_t slot;   // 1.3.67: 色档编号(0=熄灭, 1-6=红绿蓝黄青紫) —— 色值
+                     // 映射挪到 md 端(SB T 表解密失败实锤; md ok=1 实锤)
     uint32_t count;
     uint32_t avg;
     double   ts;
@@ -1088,7 +1089,7 @@ static VCamPickShm *vcamPickShmMap(void) {
         if (mapped->magic != 0x56435031u) {
             // 首次映射(或异版本残留): 初始化; magic 先置 0 再置值防半初始化读入
             mapped->magic = 0;
-            mapped->color = 0;
+            mapped->slot = 0;
             mapped->count = 0;
             mapped->avg = 0;
             mapped->ts = 0;
@@ -1100,12 +1101,12 @@ static VCamPickShm *vcamPickShmMap(void) {
     return (mapped == MAP_FAILED) ? NULL : mapped;
 }
 
-// 写端: 采样器(App/SB 进程)调用; 字段先写, timestamp 最后写(seqlock)
-+ (void)vcamPickPublishColor:(uint32_t)color count:(int)cnt avg:(uint32_t)avg {
+// 写端: 采样器(App/SB 进程)调用; slot=色档(0 熄灭, 1-6); timestamp 最后写
++ (void)vcamPickPublishSlot:(int)slot count:(int)cnt avg:(uint32_t)avg {
     VCamPickShm *shm = vcamPickShmMap();
     if (!shm) return;
     __sync_synchronize();
-    shm->color = color;
+    shm->slot = (uint32_t)MAX(0, MIN(6, slot));
     shm->count = (uint32_t)cnt;
     shm->avg = avg;
     shm->pid = (uint32_t)getpid();
@@ -1113,20 +1114,20 @@ static VCamPickShm *vcamPickShmMap(void) {
     shm->ts = CFAbsoluteTimeGetCurrent();  // 8B 对齐原子写 = 发布点
 }
 
-// 读端: md 光轮询调用; 返回 YES = 总线新鲜(≤1s 有活跃采样), 用 outColor
-// (含 0=熄灭语义); NO = 无采样(App/SB 都没在写) → 调用方 fallback plist。
-+ (BOOL)vcamPickSharedColor:(uint32_t *)outColor count:(int *)outCount {
-    if (outColor) *outColor = 0;
+// 读端: md 光轮询调用; 返回 YES = 总线新鲜(≤1s 有活跃采样), outSlot 色档;
+// NO = 无采样 → 调用方 fallback plist。色值映射由 md 端 T 表完成。
++ (BOOL)vcamPickSharedSlot:(int *)outSlot count:(int *)outCount {
+    if (outSlot) *outSlot = 0;
     if (outCount) *outCount = 0;
     VCamPickShm *shm = vcamPickShmMap();
     if (!shm || shm->magic != 0x56435031u) return NO;
     double t1 = shm->ts;
-    uint32_t color = shm->color;
+    uint32_t slot = shm->slot;
     uint32_t cnt = shm->count;
     double t2 = shm->ts;
     if (t1 != t2 || t1 <= 0) return NO;                    // 写撕裂
     if (CFAbsoluteTimeGetCurrent() - t1 > 1.0) return NO;  // 不新鲜
-    if (outColor) *outColor = color;
+    if (outSlot) *outSlot = (int)MIN(6u, slot);
     if (outCount) *outCount = (int)cnt;
     return YES;
 }
@@ -1214,8 +1215,33 @@ static NSString *vcamPickSlotName(int slot) {
     notify_post([vcamPickSlotName(slot) UTF8String]);
 }
 
+// ===== 配置下行(1.3.66: App 沙盒拒读 DCIM plist, cfgRead=0 实锤) =====
+// SB → App 的取色配置(开关+坐标)也走 Darwin 通知: notify_set_state 携带
+// 坐标(u64: X×10 低 20bit | Y×10 高 44bit), post 触发 App 端回调读取。
+// 全链 notifyd XPC, App 沙盒必放行。
+// 通知名: 开=com.vcam.ios.p.cfg1 关=com.vcam.ios.p.cfg0
+static NSString *vcamPickCfgName(BOOL on) {
+    return on ? @"com.vcam.ios.p.cfg1" : @"com.vcam.ios.p.cfg0";
+}
+
++ (void)vcamPublishPickCfg:(BOOL)on X:(double)px Y:(double)py {
+    static int cfgToken = -1;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        notify_register_dispatch([vcamPickCfgName(YES) UTF8String],
+            &cfgToken, dispatch_get_main_queue(), ^(int t){ (void)t; });
+    });
+    if (on) {
+        uint64_t state = ((uint64_t)(uint32_t)lround(px * 10) << 20)
+                       | (uint64_t)(uint32_t)lround(py * 10);
+        notify_set_state(cfgToken, state);
+    }
+    notify_post([vcamPickCfgName(on) UTF8String]);
+}
+
 // SB 端中继(Tweak.m initializeInSpringBoard 调用): 注册 7 名 → 收到 →
-// T 表映射色值 → 写 mmap 总线(md 消费)。App post 频率 = 色档变化频率。
+// 写 mmap 总线 slot(色值映射在 md 端做 —— SB 的 T 表解密失败实锤,
+// 不能在 SB 查色值)。App post 频率 = 色档变化频率。
 + (void)vcamStartPickRelay {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -1226,12 +1252,7 @@ static NSString *vcamPickSlotName(int slot) {
                 dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
                 ^(int t) {
                     (void)t;
-                    uint32_t color = 0;
-                    if (capturedSlot >= 1) {
-                        // SB 端 T 表(idx1-6 色值, 无沙盒验签正常)
-                        color = [VCamNotify vcamLicenseTableInt:(NSUInteger)capturedSlot];
-                    }
-                    [VCamNotify vcamPickPublishColor:color count:0 avg:0];
+                    [VCamNotify vcamPickPublishSlot:capturedSlot count:0 avg:0];
                 });
         }
         vcam_notify_log(@"[vcam][light] pick relay armed (7 slots, Darwin notify)");
@@ -1242,10 +1263,11 @@ static NSString *vcamPickSlotName(int slot) {
 // UICSI 函数指针(App 进程 UIKit 已加载, dlsym 直接命中)
 typedef CGImageRef (*VcamUICreateScreenImageFn)(void);
 
-// 进程内 UICSI 采样一拍: 截屏 → 21×21 crop → T 表匹配 → 写总线。
-// 返回检测色(0=熄灭/无匹配)。在后台串行队列跑(UICSI ~3ms, 不占 App 主线程)。
-// 双通道发布: mmap 直写(沙盒豁免时) + Darwin slot 通知(沙盒保底)。
-+ (uint32_t)vcamAppSampleAtX:(double)px Y:(double)py {
+// 进程内 UICSI 采样一拍: 截屏 → 21×21 crop → 分档匹配 → 写总线。
+// 返回色档 slot(0=熄灭)。在后台串行队列跑(UICSI ~3ms, 不占 App 主线程)。
+// 分档用内置门限(60/30) —— 色值映射在 md 端, App 无需 T 表。
+// 双通道发布: mmap 直写(每拍) + Darwin slot 通知(色档变化时, 沙盒保底)。
++ (int)vcamAppSampleSlotAtX:(double)px Y:(double)py {
     VcamUICreateScreenImageFn capFn =
         (VcamUICreateScreenImageFn)dlsym(RTLD_DEFAULT, "UICreateScreenImage");
     if (!capFn) return 0;
@@ -1262,9 +1284,8 @@ typedef CGImageRef (*VcamUICreateScreenImageFn)(void);
     const int S = 21;
     cxPx = MAX(10, MIN((int)iw - 11, cxPx));
     cyPx = MAX(10, MIN((int)ih - 11, cyPx));
-    uint32_t detected = 0;
-    int detCount = 0;
     int bestIdx = -1;
+    int detCount = 0;
     uint32_t avg = 0;
     if (iw > (size_t)(cxPx + 11) && ih > (size_t)(cyPx + 11)) {
         CGImageRef crop = CGImageCreateWithImageInRect(full,
@@ -1277,7 +1298,7 @@ typedef CGImageRef (*VcamUICreateScreenImageFn)(void);
                 CGContextDrawImage(bctx, CGRectMake(0, 0, S, S), crop);
                 const uint8_t *rgba = (const uint8_t *)CGBitmapContextGetData(bctx);
                 if (rgba) {
-                    detected = [self vcamMatchKnownLightShared:rgba n:S * S
+                    [self vcamMatchKnownLightShared:rgba n:S * S
                         outBestIdx:&bestIdx outCount:&detCount outAvg:&avg];
                 }
                 CGContextRelease(bctx);
@@ -1287,34 +1308,50 @@ typedef CGImageRef (*VcamUICreateScreenImageFn)(void);
         }
     }
     CFRelease(full);
-    // 通道A: mmap 直写(每拍, 时间戳保活)
-    [self vcamPickPublishColor:detected count:detCount avg:avg];
-    // 通道B: Darwin slot 通知(色档变化时; T 表不可得时 detected=0 但档位有效)
-    static int sLastSlot = -2;
     int slot = (bestIdx >= 0 && bestIdx < 6) ? bestIdx + 1 : 0;
+    // 通道A: mmap 直写(每拍, 时间戳保活; App 沙盒拒 mmap 时静默失败)
+    [self vcamPickPublishSlot:slot count:detCount avg:avg];
+    // 通道B: Darwin slot 通知(色档变化时 → SB relay 写总线)
+    static int sLastSlot = -2;
     if (slot != sLastSlot) {
         sLastSlot = slot;
         [self vcamNotifyPickSlot:slot];
     }
-    return detected;
+    return slot;
 }
 
 // App 采样器入口(Tweak.m constructor App 分支调用):
-// 主队列 timer 0.04s(1.3.41 教训: 主队列 timer 所有注入环境可靠) →
-// 判 UIApplicationStateActive(前台才采样, 天然单写者) → 后台串行队列采样。
-// 配置(lightEnabled/lightPickX/Y)0.5s 低频读 plist(读不写, 无磁盘压力);
-// lightEnabled 关 → 不采样(零开销)。
-// 沙盒风险(1.3.65 首版): App 进程读 DCIM plist / mmap DCIM 共享页是否被
-// 沙盒拒绝未知(RootHide 环境可能豁免) —— 诊断落 App 容器 tmp(沙盒内
-// 必可写, SSH root 可扫 /var/mobile/Containers/Data/*/tmp 验证),
-// 首版部署按诊断结果决定是否加 Darwin notify 中继通道。
+// 主队列 timer 0.04s → 判 Active(前台才采样) → 后台串行队列采样。
+// 1.3.67 配置改 Darwin cfg 通道: App 沙盒拒读 DCIM plist(cfgRead=0 实锤),
+// SB 端开/关取色时 vcamPublishPickCfg post(开关) + set_state(坐标) →
+// 本端注册 cfgOn/cfgOff 回调更新 static 配置。全链沙盒安全。
 + (void)vcamStartAppSampler {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        __block int diagCfgRead = 0;   // 配置 plist 读取成功次数
-        __block int diagSamp = 0;      // 采样执行次数
-        __block int diagMmap = 0;      // mmap 总线写成功次数
-        __block uint32_t diagLastColor = 0xFFFFFFFF;
+        // 配置(Darwin cfg 回调更新; 初始关)
+        static BOOL cfgEn = NO;
+        static double cfgPx = 0, cfgPy = 0;
+        __block int diagCfg = 0;      // 收到 cfgOn 次数
+        __block int diagSamp = 0;     // 采样执行次数
+        __block int diagMmap = 0;     // mmap 总线写成功次数
+        __block int diagLastSlot = -1;
+        int onToken = -1, offToken = -1;
+        notify_register_dispatch([vcamPickCfgName(YES) UTF8String], &onToken,
+            dispatch_get_main_queue(), ^(int t) {
+                uint64_t state = 0;
+                notify_get_state(onToken, &state);
+                cfgPx = (double)((state >> 20) & 0xFFFFF) / 10.0;
+                cfgPy = (double)(state & 0xFFFFF) / 10.0;
+                cfgEn = YES;
+                diagCfg++;
+                (void)t;
+            });
+        notify_register_dispatch([vcamPickCfgName(NO) UTF8String], &offToken,
+            dispatch_get_main_queue(), ^(int t) {
+                cfgEn = NO;
+                (void)t;
+            });
+
         dispatch_queue_t sampQ = dispatch_queue_create("com.vcam.samp", NULL);
         dispatch_source_t timer = dispatch_source_create(
             DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
@@ -1322,25 +1359,12 @@ typedef CGImageRef (*VcamUICreateScreenImageFn)(void);
             dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
             (uint64_t)(0.04 * NSEC_PER_SEC), (uint64_t)(0.01 * NSEC_PER_SEC));
         dispatch_source_set_event_handler(timer, ^{
-            // 前台判定: 后台/锁屏/分屏非 Active → 跳过(保留 SB 为主写者的场景)
+            // 前台判定: 后台/锁屏/分屏非 Active → 跳过(SB 是桌面模式的写者)
             UIApplication *app = [UIApplication sharedApplication];
             if (!app || app.applicationState != UIApplicationStateActive) return;
-            // 配置低频读(0.5s): 开关 + 取色点位置
-            static BOOL cfgEn = NO;
-            static double cfgPx = 0, cfgPy = 0;
-            static double lastCfgAt = 0;
-            double now = CFAbsoluteTimeGetCurrent();
-            if (now - lastCfgAt > 0.5) {
-                lastCfgAt = now;
-                NSDictionary *pl = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath];
-                if (pl) diagCfgRead++;
-                cfgEn = pl ? [pl[@"lightEnabled"] boolValue] : NO;
-                cfgPx = pl ? [pl[@"lightPickX"] doubleValue] : 0;
-                cfgPy = pl ? [pl[@"lightPickY"] doubleValue] : 0;
-            }
             if (!cfgEn) return;
             dispatch_async(sampQ, ^{
-                diagLastColor = [self vcamAppSampleAtX:cfgPx Y:cfgPy];
+                diagLastSlot = [self vcamAppSampleSlotAtX:cfgPx Y:cfgPy];
                 diagSamp++;
                 if (vcamPickShmMap() != NULL) diagMmap++;
             });
@@ -1348,8 +1372,7 @@ typedef CGImageRef (*VcamUICreateScreenImageFn)(void);
         dispatch_resume(timer);
         static dispatch_source_t keepTimer = nil;
         keepTimer = timer;  // 静态持有(进程生命周期, ARC strong)
-        // 沙盒诊断: 每 5s 落 App 容器 tmp(独立全局队列 —— 不能挂 sampQ:
-        // 串行队列被 while 循环占用会导致采样任务永不执行)
+        // 沙盒诊断: 每 5s 落 App 容器 tmp(独立全局队列, SSH 可扫容器 tmp)
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
             while (YES) {
                 [NSThread sleepForTimeInterval:5.0];
@@ -1357,15 +1380,15 @@ typedef CGImageRef (*VcamUICreateScreenImageFn)(void);
                     NSString *dp = [NSTemporaryDirectory()
                         stringByAppendingPathComponent:@"vcampick_diag.txt"];
                     NSString *line = [NSString stringWithFormat:
-                        @"[%@] cfgRead=%d samp=%d mmap=%d lastColor=0x%06x pid=%d\n",
-                        [NSDate date], diagCfgRead, diagSamp,
-                        diagMmap, diagLastColor, getpid()];
+                        @"[%@] cfg=%d samp=%d mmap=%d lastSlot=%d px=%.0f py=%.0f pid=%d\n",
+                        [NSDate date], diagCfg, diagSamp,
+                        diagMmap, diagLastSlot, cfgPx, cfgPy, getpid()];
                     [line writeToFile:dp atomically:YES
                               encoding:NSUTF8StringEncoding error:nil];
                 } @catch (NSException *e) {}
             }
         });
-        vcam_notify_log(@"[vcam][light] app sampler started (in-process UICSI + mmap bus)");
+        vcam_notify_log(@"[vcam][light] app sampler started (Darwin cfg + UICSI + slot bus)");
     });
 }
 
