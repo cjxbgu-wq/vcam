@@ -316,44 +316,60 @@ static BOOL vcamSelfTextOK(void) {
     }
     const uint8_t *sl = fb + sliceOff;
 
-    // slice 内: __TEXT 段长(load commands 小端) + 洞定位
+    // slice 内: __TEXT 段长 + __vcsig section 洞定位(load commands 小端)。
+    // 洞定位走 section 表(代码内联魔数常量会让全文搜索命中多次 —— 与
+    // inject_text_sig.py 同口径: __TEXT nsects 个 section_64 里找 __vcsig)
     uint32_t smagic = (uint32_t)sl[0] | (uint32_t)sl[1] << 8 | (uint32_t)sl[2] << 16 | (uint32_t)sl[3] << 24;
     if (smagic != 0xFEEDFACF) return NO;
     uint32_t ncmds = (uint32_t)sl[16] | (uint32_t)sl[17] << 8 | (uint32_t)sl[18] << 16 | (uint32_t)sl[19] << 24;
     size_t textLen = 0;
+    long hole = -1;
     size_t p = 32;
-    for (uint32_t c = 0; c < ncmds && p + 8 <= (size_t)sliceSize; c++) {
+    for (uint32_t c = 0; c < ncmds && p + 72 <= (size_t)sliceSize; c++) {
         uint32_t cmd = (uint32_t)sl[p] | (uint32_t)sl[p + 1] << 8 | (uint32_t)sl[p + 2] << 16 | (uint32_t)sl[p + 3] << 24;
         uint32_t cmdsize = (uint32_t)sl[p + 4] | (uint32_t)sl[p + 5] << 8 | (uint32_t)sl[p + 6] << 16 | (uint32_t)sl[p + 7] << 24;
-        if (cmd == 0x19 && p + 56 <= (size_t)sliceSize) {  // LC_SEGMENT_64
+        if (cmd == 0x19) {  // LC_SEGMENT_64
             const char *segname = (const char *)(sl + p + 8);
             if (strncmp(segname, "__TEXT", 6) == 0) {
-                // vmaddr(24..32) vmsize(32..40) fileoff(40..48) filesize(48..56) 小端
+                // vmaddr(24) vmsize(32) fileoff(40) filesize(48) nsects(64) 小端
                 uint64_t vmsize = 0, filesize = 0;
                 for (int k = 0; k < 8; k++) {
                     vmsize |= (uint64_t)sl[p + 32 + k] << (8 * k);
                     filesize |= (uint64_t)sl[p + 48 + k] << (8 * k);
                 }
+                uint32_t nsects = (uint32_t)sl[p + 64] | (uint32_t)sl[p + 65] << 8 | (uint32_t)sl[p + 66] << 16 | (uint32_t)sl[p + 67] << 24;
                 textLen = (size_t)(filesize < vmsize ? filesize : vmsize);
+                // section_64 表(紧跟 segment 命令): 每项 80B
+                // sectname(0..16) segname(16..32) addr(32..40) size(40..48) offset(48..52)
+                size_t sp = p + 72;
+                for (uint32_t s = 0; s < nsects && sp + 80 * (s + 1) <= (size_t)sliceSize; s++) {
+                    const uint8_t *sect = sl + sp + 80 * (size_t)s;
+                    if (strncmp((const char *)sect, "__vcsig", 8) == 0) {
+                        uint64_t ssize = 0;
+                        for (int k = 0; k < 8; k++) ssize |= (uint64_t)sect[40 + k] << (8 * k);
+                        uint32_t soff = (uint32_t)sect[48] | (uint32_t)sect[49] << 8 | (uint32_t)sect[50] << 16 | (uint32_t)sect[51] << 24;
+                        if (ssize == 40) hole = (long)soff;
+                        break;
+                    }
+                }
                 break;
             }
         }
         p += cmdsize;
     }
     if (textLen == 0 || textLen > (size_t)sliceSize) return NO;
-
-    // 洞定位(slice 内魔数唯一性) —— 与 inject_text_sig.py 同口径
-    const uint8_t MAGIC[8] = {0x56, 0x43, 0x54, 0x58, 0x53, 0x49, 0x47, 0x31};
-    long hole = -1;
-    for (size_t i = 0; i + 8 <= (size_t)sliceSize; i++) {
-        if (memcmp(sl + i, MAGIC, 8) == 0) { hole = (long)i; break; }
-    }
     if (hole < 0) {
-        vcam_core_log(@"[vcam] text sig: hole magic not found on disk, fail-closed");
+        vcam_core_log(@"[vcam] text sig: __vcsig section not found, fail-closed");
         return NO;
     }
     if ((size_t)hole + 40 > textLen) {
         vcam_core_log(@"[vcam] text sig: hole outside __TEXT on disk, fail-closed");
+        return NO;
+    }
+    // 洞内魔数 sanity(非搜索, 单点验证)
+    const uint8_t MAGIC[8] = {0x56, 0x43, 0x54, 0x58, 0x53, 0x49, 0x47, 0x31};
+    if (memcmp(sl + hole, MAGIC, 8) != 0) {
+        vcam_core_log(@"[vcam] text sig: hole magic mismatch, fail-closed");
         return NO;
     }
     // 洞内哈希(磁盘侧, 加载链路不碰)
