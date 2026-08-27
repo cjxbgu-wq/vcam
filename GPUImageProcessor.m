@@ -1535,16 +1535,14 @@ static void vcamApplyLightBiPlanar(CVPixelBufferRef buf, uint32_t rgb,
     int minDim = (int)((fw < fh) ? fw : fh);
     int radius = (int)((int64_t)diameter * minDim / 200);
     if (radius < 2) return;
-    // 1.3.63 方案A: 羽化/强度映射系数从许可 T 表解密取(idx14 羽化分子,
-    // idx15 羽化分母, idx16 强度分子) —— 跳过验证 = 垃圾值 → 光斑形状/强度
-    // 错乱。防除零不修正行为(值仍错)。
-    int featherK = (int)[VCamNotify vcamLicenseTableInt:14];
-    int featherScale = (int)[VCamNotify vcamLicenseTableInt:15];
-    int intensityK = (int)[VCamNotify vcamLicenseTableInt:16];
-    if (featherScale <= 0) featherScale = 1;  // 防除零(垃圾参数语义保留)
-    if (intensityK < 0) intensityK = 0;
+    // 1.3.69 原版逻辑回退: 羽化/强度映射系数硬编码(原版校准值 —— 羽化
+    // 80/10000, 强度 192: intensity=100 等同旧版 75)。不再从 T 表取
+    // (T 表参与打光的实验失败, 密钥只保留激活门禁用途)。
+    const int featherK = 80;
+    const int featherScale = 10000;
+    const int intensityK = 192;
     int innerR = radius * (100 - feather) * featherK / featherScale;
-    if (innerR < 0) innerR = 0;   // 垃圾负值钳 0(羽化满半径, 画面错但不崩)
+    if (innerR < 0) innerR = 0;
     int maxAlpha256 = intensity * intensityK / 100;
 
     uint8_t r = (rgb >> 16) & 0xFF;
