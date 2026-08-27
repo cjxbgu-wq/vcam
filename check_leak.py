@@ -45,6 +45,8 @@ KEYWORDS = [
     'kSecAttr', 'kSecSignatureAlgorithm',
     'IOPlatformExpertDevice', 'IOServiceMatching',
     'IORegistryEntryCreateCFProperty', 'IOObjectRelease',
+    # 1.3.65 取色采样器: 共享页路径 + UICSI 符号名 + 取色点 plist 键必须密文
+    '.vcampick', 'UICreateScreenImage', 'lightPickX', 'lightPickY',
 ]
 
 
