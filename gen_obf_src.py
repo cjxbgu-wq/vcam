@@ -445,6 +445,12 @@ IDENT_RENAMES = {
     'vcamPublishDeviceCode': 'qvPd',            # 类方法: SB 侧发布 dcPub
     'vcamCrossDeviceCodeOK': 'qvCc',            # 类方法: md 侧跨进程互证
     'vcamPersistDeviceUUID': 'qvUu',            # 类方法: UUID 回退持久化
+    # 1.3.63 方案A(T 表): 含许可/密钥语义的方法与 static 函数改无意义名
+    # (词边界正则防前缀互吃: \bvcamLicenseTable\b 不会命中 vcamLicenseTableDouble)
+    'vcamLicenseTableDouble': 'qvTd',           # 类方法: T 表定点参数取值
+    'vcamLicenseTableInt': 'qvTi',              # 类方法: T 表整数参数取值
+    'vcamLicenseTable': 'qvTa',                 # 类方法: T 表解密(72B)
+    'vcamFillT': 'qvFt',                        # C static(VCamFloatingBall.m): T 快照
     'vcamSelfIntegrityOK': 'qvSi',              # C static(VCamCore.m): IMP 范围自检
     'vcamDlsymTrusted': 'qzDs',                 # C static(VCamNotify.m): 可信符号解析
     'vcamPlatformSerial': 'qzPs',               # C static(VCamNotify.m): IOKit 序列号
