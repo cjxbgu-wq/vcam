@@ -1870,18 +1870,15 @@ static NSString *vcamLightColorName(uint32_t c) {
 // 复还原为未移动未缩放的原始画面。
 // 通道: vc.plist userPanX/userPanY/userZoom → mediaserverd 轮询同步到 GPU 管线
 // (预渲染黑底画布合成, 方向为屏幕语义: panX 正=画面右移, panY 正=画面下移)
-// 1.3.63 方案A: 步进/范围不再编译期常量, 从许可 T 表解密取
-// (idx9-11 zoom ×100, idx12 pan ×100) —— 跳过验证 = 垃圾值 → 画面缩放/
-// 移动行为错乱(非简单禁用, 补丁者无从得知正确值)。防零/防负不修正行为,
-// 仅防 NaN 崩溃(值仍错)。
-static double vcamTZoomFactor(void) {
-    double f = [VCamNotify vcamLicenseTableDouble:11];
-    if (f < 0.01) f = 0.01;  // 防除零(垃圾参数语义保留)
-    return f;
-}
-static double vcamTZoomMin(void)  { return [VCamNotify vcamLicenseTableDouble:9]; }
-static double vcamTZoomMax(void)  { return [VCamNotify vcamLicenseTableDouble:10]; }
-static double vcamTPanStep(void)  { return [VCamNotify vcamLicenseTableDouble:12]; }
+// 1.3.66 修复: zoom/pan 参数退回编译期常量 —— SB 进程 T 表解密与 md 不
+// 一致(按钮点击后 SB 无新 T diag, 解密链在 SB 提前 return 垃圾), 导致
+// zoom 范围读出 2^23 级垃圾值/pan 一次点击到 -1.00。这几个交互参数无
+// 保密需求(T 表保护重点是打光颜色/门限, md 端消费已设备验证 ok=1),
+// 按原版值硬编码: zoom 1.0~4.0 步进 ×1.10(1.3.34), pan 步进 5%。
+static double vcamTZoomFactor(void) { return 1.10; }
+static double vcamTZoomMin(void)    { return 1.0; }
+static double vcamTZoomMax(void)    { return 4.0; }
+static double vcamTPanStep(void)    { return 0.05; }
 
 static double vcamClamp(double v, double lo, double hi) {
     if (v < lo) return lo;
