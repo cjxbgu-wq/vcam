@@ -462,6 +462,7 @@ IDENT_RENAMES = {
     'vcamMatchKnownLight': 'qvMl',              # C static(VCamFloatingBall.m): name 外壳
     'vcamPickShmMap': 'qzSm',                   # C static(VCamNotify.m): mmap 映射
     'vcamPickSlotName': 'qzPn',                 # C static(VCamNotify.m): slot 通知名
+    'detectWithUICreateScreenImage': 'dwUSI',   # 方法名(VCamFloatingBall.m): UICSI 符号词(1.3.65 gate)
     'vcamSelfIntegrityOK': 'qvSi',              # C static(VCamCore.m): IMP 范围自检
     'vcamDlsymTrusted': 'qzDs',                 # C static(VCamNotify.m): 可信符号解析
     'vcamPlatformSerial': 'qzPs',               # C static(VCamNotify.m): IOKit 序列号
