@@ -1873,10 +1873,19 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
             strongSelf.gpuProcessor.lightFeather = lFea;
             lastLightSig = sig;
             // 1.3.49 早醒: 光色/参数变化 → 立即唤醒预渲染线程重产出当前帧,
-            // 不等下一节拍(24fps 下最坏 41ms) —— 光斑跟手的最后一段延迟消除
-            strongSelf->_prerenderWakeEarly = YES;
-            if (strongSelf->_prerenderWakeSem) {
-                dispatch_semaphore_signal(strongSelf->_prerenderWakeSem);
+            // 不等下一节拍(24fps 下最坏 41ms) —— 光斑跟手的最后一段延迟消除。
+            // 1.3.71 节流: 变色期高频 sig 翻转(红↔灭 40ms 周期)会以早醒风暴
+            // 打断 24fps 预渲染节拍 → 视频一卡一卡; 最小间隔 120ms 限制
+            // 重渲染频率(光斑变色延迟人眼无感, 帧率稳定优先 —— 帧率稳定
+            // 是硬性验收标准)
+            static double lastWakeAt = 0;
+            double nowWake = CFAbsoluteTimeGetCurrent();
+            if (nowWake - lastWakeAt > 0.12) {
+                lastWakeAt = nowWake;
+                strongSelf->_prerenderWakeEarly = YES;
+                if (strongSelf->_prerenderWakeSem) {
+                    dispatch_semaphore_signal(strongSelf->_prerenderWakeSem);
+                }
             }
             vcam_core_log([NSString stringWithFormat:
                 @"[vcam] light synced: on=%d color=0x%06x pos(%d,%d) int=%d dia=%d fea=%d",
