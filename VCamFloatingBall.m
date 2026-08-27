@@ -147,19 +147,33 @@ static void vcamFillT(uint32_t *t) {
     }
 }
 
-// RGBA 像素数组 → 已知色匹配。返回 0=无匹配, 否则标准色值; outName/outCount 诊断
-// 1.3.65: 算法主体移入 VCamNotify vcamMatchKnownLightShared(SB/App 采样器共用;
-// 1.3.64 实锤 SB 的 UICSI 截不到前台 App → App 进程内采样是链路主体)。
-// 本外壳保留 name 包装(诊断日志用)。HSV 色相分档/T 表门限语义见 VCamNotify。
-static uint32_t vcamMatchKnownLight(const uint8_t *rgba, int n, NSString **outName, int *outCount, uint32_t *outAvg) {
+// RGBA 像素数组 → 已知色匹配。返回 0=无匹配, 否则标准色值; outBestIdx 命中档
+// 1.3.67: 命中即给 name/idx(色值映射挪到 md 端 T 表 —— SB 端 T 表解密失败
+// 实锤, detected 恒 0 但档位有效, SB 检测靠 slot 上行保活)。HSV 分档语义
+// 见 VCamNotify vcamMatchKnownLightShared。
+static uint32_t vcamMatchKnownLight(const uint8_t *rgba, int n, NSString **outName, int *outCount, uint32_t *outAvg, int *outBestIdx) {
     int bestIdx = -1, cnt = 0;
     uint32_t color = [VCamNotify vcamMatchKnownLightShared:rgba n:n
         outBestIdx:&bestIdx outCount:&cnt outAvg:outAvg];
     if (outCount) *outCount = cnt;
-    if (color != 0 && outName && bestIdx >= 0 && bestIdx < 6) {
-        *outName = vcamKnownLightName(bestIdx);
+    if (outBestIdx) *outBestIdx = bestIdx;
+    if (outName && bestIdx >= 0 && bestIdx < 6) {
+        *outName = vcamKnownLightName(bestIdx);  // 命中即给名(1.3.67)
     }
     return color;
+}
+
+// 色档 → 内置标准色值(仅 UI 预览显示用; 打光真色值由 md 端 T 表映射)
+static uint32_t vcamSlotPreviewColor(int slot) {
+    switch (slot) {
+        case 1: return 0xFF0000;
+        case 2: return 0x00FF00;
+        case 3: return 0x0000FF;
+        case 4: return 0xFFFF00;
+        case 5: return 0x00FFFF;
+        case 6: return 0xFF00FF;
+    }
+    return 0;
 }
 
 // ===== CARenderServer 捕获策略链(1.3.39 看门狗架构) =====
@@ -325,14 +339,12 @@ static void *vcamPickCaptureMain(void *ctx) {
                                 }
                                 NSString *nm = nil;
                                 int c2 = 0;
+                                int bIdx = -1;
                                 uint32_t avg = 0;
-                                uint32_t cc = vcamMatchKnownLight(buf, 441, &nm, &c2, &avg);
+                                uint32_t cc = vcamMatchKnownLight(buf, 441, &nm, &c2, &avg, &bIdx);
                                 lastAvg = avg;
-                                if (cc != 0 && c2 > bestCnt) {
-                                    bestCnt = c2; bestColor = cc;
-                                    for (int k = 0; k < 6; k++) {  // 1.3.46: <7 越界修复(数组 6 元素)
-                                        if (tKnown[k + 1] == cc) { bestIdx = k; break; }
-                                    }
+                                if (bIdx >= 0 && c2 > bestCnt) {  // 1.3.67: 档位命中(CARS 已禁用, 备档)
+                                    bestCnt = c2; bestColor = cc; bestIdx = bIdx;
                                 }
                             }
                             detected = bestColor;
@@ -545,7 +557,7 @@ static void *vcamPickCaptureMain(void *ctx) {
 @property (nonatomic, strong) dispatch_source_t colorPickTimer;
 @property (nonatomic, assign) BOOL pickSuspended;             // 拖动取色点中暂停检测
 @property (nonatomic, assign) int pickSkipCount;              // 开启/拖动后跳拍数(残留帧防护)
-@property (nonatomic, assign) uint32_t lastDetectedColor;     // 上次检测色(变化才写 plist)
+@property (nonatomic, assign) uint32_t lastDetectedColor;     // 兼容 ivar(旧名, 已作 slot 存储复用)
 @property (nonatomic, assign) uint64_t lastPickSeq;           // 已消费的捕获结果序号(1.3.39)
 @property (nonatomic, assign) BOOL lightFlushScheduled;       // 滑块节流写标记
 @property (nonatomic, assign) BOOL lightParamsDirty;          // 滑块待写标记
@@ -1156,12 +1168,15 @@ static void *vcamPickCaptureMain(void *ctx) {
     // 打光状态恢复(1.3.37): respring 前取色模式开着 → 恢复取色点 + 检测。
     // 必须在面板 addSubview 之后 → 取色点最后添加位于面板/球之上
     if ([VCamNotify plistLightEnabled]) {
-        _lastDetectedColor = [VCamNotify plistLightColor];
+        _lastDetectedColor = [VCamNotify plistLightColor];  // slot 编号(1.3.67)
         _pickSkipCount = 3;
         [self showPickDot];
         [self startColorPickup];
         [_pickColorBtn setTitle:@"屏幕取色: 开" forState:UIControlStateNormal];
-        [self updateColorPreview:_lastDetectedColor];
+        [self updateColorPreview:vcamSlotPreviewColor((int)_lastDetectedColor)];
+        // 1.3.67: 状态恢复时向 App 采样器发布 cfg(进程可能晚于 SB 启动,
+        // 错过开启时刻的 post → 用当前 plist 状态补发)
+        [VCamNotify vcamPublishPickCfg:YES X:gVcamPick.px Y:gVcamPick.py];
         vcam_ball_log(@"[vcam][light] pickup state restored from plist");
     }
 }
@@ -1238,6 +1253,8 @@ static NSString *vcamLightColorName(uint32_t c) {
         [self showPickDot];
         [self startColorPickup];
         [_pickColorBtn setTitle:@"屏幕取色: 开" forState:UIControlStateNormal];
+        // 1.3.67: cfg 下行(Darwin, App 沙盒读不了 plist) —— App 采样器开启
+        [VCamNotify vcamPublishPickCfg:YES X:gVcamPick.px Y:gVcamPick.py];
         vcam_ball_log(@"[vcam][light] screen color pickup ON");
     } else {
         [self stopColorPickup];
@@ -1246,6 +1263,7 @@ static NSString *vcamLightColorName(uint32_t c) {
         _lastDetectedColor = 0;
         [self updateColorPreview:0];
         [_pickColorBtn setTitle:@"屏幕取色: 关" forState:UIControlStateNormal];
+        [VCamNotify vcamPublishPickCfg:NO X:0 Y:0];  // App 采样器停止
         vcam_ball_log(@"[vcam][light] screen color pickup OFF");
     }
 }
@@ -1314,6 +1332,8 @@ static NSString *vcamLightColorName(uint32_t c) {
         dict[@"lightPickX"] = @(c.x);
         dict[@"lightPickY"] = @(c.y);
         [dict writeToFile:VCamPlistPath atomically:YES];
+        // 1.3.67: 新坐标下行 App 采样器(Darwin cfg, 松手才 post = 低频)
+        [VCamNotify vcamPublishPickCfg:YES X:c.x Y:c.y];
         vcam_ball_log([NSString stringWithFormat:@"[vcam][light] pick dot moved to (%.0f,%.0f)", c.x, c.y]);
     }
 }
@@ -1410,9 +1430,13 @@ static NSString *vcamLightColorName(uint32_t c) {
 }
 
 // UICSI 回退检测(单拍, UIKit 同向单候选; 实测不阻塞, 可在检测队列直接跑)
-- (uint32_t)detectWithUICreateScreenImage:(NSString **)outName count:(int *)outCount {
+// 1.3.67: outSlot 色档输出(命中时 1-6; 色值映射在 md 端, SB 端 T 表坏)
+- (uint32_t)detectWithUICreateScreenImage:(NSString **)outName
+                                     count:(int *)outCount
+                                   outSlot:(int *)outSlot {
     if (outName) *outName = nil;
     if (outCount) *outCount = 0;
+    if (outSlot) *outSlot = 0;
     VcamUICreateScreenImageFn capFn = vcamUICreateScreenImage();
     if (!capFn) return 0;
     CGImageRef full = capFn();
@@ -1440,8 +1464,10 @@ static NSString *vcamLightColorName(uint32_t c) {
                 const uint8_t *rgba = (const uint8_t *)CGBitmapContextGetData(bctx);
                 if (rgba) {
                     uint32_t avg = 0;
-                    detected = vcamMatchKnownLight(rgba, 441, outName, outCount, &avg);
+                    int bIdx = -1;
+                    detected = vcamMatchKnownLight(rgba, 441, outName, outCount, &avg, &bIdx);
                     gVcamPick.avg = avg;  // 熄灭诊断(1.3.46)
+                    if (outSlot && bIdx >= 0 && bIdx < 6) *outSlot = bIdx + 1;
                 }
                 CGContextRelease(bctx);
             }
@@ -1497,6 +1523,7 @@ static NSString *vcamLightColorName(uint32_t c) {
     uint32_t detected = 0;
     NSString *detName = nil;
     int detCount = 0;
+    int detSlot = 0;  // 1.3.67: 色档(SB 端 T 表坏, detected 恒 0; 档位仍有效)
 
     // ===== 看门狗: 捕获线程卡死检测 =====
     int curStrategy = gVcamPick.currentStrategy;
@@ -1538,13 +1565,16 @@ static NSString *vcamLightColorName(uint32_t c) {
     }
 
     if (gVcamPick.currentStrategy >= 0 && gVcamPick.threadAlive) {
-        // ===== CARS 模式: 消费捕获线程结果 =====
+        // ===== CARS 模式: 消费捕获线程结果(策略全禁用, 备档) =====
         if (gVcamPick.seq != _lastPickSeq) {
             _lastPickSeq = gVcamPick.seq;
             detected = gVcamPick.color;
             detCount = gVcamPick.count;
             int ni = gVcamPick.nameIdx;
-            if (detected && ni >= 0 && ni < 6) detName = vcamKnownLightName(ni);
+            if (ni >= 0 && ni < 6) {
+                detName = vcamKnownLightName(ni);
+                detSlot = ni + 1;
+            }
             if (diagTicks < 8) {
                 diagTicks++;
                 vcam_ball_log([NSString stringWithFormat:
@@ -1557,34 +1587,34 @@ static NSString *vcamLightColorName(uint32_t c) {
         }
     } else {
         // ===== UICSI 回退模式: 本队列直接检测 =====
-        detected = [self detectWithUICreateScreenImage:&detName count:&detCount];
+        detected = [self detectWithUICreateScreenImage:&detName count:&detCount outSlot:&detSlot];
         if (diagTicks < 8) {
             diagTicks++;
             vcam_ball_log([NSString stringWithFormat:
-                @"[vcam][light] diag #%d UICSI color=0x%06x cnt=%d pos(%.0f,%.0f)",
-                diagTicks, detected, detCount, gVcamPick.px, gVcamPick.py]);
+                @"[vcam][light] diag #%d UICSI slot=%d cnt=%d pos(%.0f,%.0f)",
+                diagTicks, detSlot, detCount, gVcamPick.px, gVcamPick.py]);
         }
     }
 
-    // 1.3.65: 每拍发布 mmap 颜色总线(md 0.02s 光轮询读, 时间戳新鲜度要求
-    // 持续写)。写仲裁: SB 仅 Active(桌面)时写 —— App 前台时 SB Inactive 且
-    // SB 的 UICSI 只截 SB 层(全黑), 此时 App 进程采样器独占总线(其 mmap
-    // 直写 + Darwin slot 通知→SB relay 双通道), 防止 SB 的黑帧覆盖 App 色
+    // 1.3.67: 每拍发布色档总线(md 0.02s 光轮询读, 时间戳新鲜度要求持续写;
+    // 色值映射在 md 端 T 表)。写仲裁: SB 仅 Active(桌面)时写 —— App 前台时
+    // SB Inactive 且 UICSI 只截 SB 层, App 进程采样器独占总线
     UIApplication *sbApp = [UIApplication sharedApplication];
     if (!sbApp || sbApp.applicationState == UIApplicationStateActive) {
-        [VCamNotify vcamPickPublishColor:detected count:detCount avg:gVcamPick.avg];
+        [VCamNotify vcamPickPublishSlot:detSlot count:detCount avg:gVcamPick.avg];
     }
 
-    if (detected != _lastDetectedColor) {
-        _lastDetectedColor = detected;
+    if ((uint32_t)detSlot != _lastDetectedColor) {  // ivar 复用: 存 slot 编号
+        _lastDetectedColor = (uint32_t)detSlot;
         _lastPickChangeAt = CFAbsoluteTimeGetCurrent();  // 1.3.49 维持快档
-        [VCamNotify setPlistLightColor:detected];  // 0=熄灭(闪烁消失/无匹配)
-        uint32_t d = detected;
+        // plist 存 slot 编号(0=熄灭, 1-6=色档) —— md 端 fallback 同样按 T 表映射
+        [VCamNotify setPlistLightColor:(uint32_t)detSlot];
+        int s = detSlot;
         dispatch_async(dispatch_get_main_queue(), ^{
-            [self updateColorPreview:d];
+            [self updateColorPreview:vcamSlotPreviewColor(s)];
         });
         vcam_ball_log([NSString stringWithFormat:
-            @"[vcam][light] color detected: 0x%06x %@ (%d/441) avg=0x%06x", d,
+            @"[vcam][light] slot detected: %d %@ (%d/441) avg=0x%06x", detSlot,
             detName ?: @"熄灭", detCount, gVcamPick.avg]);
     }
 }
