@@ -5,27 +5,27 @@
 //  __TEXT 完整性签名洞(1.3.70 防破解: dylib 自校验)
 //
 //  布局: 40 字节 = 8B 魔数 'VCTXSIG1'(定位标记) + 32B SHA256(构建期注入)。
-//  显式放 __DATA,__vcsig section(used 防优化丢弃; const 数据默认可能落
-//  __TEXT,__const 或 __DATA_CONST, 显式 section 保证稳定位置)。
+//  显式放 __TEXT,__vcsig section(used 防优化丢弃)。
+//  【必须 __TEXT】设备实锤(1.3.70): 洞放 __DATA 时哈希区被 dyld 的
+//  chained fixups 改写清零(内存 m=VCTX e=0000, 磁盘 fat 有哈希)——
+//  __DATA/__DATA_CONST 加载时 fixup 重写, __TEXT 段原样只读映射。
 //
 //  inject_text_sig.py 在 CI 的 strip 之后 / ldid 签名之前:
-//  1. 在 slice 全文搜索魔数(唯一性断言)定位洞
-//  2. 对 __TEXT 段【全段】计算 SHA256(洞在 __DATA 内, 不在校验范围 →
-//     无自引用问题, 哈希 100% 覆盖代码字节)
+//  1. 在 slice 全文搜索魔数(唯一性断言)定位洞(洞在 __TEXT 内)
+//  2. 对 __TEXT 段跳过 40B 洞计算 SHA256(自引用消解)
 //  3. 哈希写入洞的后 32 字节
 //
-//  运行时 vcamSelfTextOK()(VCamCore.m) 同口径: __TEXT 全段重算, 与洞内
-//  期望值比对。任何对 __TEXT 的字节修改(改跳转/NOP 门禁/patch 常量)都会
-//  哈希失配 → licMark 关门禁 → 替换/打光静默失效。
-//  __DATA 段运行时映射为只读(__DATA_CONST 语义), 改洞需额外 vm_protect
-//  绕过; 且 md/SB 两侧独立计算, 单侧 patch 无效。
+//  运行时 vcamSelfTextOK()(VCamCore.m) 同口径(跳洞)重算比对。任何对
+//  __TEXT 的字节修改(改跳转/NOP 门禁/patch 常量)→ 哈希失配 → licMark
+//  关门禁 → 替换/打光静默失效。绕过需同时改洞内哈希并重算 —— md/SB
+//  两侧独立计算, 单侧 patch 无效。
 //
 #ifndef VCAM_TEXT_SIG_H
 #define VCAM_TEXT_SIG_H
 
 // 禁止混淆器处理本文件(COPY_FILES): 魔数字节序列必须原样进二进制,
 // inject_text_sig.py 才能定位洞。
-__attribute__((used, section("__DATA,__vcsig")))
+__attribute__((used, section("__TEXT,__vcsig")))
 static const uint8_t vcamTextSig[40] = {
     0x56, 0x43, 0x54, 0x58, 0x53, 0x49, 0x47, 0x31,  // "VCTXSIG1"
     // 32 字节 SHA256 占位(inject_text_sig.py 写入; 全 0 = 本地构建未注入
