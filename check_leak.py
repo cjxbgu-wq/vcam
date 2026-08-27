@@ -38,6 +38,13 @@ KEYWORDS = [
     # 密钥验证(1.3.54): plist 键与私有符号名必须全部密文(混淆回归即构建失败)
     'licenseKey', 'activated', 'deviceUUID',
     'UniqueDeviceID', 'MGCopyAnswer', 'CC_SHA256',
+    # 密钥验证(1.3.55, ECDSA): plist 键 + dlsym/CFSTR 符号名必须全部密文。
+    # 注: licGate/licMark 是 ObjC 属性名, 留在元数据属已接受范围(已同步改名)
+    'licBlob', 'dcPub', 'SerialNumber',
+    'SecKeyCreateWithData', 'SecKeyVerifySignature', 'ECDSA',
+    'kSecAttr', 'kSecSignatureAlgorithm',
+    'IOPlatformExpertDevice', 'IOServiceMatching',
+    'IORegistryEntryCreateCFProperty', 'IOObjectRelease',
 ]
 
 
