@@ -67,14 +67,12 @@ typedef void(^VCamNotifyCallback)(NSString *name);
 + (double)plistPanX;
 + (void)setPlistPanX:(double)panX;
 + (double)plistPanY;
-+ (BOOL)plistFrontPanFix;
-+ (void)setPlistFrontPanFix:(BOOL)on;
 + (void)setPlistPanY:(double)panY;
 + (double)plistZoom;
 + (void)setPlistZoom:(double)zoom;
 + (void)resetPlistTransform;
 // 前置方向修正(2026-08-23): 前置摄像头流的显示旋转与后置差 180°(实测 pan 双反),
-// mediaserverd 无法自动判别前后置 —— 设置页手动开关, 开启时 pan 应用时 X/Y 同时取反
+// mediaserverd 无法自动判别前后置 —— 悬浮窗长按箭头切换(1.3.53), 开启时 pan 应用时 X/Y 同时取反
 + (BOOL)plistFrontPanFix;
 + (void)setPlistFrontPanFix:(BOOL)fix;
 
