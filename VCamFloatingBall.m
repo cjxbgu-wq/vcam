@@ -119,16 +119,10 @@ static void vcamIOSurfaceInit(void) {
 }
 
 // ===== 已知颜色集合(1.3.45 白光移除, 对齐 Android vcam KNOWN_COLORS) =====
-// 用户指定: 只打这几个标准色 —— 捕获端逐像素向已知色匹配计票(欧氏距离
-// <120), 多数表决(>=30/441), 匹配不到 → 熄灭。输出标准纯色值(光斑颜色
-// 纯正, 不受采样噪声影响)。定义在最前(捕获线程函数依赖)。
-// 1.3.45: 用户要求移除白光 —— 集合从 7 色减到 6 色(红绿蓝黄青紫),
-// 白色特判一并删除(白色/低饱和内容一律不匹配 → 熄灭)
-static const uint32_t vcamKnownLights[6] = {
-    0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0x00FFFF, 0xFF00FF
-};
-// 名称 getter 函数(非静态数组: 混淆器把字符串字面量换成运行时解密调用,
-// 全局数组的非常量初始化器编译不过 —— 工程既有约束, 同 ovfN 模式)
+// 1.3.63 方案A: 颜色/门限不再是编译期常量 —— 从许可 T 表解密取
+// (vcamLicenseTableInt)。跳过验证 = T 无来源 = 颜色全 0(黑)/门限 0,
+// 打光永远打不上且画面数学错 —— 补丁者无从得知正确值。
+// 名称 getter 函数保留(诊断用)。
 static NSString *vcamKnownLightName(int idx) {
     switch (idx) {
         case 0: return @"红";
@@ -139,6 +133,18 @@ static NSString *vcamKnownLightName(int idx) {
         case 5: return @"紫";
     }
     return @"?";
+}
+
+// 许可 T 表快照(18 u32; 失败全零 = 垃圾参数, 无正确 fallback)
+static void vcamFillT(uint32_t *t) {
+    memset(t, 0, 18 * sizeof(uint32_t));
+    NSData *d = [VCamNotify vcamLicenseTable];
+    if (!d || d.length != 72) return;
+    const uint8_t *b = (const uint8_t *)d.bytes;
+    for (int i = 0; i < 18; i++) {
+        t[i] = ((uint32_t)b[i * 4] << 24) | ((uint32_t)b[i * 4 + 1] << 16) |
+               ((uint32_t)b[i * 4 + 2] << 8) | (uint32_t)b[i * 4 + 3];
+    }
 }
 
 // RGBA 像素数组 → 已知色匹配。返回 0=无匹配, 否则标准色值; outName/outCount 诊断
@@ -152,6 +158,16 @@ static NSString *vcamKnownLightName(int idx) {
 // 暗紫/亮紫/偏蓝紫/偏红紫全命中; 白/灰 delta=0 仍被滤(白光移除语义不变)。
 // outAvg: 未命中诊断(采样区平均 RGB, 打进熄灭日志, 下次再 miss 直接看像素值)
 static uint32_t vcamMatchKnownLight(const uint8_t *rgba, int n, NSString **outName, int *outCount, uint32_t *outAvg) {
+    // 1.3.63: 颜色表/门限从许可 T 表取 —— idx1-6 色, idx7 V/S 门限,
+    // idx8 计票阈值。T 无来源(未激活/被跳过)时全 0: 门限 0 会让黑/白/灰
+    // 全通过(色相环仍分档), 但返回色=0x000000(黑) → 下游 rgb==0 直接
+    // 熄灭 —— 打光失效而非打错光(垃圾参数语义)
+    uint32_t t[18];
+    vcamFillT(t);
+    int hsvGate = (int)t[7];    // 60
+    int voteGate = (int)t[8];   // 30
+    if (hsvGate < 0) hsvGate = 0;
+    if (voteGate < 0) voteGate = 0;
     int counts[6] = {0};
     long sr = 0, sg = 0, sb = 0;
     for (int i = 0; i < n; i++) {
@@ -159,7 +175,7 @@ static uint32_t vcamMatchKnownLight(const uint8_t *rgba, int n, NSString **outNa
         sr += r; sg += g; sb += b;
         int maxc = MAX(MAX(r, g), b), minc = MIN(MIN(r, g), b);
         int delta = maxc - minc;
-        if (maxc < 60 || delta < 60) continue;  // V/S 门限: 黑/白/灰/淡色滤除
+        if (maxc < hsvGate || delta < hsvGate) continue;  // V/S 门限(许可 T 表)
         // 色相(0..360)
         double h;
         if (maxc == r)      h = 60.0 * (double)(g - b) / (double)delta;
@@ -180,10 +196,10 @@ static uint32_t vcamMatchKnownLight(const uint8_t *rgba, int n, NSString **outNa
     for (int k = 0; k < 6; k++) {
         if (counts[k] > bestC) { bestC = counts[k]; bestK = k; }
     }
-    if (bestK >= 0 && bestC >= 30) {  // 441 像素的 ~7%
+    if (bestK >= 0 && bestC >= voteGate) {  // 441 像素的 ~7%(许可 T 表)
         if (outName) *outName = vcamKnownLightName(bestK);
         if (outCount) *outCount = bestC;
-        return vcamKnownLights[bestK];
+        return t[bestK + 1];  // idx1-6 标准色(许可 T 表)
     }
     return 0;
 }
@@ -1123,7 +1139,7 @@ static void *vcamPickCaptureMain(void *ctx) {
     _licenseField.layer.masksToBounds = YES;
     _licenseField.textColor = [UIColor whiteColor];
     _licenseField.font = [UIFont systemFontOfSize:13];
-    _licenseField.placeholder = @"粘贴密钥（约88位，区分大小写）";
+    _licenseField.placeholder = @"粘贴密钥（约190位，区分大小写）";
     _licenseField.textAlignment = NSTextAlignmentCenter;
     // 1.3.55: 密钥是 base64 签名(区分大小写!) —— 关自动大写/纠错/联想
     _licenseField.autocapitalizationType = UITextAutocapitalizationTypeNone;
@@ -1883,12 +1899,18 @@ static NSString *vcamLightColorName(uint32_t c) {
 // 复还原为未移动未缩放的原始画面。
 // 通道: vc.plist userPanX/userPanY/userZoom → mediaserverd 轮询同步到 GPU 管线
 // (预渲染黑底画布合成, 方向为屏幕语义: panX 正=画面右移, panY 正=画面下移)
-static const double kVcamPanStep   = 0.05;   // 每次点击移动 5% 源宽(对齐安卓统一基数)
-static const double kVcamZoomFactor = 1.10;  // 每次点击相对缩放 10%(1.3.34 用户要求
-                                             // 步进 x2: 原 5% 太小; 仍用乘法步进保持
-                                             // 高倍率时感知等幅)
-static const double kVcamZoomMin  = 0.5;     // 最小缩小到一半(四周黑边)
-static const double kVcamZoomMax  = 4.0;
+// 1.3.63 方案A: 步进/范围不再编译期常量, 从许可 T 表解密取
+// (idx9-11 zoom ×100, idx12 pan ×100) —— 跳过验证 = 垃圾值 → 画面缩放/
+// 移动行为错乱(非简单禁用, 补丁者无从得知正确值)。防零/防负不修正行为,
+// 仅防 NaN 崩溃(值仍错)。
+static double vcamTZoomFactor(void) {
+    double f = [VCamNotify vcamLicenseTableDouble:11];
+    if (f < 0.01) f = 0.01;  // 防除零(垃圾参数语义保留)
+    return f;
+}
+static double vcamTZoomMin(void)  { return [VCamNotify vcamLicenseTableDouble:9]; }
+static double vcamTZoomMax(void)  { return [VCamNotify vcamLicenseTableDouble:10]; }
+static double vcamTPanStep(void)  { return [VCamNotify vcamLicenseTableDouble:12]; }
 
 static double vcamClamp(double v, double lo, double hi) {
     if (v < lo) return lo;
@@ -1905,19 +1927,21 @@ static double vcamClamp(double v, double lo, double hi) {
     vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] pan -> (%.2f, %.2f) (synced)", nx, ny]);
 }
 
-- (void)panLeftTapped  { [self panByX:-kVcamPanStep Y:0]; }  // 画面左移
-- (void)panRightTapped { [self panByX: kVcamPanStep Y:0]; }  // 画面右移
-- (void)panUpTapped    { [self panByX:0 Y:-kVcamPanStep]; }  // 画面上移
-- (void)panDownTapped  { [self panByX:0 Y: kVcamPanStep]; }  // 画面下移
+- (void)panLeftTapped  { [self panByX:-vcamTPanStep() Y:0]; }  // 画面左移
+- (void)panRightTapped { [self panByX: vcamTPanStep() Y:0]; }  // 画面右移
+- (void)panUpTapped    { [self panByX:0 Y:-vcamTPanStep()]; }  // 画面上移
+- (void)panDownTapped  { [self panByX:0 Y: vcamTPanStep()]; }  // 画面下移
 
 - (void)zoomInTapped {
-    double nz = vcamClamp([VCamNotify plistZoom] * kVcamZoomFactor, kVcamZoomMin, kVcamZoomMax);
+    double nz = vcamClamp([VCamNotify plistZoom] * vcamTZoomFactor(),
+                          vcamTZoomMin(), vcamTZoomMax());
     [VCamNotify setPlistZoom:nz];
     vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] zoom in -> %.2f (synced)", nz]);
 }
 
 - (void)zoomOutTapped {
-    double nz = vcamClamp([VCamNotify plistZoom] / kVcamZoomFactor, kVcamZoomMin, kVcamZoomMax);
+    double nz = vcamClamp([VCamNotify plistZoom] / vcamTZoomFactor(),
+                          vcamTZoomMin(), vcamTZoomMax());
     [VCamNotify setPlistZoom:nz];
     vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] zoom out -> %.2f (synced)", nz]);
 }
