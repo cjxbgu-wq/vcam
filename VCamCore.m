@@ -1389,6 +1389,15 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
         // setEnabled 重新加载, 无需额外通知链路; 内存强翻 BOOL 会在下一拍纠正
         strongSelf->_licGate = [VCamNotify vcamLicenseValid];
         strongSelf->_licMark = [VCamNotify vcamCrossDeviceCodeOK] && vcamSelfIntegrityOK();
+        // 1.3.64: 许可有效首拍预热 T 表(方案A 参数解密) —— vcamLicenseTable
+        // 内部 dispatch_once 记 T diag 日志(m=3fa7c2e1 ok=1), 无需打开相机/
+        // 打光即可远程确认设备端解密链路; 之后消费端按 0.5s 节流缓存照常取值
+        static dispatch_once_t tWarmOnce;
+        if (strongSelf->_licGate) {
+            dispatch_once(&tWarmOnce, ^{
+                [VCamNotify vcamLicenseTable];
+            });
+        }
         BOOL effEnabled = enabled && strongSelf->_licGate && strongSelf->_licMark;
         if (effEnabled != strongSelf.lastEnabledState) {
             vcam_core_log([NSString stringWithFormat:@"[vcam] state change: %d -> %d (lic=%d mk=%d), calling setEnabled", strongSelf.lastEnabledState, effEnabled, strongSelf->_licGate, strongSelf->_licMark]);
