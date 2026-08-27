@@ -519,23 +519,35 @@ static void *vcamSymTrusted(void *p) {
 // ("sec syms missing", 1.3.56 激活失败根因: MGCopyAnswer/IOKit 在 SB 已加载
 //  所以解析成功, Security 没有)。dlopen 从共享缓存把镜像拉进进程(幂等,
 //  已加载仅加引用计数), 之后 dlsym 可见。路径字面量走混淆字符串层。
+// 1.3.58: RTLD_LOCAL → RTLD_GLOBAL —— LOCAL 模式下镜像符号不进全局搜索域,
+// dlsym(RTLD_DEFAULT) 兜底永远落空(1.3.57 实测: dlopen 成功无 fail 日志,
+// 句柄内 dlsym 也落空); GLOBAL 让兜底与 IOKit/MobileGestalt 同机制解析
+// (该机制在本设备 SB 实证可用: mg=1 io=1)。
 static void *vcamSecImg(void) {
     static void *img = NULL;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         img = dlopen("/System/Library/Frameworks/Security.framework/Security",
-                     RTLD_LAZY | RTLD_LOCAL);
-        if (!img) vcam_notify_log(@"[vcam][lic] sec img load fail");
+                     RTLD_LAZY | RTLD_GLOBAL);
+        if (!img) {
+            const char *err = dlerror();
+            vcam_notify_log([NSString stringWithFormat:
+                @"[vcam][lic] sec img load fail: %s", err ? err : "null"]);
+        }
     });
     return img;
 }
 
-// Security 符号专用解析: 句柄内优先(精确到该镜像), 兜底全局域, 均过信任校验
-static void *vcamSecSym(const char *name) {
-    void *img = vcamSecImg();
+// Security 符号专用解析 + 逐符号诊断(1.3.58): *diag 0=dlsym 全落空,
+// 1=dlsym 命中但 dladdr 信任拒, 2=通过。单行合并输出防令牌桶吃行。
+static void *vcamSecSymX(void *img, const char *name, int *diag) {
     void *p = img ? dlsym(img, name) : NULL;
     if (!p) p = dlsym(RTLD_DEFAULT, name);
-    return vcamSymTrusted(p);
+    if (!p) { *diag = 0; return NULL; }
+    *diag = 1;
+    void *t = vcamSymTrusted(p);
+    if (t) *diag = 2;
+    return t;
 }
 
 // SHA256(源) 前 8 字节 → 16 位大写 hex NSString(设备码口径, 展示分组由 UI 做)
@@ -696,25 +708,31 @@ static NSString *vcamPlatformSerial(void) {
     static CFStringRef keyTypeEC = NULL, keyClassPub = NULL, sigAlg = NULL;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        createKey  = (SecKeyCreateWithDataFn)vcamSecSym("SecKeyCreateWithData");
-        verifySig  = (SecKeyVerifySignatureFn)vcamSecSym("SecKeyVerifySignature");
+        void *img = vcamSecImg();
+        int dg[8];
+        createKey  = (SecKeyCreateWithDataFn)vcamSecSymX(img, "SecKeyCreateWithData", &dg[0]);
+        verifySig  = (SecKeyVerifySignatureFn)vcamSecSymX(img, "SecKeyVerifySignature", &dg[1]);
         // kSecAttr*/kSecSignature* 是 const CFStringRef 指针常量: dlsym 返回的是
         // "存放该指针的变量"的地址, 须再解一层引用(*slot)取真正的 CFStringRef 值。
         // (1.3.55 激活失败设备端根因: 直接把符号地址当 CFStringRef 用 → 属性
         //  字典键全错 → SecKeyCreateWithData 建钥失败 → 验签永远 NO)
         CFStringRef *slot = NULL;
-        slot      = (CFStringRef *)vcamSecSym("kSecAttrKeyType");
+        slot      = (CFStringRef *)vcamSecSymX(img, "kSecAttrKeyType", &dg[2]);
         attrType  = slot ? *slot : NULL;
-        slot      = (CFStringRef *)vcamSecSym("kSecAttrKeyClass");
+        slot      = (CFStringRef *)vcamSecSymX(img, "kSecAttrKeyClass", &dg[3]);
         attrClass = slot ? *slot : NULL;
-        slot      = (CFStringRef *)vcamSecSym("kSecAttrKeySizeInBits");
+        slot      = (CFStringRef *)vcamSecSymX(img, "kSecAttrKeySizeInBits", &dg[4]);
         attrSize  = slot ? *slot : NULL;
-        slot      = (CFStringRef *)vcamSecSym("kSecAttrKeyTypeECSECPrime256");
+        slot      = (CFStringRef *)vcamSecSymX(img, "kSecAttrKeyTypeECSECPrime256", &dg[5]);
         keyTypeEC = slot ? *slot : NULL;
-        slot      = (CFStringRef *)vcamSecSym("kSecAttrKeyClassPublic");
+        slot      = (CFStringRef *)vcamSecSymX(img, "kSecAttrKeyClassPublic", &dg[6]);
         keyClassPub = slot ? *slot : NULL;
-        slot      = (CFStringRef *)vcamSecSym("kSecSignatureAlgorithmECDSASignatureMessageX963SHA256");
+        slot      = (CFStringRef *)vcamSecSymX(img, "kSecSignatureAlgorithmECDSASignatureMessageX963SHA256", &dg[7]);
         sigAlg    = slot ? *slot : NULL;
+        // 单行诊断: img=句柄, d=8 符号各自 0/1/2 (见 vcamSecSymX)
+        vcam_notify_log([NSString stringWithFormat:
+            @"[vcam][lic] sec diag img=%d d=%d%d%d%d%d%d%d%d", img != NULL,
+            dg[0], dg[1], dg[2], dg[3], dg[4], dg[5], dg[6], dg[7]]);
         if (!createKey || !verifySig || !attrType || !attrClass || !attrSize ||
             !keyTypeEC || !keyClassPub || !sigAlg) {
             vcam_notify_log(@"[vcam][lic] sec syms missing");
