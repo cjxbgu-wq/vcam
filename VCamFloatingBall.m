@@ -11,7 +11,9 @@
 //   −(占位)   ▶        ＋(占位)  3(占位)
 //   ↷(旋转)   镜(图标)  替(图标)  4(占位)
 //  打光页: 占位(功能后续版本接入)
-//  设置页: 选择视频 / 预设视频2 / 预设视频3 / 岐盛相机(频道链接) / @QuGenttx 水印
+//  设置页: 选择视频 / 预设视频2 / 预设视频3 / 预设视频4 / 密钥验证(激活页入口) / @QuGenttx 水印
+//  激活页(1.3.54): 设备码(点击复制) + 密钥输入 + 激活状态 —— 通过密钥验证
+//  才能使用替换摄像头(替按钮/槽位键 UI 门禁, mediaserverd 帧级硬拦截);
 //
 //  跨进程控制(球在 SpringBoard, 播放器在 mediaserverd): 全部经 vc.plist
 //    enabled(替/原) / activePlaybackPath(1/2/3) / paused(▶) /
@@ -52,6 +54,16 @@ static void vcam_ball_log(NSString *msg) {
             [fh closeFile];
         }
     } @catch (NSException *e) {}
+}
+
+// 密钥验证(1.3.54): raw 16 hex → 4-4-4-4 分组展示(仅 UI 格式化, 比对口径 raw)
+static NSString *vcamGrouped16(NSString *raw16) {
+    if (![raw16 isKindOfClass:[NSString class]] || raw16.length != 16) return raw16;
+    return [NSString stringWithFormat:@"%@-%@-%@-%@",
+        [raw16 substringToIndex:4],
+        [raw16 substringWithRange:NSMakeRange(4, 4)],
+        [raw16 substringWithRange:NSMakeRange(8, 4)],
+        [raw16 substringWithRange:NSMakeRange(12, 4)]];
 }
 
 // iOS 私有截屏(1.3.38 重构): 用户实测"红色闪烁识别不到" —— 根因是
@@ -497,7 +509,7 @@ static void *vcamPickCaptureMain(void *ctx) {
 
 #pragma mark - VCamFloatingBall
 
-@interface VCamFloatingBall () <PHPickerViewControllerDelegate>
+@interface VCamFloatingBall () <PHPickerViewControllerDelegate, UITextFieldDelegate>
 @property (nonatomic, strong) UIWindow *overlayWindow;
 @property (nonatomic, strong) VCamBallView *ballView;
 @property (nonatomic, strong) UIView *panelView;
@@ -525,6 +537,16 @@ static void *vcamPickCaptureMain(void *ctx) {
 @property (nonatomic, assign) CGFloat settingsPageH;   // 设置页内容高度
 @property (nonatomic, assign) CGFloat lightPageH;      // 打光页内容高度
 @property (nonatomic, assign) NSInteger pickerSlot;      // 0=选择视频(vcam.mp4) 2/3=预设槽位
+
+// ===== 密钥验证激活页(1.3.54, 设置页入口) =====
+// 设备码展示(点击复制) + 密钥输入 + 激活状态; 激活后永久有效(无月/年),
+// mediaserverd 侧 0.15s 轮询自动拉起替换管线
+@property (nonatomic, strong) UIView *licensePageView;
+@property (nonatomic, strong) UILabel *licenseCodeLabel;    // 设备码值(点击复制)
+@property (nonatomic, strong) UILabel *licenseCodeHint;     // 设备码下提示(已复制反馈)
+@property (nonatomic, strong) UITextField *licenseField;    // 密钥输入框
+@property (nonatomic, strong) UILabel *licenseStatusLabel;  // 激活状态
+@property (nonatomic, assign) CGFloat licensePageH;
 
 // ===== 三色打光(1.3.37, 复刻 Android ControllerFragment 屏幕取色 + vcplax 注入) =====
 @property (nonatomic, strong) VCamPanelButton *pickColorBtn;  // 屏幕取色总开关
@@ -730,7 +752,7 @@ static void *vcamPickCaptureMain(void *ctx) {
     CGFloat cellH = 44;
     CGFloat gridGap = 7;
     CGFloat controlH = cellH * 4 + gridGap * 3;          // 197
-    // 设置页内容高度: 选择视频 + 预设2 + 预设3 + 前置修正 + 岐盛相机 5 整宽(38*5 + 8*4) + 10 + 水印(16)
+    // 设置页内容高度: 选择视频 + 预设2 + 预设3 + 预设4 + 密钥验证 5 整宽(38*5 + 8*4) + 10 + 水印(16)
     CGFloat settingsH = rowH * 5 + gap * 4 + 10 + 16;    // 248
     // 打光页内容高度(1.3.37): 取色按钮 38 + 6 + 颜色行 22 + 8 + 5 滑块行(30×5 + 6×4) + 4
     CGFloat lightH = 38 + 6 + 22 + 8 + (30 * 5 + 6 * 4) + 4;  // 252
@@ -1031,13 +1053,13 @@ static void *vcamPickCaptureMain(void *ctx) {
     preset4.titleLabel.font = [UIFont boldSystemFontOfSize:14];
     [_settingsPageView addSubview:preset4];
 
-    // 岐盛相机: 隐藏频道链接按钮(跳转 Telegram)。
-    // 2026-08-18: 品牌/签名/频道字符串混淆存储(VCamStr.h), 二进制无明文
-    VCamPanelButton *channel = [self makeButton:VCS(qisheng)
+    // 密钥验证(1.3.54): 原"岐盛相机"频道链接按钮改为激活入口 ——
+    // 打开激活页(设备码+密钥输入), 通过验证后才能使用替换摄像头功能
+    VCamPanelButton *licenseEntry = [self makeButton:@"密钥验证"
                                           frame:CGRectMake(pad, (rowH + gap) * 4, contentW, rowH)
-                                        selector:@selector(channelLinkTapped)];
-    channel.titleLabel.font = [UIFont boldSystemFontOfSize:14];
-    [_settingsPageView addSubview:channel];
+                                        selector:@selector(licenseEntryTapped)];
+    licenseEntry.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    [_settingsPageView addSubview:licenseEntry];
 
     // 水印
     UILabel *mark = [[UILabel alloc] initWithFrame:CGRectMake(pad, (rowH + gap) * 4 + rowH + 10, contentW, 16)];
@@ -1046,6 +1068,92 @@ static void *vcamPickCaptureMain(void *ctx) {
     mark.textAlignment = NSTextAlignmentCenter;
     mark.font = [UIFont systemFontOfSize:11];
     [_settingsPageView addSubview:mark];
+
+    // ===== 激活页(1.3.54, 密钥验证) =====
+    // 布局: 标题 / 设备码(点击复制) / 输入框 / 激活按钮 / 状态
+    CGFloat licenseH = 232;
+    _licensePageH = licenseH;
+    _licensePageView = [[UIView alloc] initWithFrame:CGRectMake(0, pageTop, panelW, licenseH)];
+    _licensePageView.backgroundColor = [UIColor clearColor];
+    [_panelView addSubview:_licensePageView];
+
+    UILabel *licTitle = [[UILabel alloc] initWithFrame:CGRectMake(pad, 0, contentW, 22)];
+    licTitle.text = @"密钥激活";
+    licTitle.textColor = [UIColor whiteColor];
+    licTitle.textAlignment = NSTextAlignmentCenter;
+    licTitle.font = [UIFont boldSystemFontOfSize:16];
+    [_licensePageView addSubview:licTitle];
+
+    UILabel *codeCaption = [[UILabel alloc] initWithFrame:CGRectMake(pad, 28, contentW, 16)];
+    codeCaption.text = @"本机设备码";
+    codeCaption.textColor = [UIColor colorWithRed:0.72 green:0.73 blue:0.75 alpha:1.0];
+    codeCaption.textAlignment = NSTextAlignmentCenter;
+    codeCaption.font = [UIFont systemFontOfSize:12];
+    [_licensePageView addSubview:codeCaption];
+
+    // 设备码值(raw 16 hex 格式化 4-4-4-4 展示; 点击复制)
+    _licenseCodeLabel = [[UILabel alloc] initWithFrame:CGRectMake(pad, 46, contentW, 24)];
+    _licenseCodeLabel.textColor = [UIColor whiteColor];
+    _licenseCodeLabel.textAlignment = NSTextAlignmentCenter;
+    _licenseCodeLabel.font = [UIFont boldSystemFontOfSize:17];
+    _licenseCodeLabel.userInteractionEnabled = YES;
+    _licenseCodeLabel.text = vcamGrouped16([VCamNotify vcamDeviceCode]);
+    UITapGestureRecognizer *codeTap = [[UITapGestureRecognizer alloc]
+        initWithTarget:self action:@selector(licenseCopyTapped)];
+    [_licenseCodeLabel addGestureRecognizer:codeTap];
+    [_licensePageView addSubview:_licenseCodeLabel];
+
+    _licenseCodeHint = [[UILabel alloc] initWithFrame:CGRectMake(pad, 70, contentW, 14)];
+    _licenseCodeHint.text = @"点击上方设备码复制, 发送给开发者获取密钥";
+    _licenseCodeHint.textColor = [UIColor colorWithRed:0.72 green:0.73 blue:0.75 alpha:1.0];
+    _licenseCodeHint.textAlignment = NSTextAlignmentCenter;
+    _licenseCodeHint.font = [UIFont systemFontOfSize:11];
+    [_licensePageView addSubview:_licenseCodeHint];
+
+    UILabel *keyCaption = [[UILabel alloc] initWithFrame:CGRectMake(pad, 92, contentW, 16)];
+    keyCaption.text = @"输入密钥";
+    keyCaption.textColor = [UIColor colorWithRed:0.72 green:0.73 blue:0.75 alpha:1.0];
+    keyCaption.textAlignment = NSTextAlignmentCenter;
+    keyCaption.font = [UIFont systemFontOfSize:12];
+    [_licensePageView addSubview:keyCaption];
+
+    _licenseField = [[UITextField alloc] initWithFrame:CGRectMake(pad, 110, contentW, 36)];
+    _licenseField.backgroundColor = [self vcButtonBgColor];
+    _licenseField.layer.cornerRadius = 9;
+    _licenseField.layer.masksToBounds = YES;
+    _licenseField.textColor = [UIColor whiteColor];
+    _licenseField.font = [UIFont systemFontOfSize:15];
+    _licenseField.placeholder = @"XXXX-XXXX-XXXX-XXXX";
+    _licenseField.textAlignment = NSTextAlignmentCenter;
+    // 全大写无联想(密钥是 hex 大写, 防自动纠错破坏输入)
+    _licenseField.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
+    _licenseField.autocorrectionType = UITextAutocorrectionTypeNo;
+    _licenseField.spellCheckingType = UITextSpellCheckingTypeNo;
+    _licenseField.keyboardType = UIKeyboardTypeASCIICapable;
+    _licenseField.returnKeyType = UIReturnKeyDone;
+    _licenseField.delegate = self;
+    [_licensePageView addSubview:_licenseField];
+
+    VCamPanelButton *activateBtn = [self makeButton:@"激活"
+                                          frame:CGRectMake(pad, 154, contentW, rowH)
+                                        selector:@selector(licenseActivateTapped)];
+    activateBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    [_licensePageView addSubview:activateBtn];
+
+    _licenseStatusLabel = [[UILabel alloc] initWithFrame:CGRectMake(pad, 198, contentW, 16)];
+    _licenseStatusLabel.textAlignment = NSTextAlignmentCenter;
+    _licenseStatusLabel.font = [UIFont systemFontOfSize:12];
+    [_licensePageView addSubview:_licenseStatusLabel];
+
+    UILabel *licFoot = [[UILabel alloc] initWithFrame:CGRectMake(pad, 216, contentW, 14)];
+    licFoot.text = @"密钥绑定本机 · 激活后永久有效";
+    licFoot.textColor = [UIColor colorWithRed:0.72 green:0.73 blue:0.75 alpha:1.0];
+    licFoot.textAlignment = NSTextAlignmentCenter;
+    licFoot.font = [UIFont systemFontOfSize:11];
+    [_licensePageView addSubview:licFoot];
+
+    _licensePageView.hidden = YES;
+    [self refreshLicenseStatus];
 
     // 初始页签 = 控制, 替/镜边框按当前 enabled/mirrored 状态
     _lightPageView.hidden = YES;
@@ -1102,6 +1210,7 @@ static void *vcamPickCaptureMain(void *ctx) {
     _controlPageView.hidden = NO;
     _lightPageView.hidden = YES;
     _settingsPageView.hidden = YES;
+    _licensePageView.hidden = YES;
     [self refreshTabStyles];
     [self applyPanelContentHeight:_controlPageH];
 }
@@ -1111,6 +1220,7 @@ static void *vcamPickCaptureMain(void *ctx) {
     _controlPageView.hidden = YES;
     _lightPageView.hidden = NO;
     _settingsPageView.hidden = YES;
+    _licensePageView.hidden = YES;
     [self refreshTabStyles];
     [self applyPanelContentHeight:_lightPageH];
 }
@@ -1554,6 +1664,7 @@ static NSString *vcamLightColorName(uint32_t c) {
     _controlPageView.hidden = YES;
     _lightPageView.hidden = YES;
     _settingsPageView.hidden = NO;
+    _licensePageView.hidden = YES;
     [self refreshTabStyles];
     [self applyPanelContentHeight:_settingsPageH];
 }
@@ -1642,6 +1753,13 @@ static NSString *vcamLightColorName(uint32_t c) {
 
 // 替/原: 替换摄像头 ↔ 还原摄像头(图标按钮, 白色边框=替换开启)
 - (void)toggleReplacementTapped {
+    // 密钥门禁(1.3.54): 未激活直接弹激活页, 不写 enabled(mediaserverd 侧
+    // render 入口另有硬拦截, 此处是 UI 层引导)
+    if (![VCamNotify vcamLicenseValid]) {
+        vcam_ball_log(@"[vcam][btn] replace blocked: license not activated");
+        [self showLicensePage];
+        return;
+    }
     BOOL newEnabled = ![VCamNotify isPlistEnabled];
     [VCamNotify setPlistEnabled:newEnabled];
     [[VCamCore sharedInstance] setEnabled:newEnabled];
@@ -1716,6 +1834,12 @@ static NSString *vcamLightColorName(uint32_t c) {
 - (void)slot4Tapped { [self playSlot:4]; }
 
 - (void)playSlot:(NSInteger)slot {
+    // 密钥门禁(1.3.54): 未激活不自动开启替换(与"替"按钮同一门禁)
+    if (![VCamNotify vcamLicenseValid]) {
+        vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] slot %ld blocked: license not activated", (long)slot]);
+        [self showLicensePage];
+        return;
+    }
     NSString *path = (slot == 1) ? @"/var/mobile/Media/DCIM/vcam.mp4"
                                  : [NSString stringWithFormat:@"/var/mobile/Media/DCIM/6/%ld.mp4", (long)slot];
     if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
@@ -1960,13 +2084,77 @@ static double vcamClamp(double v, double lo, double hi) {
     [self loadVideoFromProvider:provider candidates:cands slot:slot];
 }
 
-#pragma mark - 频道链接
+#pragma mark - 密钥验证(1.3.54, 激活页)
 
-// 岐盛相机: 隐藏频道链接按钮
-- (void)channelLinkTapped {
-    vcam_ball_log(@"[vcam][btn] channel link tapped");
-    NSURL *url = [NSURL URLWithString:VCS(tglink)];
-    [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
+// 设置页"密钥验证"入口 → 激活页
+- (void)licenseEntryTapped {
+    vcam_ball_log(@"[vcam][lic] entry tapped");
+    [self showLicensePage];
+}
+
+// 显示激活页: 页面区切到 license 视图(设置 tab 保持高亮, tab 栏可随时切走)
+- (void)showLicensePage {
+    _controlPageView.hidden = YES;
+    _lightPageView.hidden = YES;
+    _settingsPageView.hidden = YES;
+    _licensePageView.hidden = NO;
+    [self refreshLicenseStatus];
+    [self refreshTabStyles];
+    [self applyPanelContentHeight:_licensePageH];
+}
+
+// 激活状态刷新: 已激活 = 绿色状态 + 输入框填入已存密钥(只读展示);
+// 未激活 = 红色状态 + 可输入
+- (void)refreshLicenseStatus {
+    if ([VCamNotify vcamLicenseValid]) {
+        _licenseStatusLabel.text = @"已激活 · 永久有效";
+        _licenseStatusLabel.textColor = [UIColor colorWithRed:0.30 green:0.85 blue:0.45 alpha:1.0];
+        // 展示已存密钥(4-4-4-4 分组), 只读 —— 激活后无需再输入
+        NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath];
+        NSString *stored = dict[@"licenseKey"];
+        _licenseField.text = vcamGrouped16(stored);
+        _licenseField.enabled = NO;
+    } else {
+        _licenseStatusLabel.text = @"未激活";
+        _licenseStatusLabel.textColor = [UIColor colorWithRed:0.95 green:0.40 blue:0.40 alpha:1.0];
+        _licenseField.enabled = YES;
+    }
+}
+
+// 点击设备码: 复制到剪贴板(4-4-4-4 分组格式, 与展示一致) + 2 秒"已复制"反馈
+- (void)licenseCopyTapped {
+    UIPasteboard *pb = [UIPasteboard generalPasteboard];
+    pb.string = vcamGrouped16([VCamNotify vcamDeviceCode]);
+    _licenseCodeHint.text = @"已复制, 发送给开发者获取密钥";
+    _licenseCodeHint.textColor = [UIColor colorWithRed:0.30 green:0.85 blue:0.45 alpha:1.0];
+    vcam_ball_log(@"[vcam][lic] device code copied");
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        self->_licenseCodeHint.text = @"点击上方设备码复制, 发送给开发者获取密钥";
+        self->_licenseCodeHint.textColor = [UIColor colorWithRed:0.72 green:0.73 blue:0.75 alpha:1.0];
+    });
+}
+
+// 激活: 本地重算比对(设备码派生密钥), 通过写 vc.plist —— mediaserverd
+// 0.15s 轮询下一拍自动拉起替换管线, 无需重启/重开相机
+- (void)licenseActivateTapped {
+    NSString *input = _licenseField.text;
+    BOOL ok = [VCamNotify vcamActivateLicense:input];
+    if (ok) {
+        [self refreshLicenseStatus];
+        [_licenseField resignFirstResponder];  // 收键盘
+        vcam_ball_log(@"[vcam][lic] activated OK (permanent)");
+    } else {
+        _licenseStatusLabel.text = @"密钥无效, 请核对后重试";
+        _licenseStatusLabel.textColor = [UIColor colorWithRed:0.95 green:0.40 blue:0.40 alpha:1.0];
+        vcam_ball_log(@"[vcam][lic] activate failed (mismatch)");
+    }
+}
+
+// 键盘 Done 收起
+- (BOOL)textFieldShouldReturn:(UITextField *)textField {
+    [textField resignFirstResponder];
+    return YES;
 }
 
 #pragma mark - 前后台切换
