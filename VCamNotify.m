@@ -1263,11 +1263,14 @@ static NSString *vcamPickCfgName(BOOL on) {
 // UICSI 函数指针(App 进程 UIKit 已加载, dlsym 直接命中)
 typedef CGImageRef (*VcamUICreateScreenImageFn)(void);
 
-// 进程内 UICSI 采样一拍: 截屏 → 21×21 crop → 分档匹配 → 写总线。
-// 返回色档 slot(0=熄灭)。在后台串行队列跑(UICSI ~3ms, 不占 App 主线程)。
-// 分档用内置门限(60/30) —— 色值映射在 md 端, App 无需 T 表。
-// 双通道发布: mmap 直写(每拍) + Darwin slot 通知(色档变化时, 沙盒保底)。
+// 进程内 UICSI 采样一拍: 截屏 → 全屏网格采样 → 分档匹配 → 写总线。
+// 1.3.68: 坐标通道全断(notify_set_state per-token 实锤 px=0, mmap 沙盒拒)
+// → 改全屏最强已知色扫描, 无坐标依赖。语义: App 内任何位置颜色跳动都打光
+// (对齐"无论在哪个 App 检测到颜色跳动就打光"); 取色点保留为视觉指示。
+// 阈值按比例: ≥12% 采样点同档才命中(防零散鲜艳 UI 元素误触发);
+// 满屏纯色图 ≈ 60%+ 命中。HSV 分档与共享算法同口径(60° 档, V/S 门限 60)。
 + (int)vcamAppSampleSlotAtX:(double)px Y:(double)py {
+    (void)px; (void)py;  // 1.3.68: 坐标不再使用(全屏扫描)
     VcamUICreateScreenImageFn capFn =
         (VcamUICreateScreenImageFn)dlsym(RTLD_DEFAULT, "UICreateScreenImage");
     if (!capFn) return 0;
@@ -1275,48 +1278,57 @@ typedef CGImageRef (*VcamUICreateScreenImageFn)(void);
     if (!full) return 0;
     size_t iw = CGImageGetWidth(full), ih = CGImageGetHeight(full);
     if (iw < 40 || ih < 40) { CFRelease(full); return 0; }
-    // 屏幕坐标 → 像素坐标(UICSI 输出与 UIScreen 同向, 按 bounds 等比)
-    CGRect sb = [UIScreen mainScreen].bounds;
-    double wx = (px > 0) ? px : sb.size.width / 2;
-    double wy = (py > 0) ? py : sb.size.height / 2;
-    int cxPx = (int)lround(wx * (double)iw / sb.size.width);
-    int cyPx = (int)lround(wy * (double)ih / sb.size.height);
-    const int S = 21;
-    cxPx = MAX(10, MIN((int)iw - 11, cxPx));
-    cyPx = MAX(10, MIN((int)ih - 11, cyPx));
+    // 全屏降采样: 缩到 32×64 网格(2048 采样点)
+    const int GW = 32, GH = 64;
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef bctx = CGBitmapContextCreate(NULL, GW, GH, 8, GW * 4, cs,
+                                              kCGBitmapByteOrder32Big | kCGImageAlphaPremultipliedLast);
     int bestIdx = -1;
-    int detCount = 0;
-    uint32_t avg = 0;
-    if (iw > (size_t)(cxPx + 11) && ih > (size_t)(cyPx + 11)) {
-        CGImageRef crop = CGImageCreateWithImageInRect(full,
-            CGRectMake(cxPx - 10, cyPx - 10, S, S));
-        if (crop) {
-            CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-            CGContextRef bctx = CGBitmapContextCreate(NULL, S, S, 8, S * 4, cs,
-                                                      kCGBitmapByteOrder32Big | kCGImageAlphaPremultipliedLast);
-            if (bctx) {
-                CGContextDrawImage(bctx, CGRectMake(0, 0, S, S), crop);
-                const uint8_t *rgba = (const uint8_t *)CGBitmapContextGetData(bctx);
-                if (rgba) {
-                    [self vcamMatchKnownLightShared:rgba n:S * S
-                        outBestIdx:&bestIdx outCount:&detCount outAvg:&avg];
-                }
-                CGContextRelease(bctx);
+    int bestCnt = 0;
+    if (bctx) {
+        CGContextSetInterpolationQuality(bctx, kCGInterpolationLow);
+        CGContextDrawImage(bctx, CGRectMake(0, 0, GW, GH), full);
+        const uint8_t *rgba = (const uint8_t *)CGBitmapContextGetData(bctx);
+        if (rgba) {
+            // HSV 分档计票(与 vcamMatchKnownLightShared 同口径, 阈值独立)
+            const int n = GW * GH;
+            int counts[6] = {0};
+            for (int i = 0; i < n; i++) {
+                int r = rgba[i * 4], g = rgba[i * 4 + 1], b = rgba[i * 4 + 2];
+                int maxc = MAX(MAX(r, g), b), minc = MIN(MIN(r, g), b);
+                int delta = maxc - minc;
+                if (maxc < 60 || delta < 60) continue;  // V/S 门限
+                double h;
+                if (maxc == r)      h = 60.0 * (double)(g - b) / (double)delta;
+                else if (maxc == g) h = 60.0 * (2.0 + (double)(b - r) / (double)delta);
+                else                h = 60.0 * (4.0 + (double)(r - g) / (double)delta);
+                if (h < 0) h += 360.0;
+                int idx;
+                if (h < 30.0 || h >= 330.0)      idx = 0;  // 红
+                else if (h < 90.0)               idx = 3;  // 黄
+                else if (h < 150.0)              idx = 1;  // 绿
+                else if (h < 210.0)              idx = 4;  // 青
+                else if (h < 270.0)              idx = 2;  // 蓝
+                else                             idx = 5;  // 紫
+                counts[idx]++;
             }
-            CGColorSpaceRelease(cs);
-            CFRelease(crop);
+            for (int k = 0; k < 6; k++) {
+                if (counts[k] > bestCnt) { bestCnt = counts[k]; bestIdx = k; }
+            }
+            // 比例阈值: <12% = 噪声(零散 UI 元素) → 不命中
+            if (bestCnt < n / 8) { bestIdx = -1; bestCnt = 0; }
         }
+        CGContextRelease(bctx);
     }
+    CGColorSpaceRelease(cs);
     CFRelease(full);
     int slot = (bestIdx >= 0 && bestIdx < 6) ? bestIdx + 1 : 0;
     // 通道A: mmap 直写(每拍, 时间戳保活; App 沙盒拒 mmap 时静默失败)
-    [self vcamPickPublishSlot:slot count:detCount avg:avg];
-    // 通道B: Darwin slot 通知(色档变化时 → SB relay 写总线)
-    static int sLastSlot = -2;
-    if (slot != sLastSlot) {
-        sLastSlot = slot;
-        [self vcamNotifyPickSlot:slot];
-    }
+    [self vcamPickPublishSlot:slot count:bestCnt avg:0];
+    // 通道B: Darwin slot 通知 —— 每拍 post(25Hz 心跳): relay 每次收到都写
+    // 总线刷新时间戳, 颜色稳定也能保活新鲜度(1s 窗口); 只变化时 post 会让
+    // 稳定色 1s 后"过期"→ md fallback 熄灭(1.3.68 修复)
+    [self vcamNotifyPickSlot:slot];
     return slot;
 }
 
