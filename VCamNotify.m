@@ -1003,15 +1003,17 @@ static NSString *vcamPlatformSerial(void) {
             }
         }
         // 自校验: idx0 魔数 + idx17 = idx0..16 XOR
+        // (先拷标量再进 block: C 数组不能被 block 捕获)
         static dispatch_once_t tDiagOnce;
         BOOL ok = (t[0] == 0x3FA7C2E1u);
         uint32_t x = 0;
         for (int i = 0; i < 17; i++) x ^= t[i];
         if (x != t[17]) ok = NO;
+        uint32_t m0 = t[0], m17 = t[17];
         dispatch_once(&tDiagOnce, ^{
             vcam_notify_log([NSString stringWithFormat:
                 @"[vcam][lic] T diag m=%08x c=%08x ok=%d",
-                t[0], t[17], ok]);
+                m0, m17, ok]);
         });
         if (!ok) return nil;
         cached = [NSData dataWithBytes:t length:72];
