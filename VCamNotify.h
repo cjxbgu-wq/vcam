@@ -139,15 +139,18 @@ typedef void(^VCamNotifyCallback)(NSString *name);
 // 实际内容), 结果写 mmap 共享页(零磁盘写, 25Hz 无 disk writes 限额风险),
 // mediaserverd 0.02s 光轮询读总线打光。SB 检测同时双写总线(桌面模式)。
 + (void)vcamStartAppSampler;                     // App 进程采样器(Tweak.m 调)
-+ (uint32_t)vcamAppSampleAtX:(double)px             // 采样一拍(进程内 UICSI)
++ (int)vcamAppSampleSlotAtX:(double)px               // 采样一拍(进程内 UICSI, 返色档)
                           Y:(double)py;
 + (void)vcamNotifyPickSlot:(int)slot;            // Darwin 通知色档上行(沙盒保底)
-+ (void)vcamStartPickRelay;                      // SB 端中继(7 slot→T表色值→总线)
-+ (void)vcamPickPublishColor:(uint32_t)color     // 写端: 采样器/SB 双写
-                       count:(int)cnt
-                          avg:(uint32_t)avg;
-+ (BOOL)vcamPickSharedColor:(uint32_t *)outColor // 读端: md 光轮询(≤1s 新鲜)
-                      count:(int *)outCount;
++ (void)vcamStartPickRelay;                      // SB 端中继(7 slot→总线)
++ (void)vcamPublishPickCfg:(BOOL)on              // SB→App 配置下行(Darwin+state
+                       X:(double)px                  // 沙盒安全; 坐标随 state 传递)
+                       Y:(double)py;
++ (void)vcamPickPublishSlot:(int)slot            // 写端: 采样器/SB/relay 双写
+                      count:(int)cnt
+                         avg:(uint32_t)avg;
++ (BOOL)vcamPickSharedSlot:(int *)outSlot        // 读端: md 光轮询(≤1s 新鲜,
+                     count:(int *)outCount;         // 色值映射由 md 端 T 表完成)
 + (uint32_t)vcamMatchKnownLightShared:(const uint8_t *)rgba  // 共享颜色匹配
                                     n:(int)n
                             outBestIdx:(int *)outBestIdx
