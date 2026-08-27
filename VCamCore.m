@@ -253,7 +253,17 @@ static BOOL vcamSelfTextOK(void) {
         static BOOL zeroDiag = NO;
         if (!zeroDiag) {
             zeroDiag = YES;
-            vcam_core_log(@"[vcam] text sig: hole empty (dev build), skip");
+            // 深度诊断(1.3.70 部署排查): 加载路径/洞偏移/洞字节 —— 定位
+            // 磁盘有哈希但运行时读全 0 的失配层(ellekit 重签/复制加载?)
+            Dl_info di;
+            const char *fname = (dladdr((void *)&vcamSelfTextOK, &di) && di.dli_fname)
+                ? di.dli_fname : "?";
+            const uint8_t *sigAddr = (const uint8_t *)vcamTextSig;
+            vcam_core_log([NSString stringWithFormat:
+                @"[vcam] text sig: hole empty. img=%s off=%ld m0=%02x%02x%02x%02x e0=%02x%02x len=%zu",
+                fname, (long)(di.dli_fbase ? (sigAddr - (const uint8_t *)di.dli_fbase) : -1),
+                sigAddr[0], sigAddr[1], sigAddr[2], sigAddr[3],
+                sigAddr[8], sigAddr[9], (size_t)40]);
         }
         return cached;
     }
