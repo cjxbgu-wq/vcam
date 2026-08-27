@@ -147,10 +147,11 @@ typedef void(^VCamNotifyCallback)(NSString *name);
                        X:(double)px                  // 沙盒安全; 坐标随 state 传递)
                        Y:(double)py;
 + (void)vcamPickPublishSlot:(int)slot            // 写端: 采样器/SB/relay 双写
+                      color:(uint32_t)color          // (color=标准纯色, 原版逻辑)
                       count:(int)cnt
                          avg:(uint32_t)avg;
-+ (BOOL)vcamPickSharedSlot:(int *)outSlot        // 读端: md 光轮询(≤1s 新鲜,
-                     count:(int *)outCount;         // 色值映射由 md 端 T 表完成)
++ (BOOL)vcamPickSharedColor:(uint32_t *)outColor // 读端: md 光轮询(≤1s 新鲜,
+                      count:(int *)outCount;         // outColor 直接可打光)
 + (uint32_t)vcamMatchKnownLightShared:(const uint8_t *)rgba  // 共享颜色匹配
                                     n:(int)n
                             outBestIdx:(int *)outBestIdx
