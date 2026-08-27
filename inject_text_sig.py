@@ -25,9 +25,10 @@ HOLE = 40
 
 
 def process_slice(data):
-    """thin slice: 找洞(__DATA) → __TEXT 全段哈希 → 写洞。
+    """thin slice: 找洞(__TEXT,__vcsig) → __TEXT 跳洞哈希 → 写洞。
     返回 (hole_off_in_slice, hash32)。
-    注意: Mach-O load commands 是小端(iOS dylib 实际字节序); fat 头是大端。"""
+    注意: Mach-O load commands 是小端(iOS dylib 实际字节序); fat 头是大端。
+    洞必须在 __TEXT 内(设备实锤: __DATA 洞被 dyld chained fixups 清零)。"""
     magic = struct.unpack("<I", data[:4])[0]
     assert magic == 0xFEEDFACF, "not little-endian arm64 Mach-O: 0x%x" % magic
     # __TEXT segment
@@ -45,13 +46,16 @@ def process_slice(data):
                 break
         p += cmdsize
     assert text_len > 0, "__TEXT segment not found"
-    # 洞定位(slice 全文搜索; 洞应在 __TEXT 之外 —— 断言防口径漂移)
+    # 洞定位(唯一性; 必须在 __TEXT 内)
     hole = data.find(MAGIC8)
     assert hole != -1, "sig hole magic not found"
     assert data.find(MAGIC8, hole + 1) == -1, "sig hole magic not unique"
-    assert hole >= text_len, "sig hole inside __TEXT (口径破坏): 0x%x vs text 0x%x" % (hole, text_len)
-    # 哈希: __TEXT 全段(洞不影响)
-    digest = hashlib.sha256(data[:text_len]).digest()
+    assert hole + HOLE <= text_len, "sig hole outside __TEXT: 0x%x > 0x%x" % (hole + HOLE, text_len)
+    # 哈希: __TEXT 跳洞(自引用消解 —— 与运行时 vcamSelfTextOK 口径一致)
+    h = hashlib.sha256()
+    h.update(data[:hole])
+    h.update(data[hole + HOLE:text_len])
+    digest = h.digest()
     # 写洞(魔数 8B 保持, 后 32B 写哈希)
     out = bytearray(data)
     out[hole + 8:hole + HOLE] = digest
