@@ -25,19 +25,20 @@ HOLE = 40
 
 
 def process_slice(data):
-    """thin slice: 找洞 → 算哈希 → 写洞。返回 (hole_off_in_slice, hash32)"""
-    magic = struct.unpack(">I", data[:4])[0]
-    assert magic in (0xFEEDFACF, 0xCFFAEDFE), "not arm64 Mach-O: 0x%x" % magic
+    """thin slice: 找洞 → 算哈希 → 写洞。返回 (hole_off_in_slice, hash32)
+    注意: Mach-O load commands 是小端(iOS dylib 实际字节序); fat 头是大端。"""
+    magic = struct.unpack("<I", data[:4])[0]
+    assert magic == 0xFEEDFACF, "not little-endian arm64 Mach-O: 0x%x" % magic
     # __TEXT segment
-    ncmds = struct.unpack(">I", data[16:20])[0]
+    ncmds = struct.unpack("<I", data[16:20])[0]
     p = 32
     text_len = 0
     for _ in range(ncmds):
-        cmd, cmdsize = struct.unpack(">II", data[p:p + 8])
+        cmd, cmdsize = struct.unpack("<II", data[p:p + 8])
         if cmd == 0x19:  # LC_SEGMENT_64
             segname = data[p + 8:p + 24].rstrip(b"\x00").decode()
             if segname == "__TEXT":
-                vmaddr, vmsize, fileoff, filesize = struct.unpack(">QQQQ", data[p + 24:p + 56])
+                vmaddr, vmsize, fileoff, filesize = struct.unpack("<QQQQ", data[p + 24:p + 56])
                 assert fileoff == 0, "__TEXT fileoff != 0, 口径破坏"
                 text_len = min(vmsize, filesize)
                 break
