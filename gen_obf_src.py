@@ -435,6 +435,13 @@ IDENT_RENAMES = {
     'vcam_log_budget_take': 'qzbt0',            # 全局符号(strip -x 不删外部符号)
     'activePlaybackPath': 'ap0x',               # 类方法名(plist 键字符串已加密, 不受影响)
     'setActivePlaybackPath': 'setAp0x',         # 对应 setter(大小写变体)
+    # 密钥验证(1.3.54): 类方法名含激活/设备语义, 改无意义名防逆向按元数据定位;
+    # 全部是直接调用(无 @selector/KVC 引用), 声明/实现/调用点统一替换
+    'vcamDeviceCode': 'qvDc',                   # 设备码
+    'vcamLicenseExpected': 'qvLe',              # 期望密钥派生
+    'vcamLicenseValid': 'qvLv',                 # 激活校验
+    'vcamActivateLicense': 'qvLa',              # 激活写入
+    'vcamPersistDeviceUUID': 'qvUu',            # UDID 回退 UUID 持久化
 }
 
 
