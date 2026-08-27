@@ -738,14 +738,30 @@ static NSString *vcamPlatformSerial(void) {
 // 伪造密钥(数学保证, 非混淆保证)
 + (BOOL)vcamLicenseVerifyBlob:(NSString *)blob {
     if (![blob isKindOfClass:[NSString class]]) return NO;
-    NSData *sig = [[NSData alloc] initWithBase64EncodedString:blob
+    // 1.3.63 方案A: blob v2 = base64(DER 签名) "." base64(T_enc 72B)。
+    // 旧格式(无 "." 段)fail-closed —— 验签消息升级为 设备码||T_enc
+    NSRange dot = [blob rangeOfString:@"."];
+    if (dot.location == NSNotFound || dot.location == 0 ||
+        dot.location + 1 >= blob.length) return NO;
+    NSData *sig = [[NSData alloc] initWithBase64EncodedString:
+        [blob substringToIndex:dot.location]
+        options:NSDataBase64DecodingIgnoreUnknownCharacters];
+    NSData *tEnc = [[NSData alloc] initWithBase64EncodedString:
+        [blob substringFromIndex:dot.location + 1]
         options:NSDataBase64DecodingIgnoreUnknownCharacters];
     // DER P-256 签名 = 0x30 开头的 SEQUENCE, 66~72 字节(r/s 前导零致不定长;
     // 此处只做快速 fail-closed, 真正解析由 SecKeyVerifySignature 完成)
     if (!sig || sig.length < 64 || sig.length > 72) return NO;
     if (((const uint8_t *)sig.bytes)[0] != 0x30) return NO;
-    NSData *msg = [[self vcamDeviceCode] dataUsingEncoding:NSUTF8StringEncoding];
-    if (msg.length != 16) return NO;
+    // T 表 = 18 × u32(BE) = 72 字节(gen_license.py T_TRUE 布局)
+    if (!tEnc || tEnc.length != 72) return NO;
+    NSString *dc = [self vcamDeviceCode];
+    if (dc.length != 16) return NO;
+    // 消息 = 设备码(16 ascii) || T_enc(签名覆盖参数密文, 篡改即验签失败)
+    NSMutableData *msg = [NSMutableData dataWithCapacity:16 + 72];
+    [msg appendData:[dc dataUsingEncoding:NSUTF8StringEncoding]];
+    [msg appendData:tEnc];
+    NSData *msgData = [msg copy];
 
     typedef CFTypeRef (*SecKeyCreateWithDataFn)(CFDataRef, CFDictionaryRef, void **);
     typedef BOOL (*SecKeyVerifySignatureFn)(CFTypeRef, CFStringRef, CFDataRef, CFDataRef, void **);
@@ -824,7 +840,7 @@ static NSString *vcamPlatformSerial(void) {
         keyOK = key != NULL;
         if (key) {
             sigOK = verifySig(key, sigAlg,
-                              (__bridge CFDataRef)msg, (__bridge CFDataRef)sig, NULL);
+                              (__bridge CFDataRef)msgData, (__bridge CFDataRef)sig, NULL);
             CFRelease(key);
         }
     }
@@ -891,6 +907,135 @@ static NSString *vcamPlatformSerial(void) {
     NSString *pub = dict[@"dcPub"];
     if (![pub isKindOfClass:[NSString class]] || pub.length != 16) return NO;
     return [pub isEqualToString:[self vcamDeviceCode]];
+}
+
+// ===== 1.3.63 方案A: 许可携带功能参数密文(T 表) =====
+// 验签不再是"开关"而是"钥匙": blob v2 的 T 段解密出打光颜色/HSV 门限/
+// 计票阈值/zoom/pan/旋转/羽化等真值 —— 跳过验证 = T 无来源 = 参数全垃圾
+// (画面数学错误, 非简单"不工作", 补丁者无从得知正确值)。
+// 链路(与 gen_license.py 严格一致):
+//   验签: SecKeyVerifySignature(公钥, 设备码||T_enc, DER 签名)
+//   K    = SHA256(设备码 16 ascii || T_SALT 16B)
+//   流    = SHA256(K||u32be(ctr)) 分块拼接(CTR 风格)
+//   T[i] = (T_enc_u32[i] ^ 流_u32[i]) ^ devHash32[i%8]
+//   devHash32 = SHA256(设备码) 前 32B 按 8×u32(BE)
+// 防抄许可: T_enc 加密端已预混签发设备的 devHash32, 本机再混自己值,
+// 他人许可在本机掺混后必为垃圾(魔数校验拦截)。
+// 返回 72 字节(18×u32 BE) 或 nil; 0.5s 节流缓存与 vcamLicenseValid 同拍。
++ (NSData *)vcamLicenseTable {
+    @synchronized ([VCamNotify class]) {
+        static NSData *cached = nil;
+        static double cachedAt = 0;
+        static BOOL hasCache = NO;
+        double now = [NSDate timeIntervalSinceReferenceDate];
+        if (hasCache && now - cachedAt < 0.5) return cached;
+        cached = nil;
+        cachedAt = now;
+        hasCache = YES;
+        NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath];
+        if (!dict) dict = [NSDictionary dictionaryWithContentsOfFile:VCamStateBackupPath];
+        NSString *blob = dict[@"licBlob"];
+        if (![blob isKindOfClass:[NSString class]] ||
+            ![self vcamLicenseVerifyBlob:blob]) return nil;
+        // 复用验签内部同款解析: sig 段(解 K 不需要) + T_enc 段
+        NSRange dot = [blob rangeOfString:@"."];
+        NSData *tEnc = [[NSData alloc] initWithBase64EncodedString:
+            [blob substringFromIndex:dot.location + 1]
+            options:NSDataBase64DecodingIgnoreUnknownCharacters];
+        if (tEnc.length != 72) return nil;
+        NSString *dc = [self vcamDeviceCode];
+        if (dc.length != 16) return nil;
+        NSData *dcData = [dc dataUsingEncoding:NSUTF8StringEncoding];
+
+        // CC_SHA256(可信解析, 与设备码同链路)
+        static vcamSHA256Fn sha = NULL;
+        static dispatch_once_t shaOnce;
+        dispatch_once(&shaOnce, ^{
+            sha = (vcamSHA256Fn)vcamDlsymTrusted("CC_SHA256");
+        });
+        if (!sha) return nil;
+
+        // T_SALT(构建期盐, hex 32 字符 → 16B; 与 gen_license.py 一致)。
+        // 局部变量(非 static): 混淆器把 C 字符串换成运行时解密调用,
+        // static const 初始化会因非常量初始化器编译失败(工程既有约束)
+        const char *saltHex = "7ecfba852c100ab4228ac14f062f737c";
+        uint8_t salt[16];
+        for (int i = 0; i < 16; i++) {
+            int hi = vcamHexDigit(saltHex[i * 2]);
+            int lo = vcamHexDigit(saltHex[i * 2 + 1]);
+            if (hi < 0 || lo < 0) return nil;
+            salt[i] = (uint8_t)((hi << 4) | lo);
+        }
+
+        // K = SHA256(设备码 || T_SALT)
+        uint8_t bufK[16 + 16];
+        memcpy(bufK, dcData.bytes, 16);
+        memcpy(bufK + 16, salt, 16);
+        uint8_t k[32];
+        sha(bufK, 32, k);
+
+        // devHash32 = SHA256(设备码) → 8×u32(BE)
+        uint8_t devHash[32];
+        sha(dcData.bytes, 16, devHash);
+        uint32_t dev32[8];
+        for (int i = 0; i < 8; i++) {
+            dev32[i] = ((uint32_t)devHash[i * 4] << 24) | ((uint32_t)devHash[i * 4 + 1] << 16) |
+                       ((uint32_t)devHash[i * 4 + 2] << 8) | (uint32_t)devHash[i * 4 + 3];
+        }
+
+        // 解密: t[i] = T_enc_u32[i] ^ 流_u32[i] ^ dev32[i%8]
+        const uint8_t *enc = (const uint8_t *)tEnc.bytes;
+        uint32_t t[18];
+        uint8_t ctr[32 + 4];
+        memcpy(ctr, k, 32);
+        for (int blk = 0; blk < 3; blk++) {  // 72B = 3 块 SHA256
+            ctr[32] = (uint8_t)(blk >> 24); ctr[33] = (uint8_t)(blk >> 16);
+            ctr[34] = (uint8_t)(blk >> 8);  ctr[35] = (uint8_t)blk;
+            uint8_t st[32];
+            sha(ctr, 36, st);
+            for (int j = 0; j < 6; j++) {  // 每块 6 × u32
+                int idx = blk * 6 + j;
+                uint32_t e = ((uint32_t)enc[idx * 4] << 24) | ((uint32_t)enc[idx * 4 + 1] << 16) |
+                             ((uint32_t)enc[idx * 4 + 2] << 8) | (uint32_t)enc[idx * 4 + 3];
+                uint32_t s = ((uint32_t)st[j * 4] << 24) | ((uint32_t)st[j * 4 + 1] << 16) |
+                             ((uint32_t)st[j * 4 + 2] << 8) | (uint32_t)st[j * 4 + 3];
+                t[idx] = e ^ s ^ dev32[idx % 8];
+            }
+        }
+        // 自校验: idx0 魔数 + idx17 = idx0..16 XOR
+        static dispatch_once_t tDiagOnce;
+        BOOL ok = (t[0] == 0x3FA7C2E1u);
+        uint32_t x = 0;
+        for (int i = 0; i < 17; i++) x ^= t[i];
+        if (x != t[17]) ok = NO;
+        dispatch_once(&tDiagOnce, ^{
+            vcam_notify_log([NSString stringWithFormat:
+                @"[vcam][lic] T diag m=%08x c=%08x ok=%d",
+                t[0], t[17], ok]);
+        });
+        if (!ok) return nil;
+        cached = [NSData dataWithBytes:t length:72];
+        return cached;
+    }
+}
+
+// T 表参数取值(u32 → double, ×100 定点): 消费端统一入口
++ (double)vcamLicenseTableDouble:(NSUInteger)idx {
+    NSData *t = [self vcamLicenseTable];
+    if (!t || idx > 17) return 0.0;
+    const uint8_t *b = (const uint8_t *)t.bytes + idx * 4;
+    uint32_t v = ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
+                 ((uint32_t)b[2] << 8) | (uint32_t)b[3];
+    return (double)v / 100.0;
+}
+
+// T 表参数取值(u32 原值): 颜色表/门限等整数参数
++ (uint32_t)vcamLicenseTableInt:(NSUInteger)idx {
+    NSData *t = [self vcamLicenseTable];
+    if (!t || idx > 17) return 0;
+    const uint8_t *b = (const uint8_t *)t.bytes + idx * 4;
+    return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
+           ((uint32_t)b[2] << 8) | (uint32_t)b[3];
 }
 
 @end
