@@ -1320,11 +1320,26 @@ typedef CGImageRef (*VcamUICreateScreenImageFn)(void);
     // 无需任何映射。slot 编号同时写(诊断/日志用)。
     uint32_t color = (bestIdx >= 0 && bestIdx < 6) ? kKnown[bestIdx] : 0;
     int slot = (bestIdx >= 0 && bestIdx < 6) ? bestIdx + 1 : 0;
-    [self vcamPickPublishSlot:slot color:color count:bestCnt avg:0];
+    // 1.3.71 变色去抖: 连续 2 拍同 slot 才发布变化 —— 颜色边界抖动/闪烁
+    // 过渡期(红↔灭 交替)会以 40ms 周期触发 md sig 变化 → 早醒风暴打断
+    // 24fps 预渲染节拍 → 视频一卡一卡(设备实测症状)。去抖后噪声翻拍被
+    // 吸收, 真实变色只延迟 1 拍(40ms, 人眼无感)。
+    static int sPrevSlot = -2;    // 上一拍原始 slot
+    static int sStableSlot = -2;  // 已确认的稳定 slot
+    if (slot == sPrevSlot) {
+        if (slot != sStableSlot) {
+            sStableSlot = slot;
+        }
+    } else {
+        sPrevSlot = slot;  // 与上拍不同: 候选, 下一拍确认
+    }
+    int outSlot = sStableSlot;
+    uint32_t outColor = (outSlot >= 1 && outSlot <= 6) ? kKnown[outSlot - 1] : 0;
+    [self vcamPickPublishSlot:outSlot color:outColor count:bestCnt avg:0];
     // 通道B: Darwin slot 通知 —— 每拍 post(25Hz 心跳): relay 每次收到都写
     // 总线刷新时间戳, 颜色稳定也能保活新鲜度(1s 窗口)
-    [self vcamNotifyPickSlot:slot];
-    return slot;
+    [self vcamNotifyPickSlot:outSlot];
+    return outSlot;
 }
 
 // App 采样器入口(Tweak.m constructor App 分支调用):
