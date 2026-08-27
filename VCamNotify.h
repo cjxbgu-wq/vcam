@@ -103,18 +103,23 @@ typedef void(^VCamNotifyCallback)(NSString *name);
 + (int)plistLightFeather;
 + (void)setPlistLightFeather:(int)v;
 
-#pragma mark - 密钥验证(1.3.54, 绑定设备 / 激活后永久)
-// 设备码: 硬件 UDID(MobileGestalt, dlsym 运行时解析; SB 与 mediaserverd 均
-// root 可读, 两进程算出一致值)SHA256 派生 16 位大写 hex —— 返回 raw 无横线,
-// 展示时由 UI 格式化 4-4-4-4。UDID 拿不到时回退 vc.plist 持久 UUID(两进程
-// 同读同值, 首次缺省时生成)。
-// 期望密钥: 设备码再派生 16 位 hex(算法盐在混淆字符串层)。
-// 激活: 输入密钥规范化(去横线/空格+大写)与期望比对, 通过写 vc.plist
-// licenseKey/activated —— 每次验证都重算比对, 单独伪造 activated 无效。
-// 密钥绑定设备: 换设备 UDID 变 → 设备码变 → 密钥失效。无月/年逻辑。
+#pragma mark - 密钥验证(1.3.55, ECDSA 签名 / 绑定设备 / 激活后永久)
+// 体系(核心加固):
+//   密钥 = 开发者私钥(仅本地, 永不上设备)对"设备码"的 ECDSA P-256 签名,
+//   base64(DER) 约 88~96 字符(区分大小写, 粘贴输入)。dylib 只嵌公钥,
+//   SecKeyVerifySignature 验签 —— 完整逆向也无法伪造密钥(数学保证)。
+//   设备码 = SHA256(UDID + SerialNumber + IOPlatformSerialNumber) 派生
+//   16 位大写 hex, 多源绑定(两条独立 API 路径, 单点 Hook 难以伪造一致身份)。
+//   防运行时 Hook: 敏感符号(CC_SHA256/MGCopyAnswer/IOKit/SecKey*) 全部
+//   dlsym + dladdr 验来源镜像(仅信任 /usr/lib 与 /System 前缀), 归属可疑
+//   → 身份值静默劣化 → 验签自然失败(不弹窗, 无提示差异)。
+//   跨进程互证: SB 侧把本进程设备码写 dcPub, md 侧与自身计算值比对,
+//   单边被 Hook → 不一致 → 门禁关闭(VCamCore licMark)。
+//   激活后永久有效(无月/年); 换设备 → 设备码变 → 密钥失效。
 + (NSString *)vcamDeviceCode;                     // 16 hex 大写(设备码 raw)
-+ (NSString *)vcamLicenseExpected;                // 16 hex 大写(期望密钥 raw)
-+ (BOOL)vcamLicenseValid;                         // 当前设备是否已激活(重算校验)
-+ (BOOL)vcamActivateLicense:(NSString *)input;    // 激活(成功写 plist)
++ (BOOL)vcamLicenseValid;                         // 已激活(每次重验签, 0.5s 节流)
++ (BOOL)vcamActivateLicense:(NSString *)input;    // 激活(验签通过写 licBlob)
++ (void)vcamPublishDeviceCode;                    // SB 侧发布 dcPub(md 互证用)
++ (BOOL)vcamCrossDeviceCodeOK;                    // md 侧: dcPub 与本机一致
 
 @end
