@@ -538,12 +538,15 @@ static void *vcamSecImg(void) {
     return img;
 }
 
-// 镜像扫描兜底(1.3.59): 两个较新常量(kSecAttrKeyTypeECSECPrime256 /
-// kSecSignatureAlgorithmECDSASignatureMessageX963SHA256)实测(d=..0..0)
-// 不在 Security 主镜像与全局搜索域 —— tapi 闭包子镜像持有它们。遍历进程
+// 镜像扫描兜底(1.3.59): 符号不在 dlopen 句柄/全局搜索域时, 遍历进程
 // 已加载的 /System /usr/lib 镜像(RTLD_NOLOAD 现成句柄)逐个 dlsym, 找到后
 // 照走 dladdr 信任校验。_dyld_* 在 libdyld(/usr/lib/system), 与已实证可
 // 解析的 MGCopyAnswer/IOKit 同机制。
+// (1.3.60 根因实锤, 依据 iOS 15.6 SDK 头文件: 1.3.55~59 的 d=..0..0 并非
+// 镜像问题, 是符号名错 —— kSecAttrKeyTypeECSECPrime256 是 macOS-only 常量
+// (SecItem.h 标 ios NA), iOS 的 EC key type 真名是 kSecAttrKeyTypeECSECPrimeRandom;
+// 算法常量真名是 kSecKeyAlgorithmECDSASignatureMessageX962SHA256(kSecKeyAlgorithm*
+// 前缀 + X962, iOS 无 kSecSignatureAlgorithm* 旧 macOS 枚举符号)。已修正。)
 static void *vcamScanImagesFor(const char *name) {
     typedef uint32_t (*ImgCountFn)(void);
     typedef const char *(*ImgNameFn)(uint32_t);
@@ -726,7 +729,10 @@ static NSString *vcamPlatformSerial(void) {
 }
 
 // ==== ECDSA P-256 验签(全 dlsym, 符号不进符号表) ====
-// 消息 = 本机设备码原文(16 hex 大写); 签名 = base64(DER) blob(~88 字符);
+// 消息 = 本机设备码原文(16 hex 大写); 签名 = base64(DER x9.62) blob(~96 字符)。
+// (1.3.60: iOS 的 kSecKeyAlgorithmECDSASignatureMessageX962SHA256 要求 DER
+// 编码签名(SEQUENCE of r,s); 1.3.56 改的 raw r||s 64B 是按 macOS 文档臆断
+// 的格式, iOS 验签必失败 —— gen_license.py 已同步改回 DER 输出)
 // 公钥 = X9.63 未压缩 65 字节(hex 嵌入, 混淆字符串层加密)。
 // 私钥仅存在于开发机 license_priv.pem, 永不上设备 —— 逆向再彻底也无法
 // 伪造密钥(数学保证, 非混淆保证)
@@ -734,8 +740,10 @@ static NSString *vcamPlatformSerial(void) {
     if (![blob isKindOfClass:[NSString class]]) return NO;
     NSData *sig = [[NSData alloc] initWithBase64EncodedString:blob
         options:NSDataBase64DecodingIgnoreUnknownCharacters];
-    // X963 P-256 签名 = r||s 各 32 字节, 定长 64(1.3.56 收紧, fail-closed)
-    if (!sig || sig.length != 64) return NO;
+    // DER P-256 签名 = 0x30 开头的 SEQUENCE, 66~72 字节(r/s 前导零致不定长;
+    // 此处只做快速 fail-closed, 真正解析由 SecKeyVerifySignature 完成)
+    if (!sig || sig.length < 64 || sig.length > 72) return NO;
+    if (((const uint8_t *)sig.bytes)[0] != 0x30) return NO;
     NSData *msg = [[self vcamDeviceCode] dataUsingEncoding:NSUTF8StringEncoding];
     if (msg.length != 16) return NO;
 
@@ -751,7 +759,7 @@ static NSString *vcamPlatformSerial(void) {
         int dg[8];
         createKey  = (SecKeyCreateWithDataFn)vcamSecSymX(img, "SecKeyCreateWithData", &dg[0]);
         verifySig  = (SecKeyVerifySignatureFn)vcamSecSymX(img, "SecKeyVerifySignature", &dg[1]);
-        // kSecAttr*/kSecSignature* 是 const CFStringRef 指针常量: dlsym 返回的是
+        // kSecAttr*/kSecKeyAlgorithm* 是 const CFStringRef 指针常量: dlsym 返回的是
         // "存放该指针的变量"的地址, 须再解一层引用(*slot)取真正的 CFStringRef 值。
         // (1.3.55 激活失败设备端根因: 直接把符号地址当 CFStringRef 用 → 属性
         //  字典键全错 → SecKeyCreateWithData 建钥失败 → 验签永远 NO)
@@ -762,11 +770,11 @@ static NSString *vcamPlatformSerial(void) {
         attrClass = slot ? *slot : NULL;
         slot      = (CFStringRef *)vcamSecSymX(img, "kSecAttrKeySizeInBits", &dg[4]);
         attrSize  = slot ? *slot : NULL;
-        slot      = (CFStringRef *)vcamSecSymX(img, "kSecAttrKeyTypeECSECPrime256", &dg[5]);
+        slot      = (CFStringRef *)vcamSecSymX(img, "kSecAttrKeyTypeECSECPrimeRandom", &dg[5]);
         keyTypeEC = slot ? *slot : NULL;
         slot      = (CFStringRef *)vcamSecSymX(img, "kSecAttrKeyClassPublic", &dg[6]);
         keyClassPub = slot ? *slot : NULL;
-        slot      = (CFStringRef *)vcamSecSymX(img, "kSecSignatureAlgorithmECDSASignatureMessageX963SHA256", &dg[7]);
+        slot      = (CFStringRef *)vcamSecSymX(img, "kSecKeyAlgorithmECDSASignatureMessageX962SHA256", &dg[7]);
         sigAlg    = slot ? *slot : NULL;
         // 单行诊断: img=句柄, d=8 符号各自 0/1/2 (见 vcamSecSymX)
         vcam_notify_log([NSString stringWithFormat:
