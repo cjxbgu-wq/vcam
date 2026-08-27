@@ -1831,9 +1831,10 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
 
     // 三色打光快速轮询(1.3.45→1.3.49 提频): 0.02s 节拍(50Hz)同步打光 7 键到
     // gpuProcessor。延迟链: 悬浮球检测(自适应 0.02/0.04s) → 写 plist → 本轮询
-    // ≤0.02s → 变化时 signal 预渲染早醒信号量 → 立即重产出当前帧(新光斑)
-    // → render。相比 1.3.45: 轮询相位延迟 20ms→10ms, 预渲染等待下一拍
-    // (最坏 41ms@24fps) → 即时出拍。plist 读 ~0.15ms, 50Hz ≈ 0.75% 单核
+    // ≤0.02s → gpuProcessor 参数即时生效 → 下一预渲染节拍(≤41.6ms@24fps)
+    // 烘焙新光斑 → render。1.3.72: 早醒已移除(变色早醒 → 解码队列积压 +
+    // FIFO 限深丢帧 = 卡顿根因), 光斑延迟 = 下一节拍, 人眼无感。
+    // plist 读 ~0.15ms, 50Hz ≈ 0.75% 单核
     [[VCamNotify sharedInstance] startLightPollingWithInterval:0.02 callback:^(NSDictionary *pl) {
         VCamCore *strongSelf = weakSelf;
         if (!strongSelf) return;
@@ -1872,21 +1873,14 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
             strongSelf.gpuProcessor.lightDiameter = lDia;
             strongSelf.gpuProcessor.lightFeather = lFea;
             lastLightSig = sig;
-            // 1.3.49 早醒: 光色/参数变化 → 立即唤醒预渲染线程重产出当前帧,
-            // 不等下一节拍(24fps 下最坏 41ms) —— 光斑跟手的最后一段延迟消除。
-            // 1.3.71 节流: 变色期高频 sig 翻转(红↔灭 40ms 周期)会以早醒风暴
-            // 打断 24fps 预渲染节拍 → 视频一卡一卡; 最小间隔 120ms 限制
-            // 重渲染频率(光斑变色延迟人眼无感, 帧率稳定优先 —— 帧率稳定
-            // 是硬性验收标准)
-            static double lastWakeAt = 0;
-            double nowWake = CFAbsoluteTimeGetCurrent();
-            if (nowWake - lastWakeAt > 0.12) {
-                lastWakeAt = nowWake;
-                strongSelf->_prerenderWakeEarly = YES;
-                if (strongSelf->_prerenderWakeSem) {
-                    dispatch_semaphore_signal(strongSelf->_prerenderWakeSem);
-                }
-            }
+            // 1.3.72 早醒彻底移除: 1.3.71 节流后仍卡 —— 早醒拍不消费解码队列
+            // → 队列积压 +1 → 下拍 FIFO 限深(>1 丢最旧)跳帧 + 早醒拍整帧重
+            // 渲染(旋转VT+memcpy+光斑+烘焙 ≈ 1 帧间隔)挤占节拍 → 每次变色
+            // = 丢帧+节拍错位 = 一卡一卡。根修: 光色变化不再唤醒预渲染线程,
+            // 由下一正常节拍(≤41.6ms@24fps)自然烘焙新光斑 —— 检测去抖本身
+            // 已 40ms 延迟, 此延迟人眼无感; 帧率节拍零扰动、零跳帧(帧率
+            // 稳定是硬性验收标准)。semaphore 保留无人 signal = 纯超时等待,
+            // 行为等同 sleep, 零风险。
             vcam_core_log([NSString stringWithFormat:
                 @"[vcam] light synced: on=%d color=0x%06x pos(%d,%d) int=%d dia=%d fea=%d",
                 (int)lEnabled, lColor, lX, lY, lInt, lDia, lFea]);
