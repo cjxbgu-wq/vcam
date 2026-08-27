@@ -450,18 +450,16 @@ IDENT_RENAMES = {
     'vcamLicenseTableDouble': 'qvTd',           # 类方法: T 表定点参数取值
     'vcamLicenseTableInt': 'qvTi',              # 类方法: T 表整数参数取值
     'vcamLicenseTable': 'qvTa',                 # 类方法: T 表解密(72B)
-    'vcamFillT': 'qvFt',                        # C static(VCamFloatingBall.m): T 快照
     # 1.3.65 取色采样器: 采样/共享总线方法名(含检测语义)
     'vcamStartAppSampler': 'qvSa',              # 类方法: App 采样器入口
     'vcamAppSampleSlotAtX': 'qvAp',             # 类方法: 采样一拍(返色档)
     'vcamNotifyPickSlot': 'qvNp',               # 类方法: Darwin slot 上行
     'vcamStartPickRelay': 'qvSr',               # 类方法: SB 中继
     'vcamPublishPickCfg': 'qvPc',               # 类方法: 配置下行(Darwin+state)
-    'vcamPickPublishSlot': 'qvPb',              # 类方法: 总线写端(slot)
-    'vcamPickSharedSlot': 'qvRd',               # 类方法: 总线读端(slot)
+    'vcamPickPublishSlot': 'qvPb',              # 类方法: 总线写端(slot+color)
+    'vcamPickSharedColor': 'qvRd',              # 类方法: 总线读端(色值直用)
     'vcamMatchKnownLightShared': 'qvMk',        # 类方法: 共享颜色匹配
     'vcamMatchKnownLight': 'qvMl',              # C static(VCamFloatingBall.m): name 外壳
-    'vcamSlotPreviewColor': 'qzSp',             # C static(VCamFloatingBall.m): 档位预览色
     'vcamPickShmMap': 'qzSm',                   # C static(VCamNotify.m): mmap 映射
     'vcamPickSlotName': 'qzPn',                 # C static(VCamNotify.m): slot 通知名
     'vcamPickCfgName': 'qzCn',                  # C static(VCamNotify.m): cfg 通知名
