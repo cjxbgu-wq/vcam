@@ -8,6 +8,7 @@
 
 #import "VCamNotify.h"
 #include <dlfcn.h>
+#include <string.h>
 
 NSString *const VCamNotifyReloadMedia = @"com.vcam.ios.media.reload";
 NSString *const VCamNotifyLiveChanged = @"com.vcam.ios.live.changed";
@@ -483,23 +484,33 @@ static void vcam_darwin_callback(CFNotificationCenterRef center, void *observer,
     [dict writeToFile:VCamPlistPath atomically:YES];
 }
 
-#pragma mark - 密钥验证(1.3.54, 绑定设备 / 激活后永久)
+#pragma mark - 密钥验证(1.3.55, ECDSA P-256 设备绑定签名 / 激活后永久)
 
-// CommonCrypto SHA256 运行时解析(符号在 libSystem): dlsym 直取, 符号不进
-// 二进制符号表 —— 与 MobileGestalt 同策略, 防逆向按符号定位算法入口
-typedef unsigned char *(*vcamSHA256Fn)(const void *, unsigned int, unsigned char *);
-static vcamSHA256Fn vcamSHA256Resolve(void) {
-    static vcamSHA256Fn fn = NULL;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        fn = (vcamSHA256Fn)dlsym(RTLD_DEFAULT, "CC_SHA256");
-    });
-    return fn;
+// ==== 可信符号解析(防 rebind/interpose Hook) ====
+// dlsym + dladdr 双重校验: 符号必须解析自系统镜像(/usr/lib 或 /System 前缀)。
+// 越狱注入的第三方 dylib 全在 /var/jb / /Library 等路径下 —— 符号被 rebind
+// 到攻击者镜像时 dli_fname 不在信任前缀 → 返回 NULL。调用方随之走"身份值
+// 劣化"路径(静默): 设备码变垃圾/拿不到硬件源 → md 侧验签自然失败。
+// (注: 对内联补丁式 Hook 由 VCamCore 的 IMP 范围自检 + 帧门禁周期重算兜底)
+static void *vcamDlsymTrusted(const char *name) {
+    void *p = dlsym(RTLD_DEFAULT, name);
+    if (!p) return NULL;
+    Dl_info info;
+    if (dladdr(p, &info) == 0 || !info.dli_fname) return NULL;
+    const char *fn = info.dli_fname;
+    if (strncmp(fn, "/usr/lib", 8) == 0 || strncmp(fn, "/System", 7) == 0) return p;
+    vcam_notify_log(@"[vcam][lic] untrusted sym src");
+    return NULL;
 }
 
-// SHA256(源) 前 8 字节 → 16 位大写 hex NSString(raw, 无横线; 展示分组由 UI 做)
+// SHA256(源) 前 8 字节 → 16 位大写 hex NSString(设备码口径, 展示分组由 UI 做)
+typedef unsigned char *(*vcamSHA256Fn)(const void *, unsigned int, unsigned char *);
 static NSString *vcamDigestHex16(NSString *src) {
-    vcamSHA256Fn sha = vcamSHA256Resolve();
+    static vcamSHA256Fn sha = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        sha = (vcamSHA256Fn)vcamDlsymTrusted("CC_SHA256");
+    });
     if (!sha || src.length == 0) return nil;
     NSData *d = [src dataUsingEncoding:NSUTF8StringEncoding];
     if (!d) return nil;
@@ -515,19 +526,63 @@ static NSString *vcamDigestHex16(NSString *src) {
     return [NSString stringWithUTF8String:hex];
 }
 
-// 密钥输入规范化: 去横线/空格, 大写(接受 4-4-4-4 分组或连写输入)
-static NSString *vcamLicenseNormalize(NSString *input) {
-    if (![input isKindOfClass:[NSString class]]) return @"";
-    NSMutableString *s = [input mutableCopy];
-    [s replaceOccurrencesOfString:@"-" withString:@"" options:NSLiteralSearch
-                            range:NSMakeRange(0, s.length)];
-    [s replaceOccurrencesOfString:@" " withString:@"" options:NSLiteralSearch
-                            range:NSMakeRange(0, s.length)];
-    return [s uppercaseString];
+// hex 单字符 → 数值(非法返回 -1)
+static int vcamHexDigit(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
 }
 
-// UDID 不可用时回退: plist 持久 UUID(两进程同读同值; 首次缺省生成并写回,
-// 原子写双路径与既有 setter 一致 —— SFTP/plist 并发教训)
+// MobileGestalt(可信任源解析)
+typedef CFStringRef (*vcamMGCopyAnswerFn)(CFStringRef);
+static vcamMGCopyAnswerFn vcamMGResolve(void) {
+    static vcamMGCopyAnswerFn fn = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        fn = (vcamMGCopyAnswerFn)vcamDlsymTrusted("MGCopyAnswer");
+    });
+    return fn;
+}
+
+// IOKit 平台序列号: 与 MobileGestalt 完全独立的第二条身份 API 路径。
+// 类型按框架 ABI 手工声明(iOS 公开 SDK 不带 IOKit 用户头);
+// kIOMasterPortDefault == 0 直传
+static NSString *vcamPlatformSerial(void) {
+    static NSString *serial = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        typedef uint32_t vcamIOObj;
+        typedef CFMutableDictionaryRef (*IOServiceMatchingFn)(const char *);
+        typedef vcamIOObj (*IOServiceGetMatchingServiceFn)(uint32_t, CFDictionaryRef);
+        typedef CFTypeRef (*IORegistryEntryCreateCFPropertyFn)(vcamIOObj, CFStringRef, CFAllocatorRef, uint32_t);
+        typedef int (*IOObjectReleaseFn)(vcamIOObj);
+        IOServiceMatchingFn matching =
+            (IOServiceMatchingFn)vcamDlsymTrusted("IOServiceMatching");
+        IOServiceGetMatchingServiceFn getsvc =
+            (IOServiceGetMatchingServiceFn)vcamDlsymTrusted("IOServiceGetMatchingService");
+        IORegistryEntryCreateCFPropertyFn getprop =
+            (IORegistryEntryCreateCFPropertyFn)vcamDlsymTrusted("IORegistryEntryCreateCFProperty");
+        IOObjectReleaseFn release =
+            (IOObjectReleaseFn)vcamDlsymTrusted("IOObjectRelease");
+        if (!matching || !getsvc || !getprop || !release) return;
+        NSString *svc = @"IOPlatformExpertDevice";
+        vcamIOObj entry = getsvc(0, matching([svc UTF8String]));
+        if (entry) {
+            CFTypeRef v = getprop(entry, CFSTR("IOPlatformSerialNumber"),
+                                  kCFAllocatorDefault, 0);
+            if (v && CFGetTypeID(v) == CFStringGetTypeID()) {
+                serial = [NSString stringWithString:(__bridge NSString *)v];
+            }
+            if (v) CFRelease(v);
+            release(entry);
+        }
+    });
+    return serial;
+}
+
+// UDID/硬件源不可用时回退: plist 持久 UUID(两进程同读同值; 首次缺省生成并
+// 写回, 原子写双路径与既有 setter 一致)
 + (NSString *)vcamPersistDeviceUUID {
     NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath];
     NSString *uuid = dict[@"deviceUUID"];
@@ -540,68 +595,176 @@ static NSString *vcamLicenseNormalize(NSString *input) {
     return uuid;
 }
 
-// 设备码(静态缓存): MobileGestalt UDID 优先(真实硬件唯一标识, 换设备必变),
-// 回退 plist UUID。logEnabled 时打印设备码与来源类型便于跨进程一致性诊断
-// (SB 与 mediaserverd 算出的设备码必须一致, 否则激活在 md 侧不生效)
+// 设备码(静态缓存, 多源绑定): UDID + SerialNumber(MobileGestalt) +
+// IOPlatformSerialNumber(IOKit) 混入 SHA256 —— 两条独立 API 路径, 单点
+// Hook 难以在 SB/md 两进程伪造一致的假身份。硬件源全不可用时回退 plist
+// UUID(仅同机一致, 换机必变)。logEnabled 时打印设备码与源可用性, 用于
+// 跨进程一致性诊断(SB 与 md 必须算出同值, 否则激活在 md 侧不生效)
 + (NSString *)vcamDeviceCode {
     static NSString *code = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        NSString *deviceID = nil;
-        BOOL fromUDID = NO;
-        typedef CFStringRef (*MGCopyAnswerFn)(CFStringRef);
-        MGCopyAnswerFn mg = (MGCopyAnswerFn)dlsym(RTLD_DEFAULT, "MGCopyAnswer");
+        NSMutableString *mix = [NSMutableString stringWithString:@"QvD|"];
+        vcamMGCopyAnswerFn mg = vcamMGResolve();
+        BOOL gotHW = NO;
         if (mg) {
             CFStringRef udid = mg(CFSTR("UniqueDeviceID"));
             if (udid) {
-                deviceID = [NSString stringWithString:(__bridge NSString *)udid];
+                [mix appendString:(__bridge NSString *)udid];
                 CFRelease(udid);
-                fromUDID = YES;
+                gotHW = YES;
+            }
+            [mix appendString:@"|S|"];
+            CFStringRef serial = mg(CFSTR("SerialNumber"));
+            if (serial) {
+                [mix appendString:(__bridge NSString *)serial];
+                CFRelease(serial);
+                gotHW = YES;
             }
         }
-        if (deviceID.length == 0) {
-            deviceID = [self vcamPersistDeviceUUID];
+        [mix appendString:@"|P|"];
+        NSString *platformSerial = vcamPlatformSerial();
+        if (platformSerial.length > 0) {
+            [mix appendString:platformSerial];
+            gotHW = YES;
         }
-        code = vcamDigestHex16([@"QvD|" stringByAppendingString:deviceID]);
+        if (!gotHW) {
+            [mix appendString:[self vcamPersistDeviceUUID]];
+        }
+        code = vcamDigestHex16(mix);
         vcam_notify_log([NSString stringWithFormat:
-            @"[vcam][lic] device code %@ (src=%@)",
-            code, fromUDID ? @"udid" : @"uuid"]);
+            @"[vcam][lic] device code %@ (mg=%d io=%d)",
+            code, mg != NULL, platformSerial.length > 0]);
     });
     return code;
 }
 
-// 期望密钥(静态缓存, 静态值仅本进程内存 —— 比对口径与设备码一致 raw 16 hex)
-+ (NSString *)vcamLicenseExpected {
-    static NSString *key = nil;
+// ==== ECDSA P-256 验签(全 dlsym, 符号不进符号表) ====
+// 消息 = 本机设备码原文(16 hex 大写); 签名 = base64(DER) blob(~88 字符);
+// 公钥 = X9.63 未压缩 65 字节(hex 嵌入, 混淆字符串层加密)。
+// 私钥仅存在于开发机 license_priv.pem, 永不上设备 —— 逆向再彻底也无法
+// 伪造密钥(数学保证, 非混淆保证)
++ (BOOL)vcamLicenseVerifyBlob:(NSString *)blob {
+    if (![blob isKindOfClass:[NSString class]]) return NO;
+    NSData *sig = [[NSData alloc] initWithBase64EncodedString:blob
+        options:NSDataBase64DecodingIgnoreUnknownCharacters];
+    if (!sig || sig.length < 8 || sig.length > 80) return NO;
+    NSData *msg = [[self vcamDeviceCode] dataUsingEncoding:NSUTF8StringEncoding];
+    if (msg.length != 16) return NO;
+
+    typedef CFTypeRef (*SecKeyCreateWithDataFn)(CFDataRef, CFDictionaryRef, void **);
+    typedef BOOL (*SecKeyVerifySignatureFn)(CFTypeRef, CFStringRef, CFDataRef, CFDataRef, void **);
+    static SecKeyCreateWithDataFn createKey = NULL;
+    static SecKeyVerifySignatureFn verifySig = NULL;
+    static CFStringRef attrType = NULL, attrClass = NULL, attrSize = NULL;
+    static CFStringRef keyTypeEC = NULL, keyClassPub = NULL, sigAlg = NULL;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        key = vcamDigestHex16([@"QvL|" stringByAppendingString:[self vcamDeviceCode]]);
+        createKey  = (SecKeyCreateWithDataFn)vcamDlsymTrusted("SecKeyCreateWithData");
+        verifySig  = (SecKeyVerifySignatureFn)vcamDlsymTrusted("SecKeyVerifySignature");
+        attrType   = (CFStringRef)vcamDlsymTrusted("kSecAttrKeyType");
+        attrClass  = (CFStringRef)vcamDlsymTrusted("kSecAttrKeyClass");
+        attrSize   = (CFStringRef)vcamDlsymTrusted("kSecAttrKeySizeInBits");
+        keyTypeEC  = (CFStringRef)vcamDlsymTrusted("kSecAttrKeyTypeECSECPrime256");
+        keyClassPub= (CFStringRef)vcamDlsymTrusted("kSecAttrKeyClassPublic");
+        sigAlg     = (CFStringRef)vcamDlsymTrusted("kSecSignatureAlgorithmECDSASignatureMessageX963SHA256");
+        if (!createKey || !verifySig || !attrType || !attrClass || !attrSize ||
+            !keyTypeEC || !keyClassPub || !sigAlg) {
+            vcam_notify_log(@"[vcam][lic] sec syms missing");
+        }
     });
-    return key;
+    if (!createKey || !verifySig || !attrType || !attrClass || !attrSize ||
+        !keyTypeEC || !keyClassPub || !sigAlg) return NO;
+
+    // 公钥 hex → 65 字节未压缩点(静态缓存)
+    static NSData *pubKeyData = nil;
+    static dispatch_once_t pubOnce;
+    dispatch_once(&pubOnce, ^{
+        NSString *pubHex = @"047ac82d0d8ba9e315bebf8ebdb1c6a8065b4156f9a5839fd2ba92082081a10fa67972526b49606266b25d87911b5b707838390d4ce3eef81039e986da6cd58cd6";
+        if ([pubHex length] != 130) return;
+        const char *hex = [pubHex UTF8String];
+        NSMutableData *d = [NSMutableData dataWithLength:65];
+        uint8_t *b = (uint8_t *)d.mutableBytes;
+        for (int i = 0; i < 65; i++) {
+            int hi = vcamHexDigit(hex[i * 2]);
+            int lo = vcamHexDigit(hex[i * 2 + 1]);
+            if (hi < 0 || lo < 0) return;
+            b[i] = (uint8_t)((hi << 4) | lo);
+        }
+        pubKeyData = [d copy];
+    });
+    if (pubKeyData.length != 65) return NO;
+
+    int bits = 256;
+    CFNumberRef sizeNum = CFNumberCreate(NULL, kCFNumberIntType, &bits);
+    const void *dk[3] = { attrType, attrClass, attrSize };
+    const void *dv[3] = { keyTypeEC, keyClassPub, sizeNum };
+    CFDictionaryRef attrs = CFDictionaryCreate(NULL, dk, dv, 3,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CFTypeRef key = attrs ? createKey((__bridge CFDataRef)pubKeyData, attrs, NULL) : NULL;
+    if (attrs) CFRelease(attrs);
+    if (sizeNum) CFRelease(sizeNum);
+    if (!key) return NO;
+    BOOL ok = verifySig(key, sigAlg,
+                        (__bridge CFDataRef)msg, (__bridge CFDataRef)sig, NULL);
+    CFRelease(key);
+    return ok;
 }
 
-// 已激活: plist licenseKey 存储值 == 本机重算期望(每次重算, 伪造 plist 无效)
+// 已激活: plist licBlob 对本机设备码验签通过。0.5s 节流缓存(ECDSA ~1ms,
+// 0.15s 轮询全验签无必要; 激活写入后 0.5s 内过期重验, md 下一拍生效)
 + (BOOL)vcamLicenseValid {
-    NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath];
-    if (!dict) dict = [NSDictionary dictionaryWithContentsOfFile:VCamStateBackupPath];
-    NSString *stored = dict[@"licenseKey"];
-    if (![stored isKindOfClass:[NSString class]] || stored.length != 16) return NO;
-    return [stored isEqualToString:[self vcamLicenseExpected]];
+    @synchronized ([VCamNotify class]) {
+        static BOOL cached = NO;
+        static double cachedAt = 0;
+        static BOOL hasCache = NO;
+        double now = [NSDate timeIntervalSinceReferenceDate];
+        if (hasCache && now - cachedAt < 0.5) return cached;
+        NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath];
+        if (!dict) dict = [NSDictionary dictionaryWithContentsOfFile:VCamStateBackupPath];
+        NSString *blob = dict[@"licBlob"];
+        cached = [blob isKindOfClass:[NSString class]] && [self vcamLicenseVerifyBlob:blob];
+        cachedAt = now;
+        hasCache = YES;
+        return cached;
+    }
 }
 
-// 激活: 规范化输入比对期望, 通过写 licenseKey(规范化 16 hex)+activated。
-// mediaserverd 0.15s 轮询下一拍即生效(licGate→effEnabled), 无需额外通知
+// 激活: 输入密钥(base64, 区分大小写, 仅去空白/换行)验签通过 → 写
+// licBlob/activated/dcPub。mediaserverd 0.15s 轮询下一拍即生效
 + (BOOL)vcamActivateLicense:(NSString *)input {
-    NSString *norm = vcamLicenseNormalize(input);
-    if (norm.length != 16) return NO;
-    if (![norm isEqualToString:[self vcamLicenseExpected]]) return NO;
+    if (![input isKindOfClass:[NSString class]]) return NO;
+    NSString *blob = [[input componentsSeparatedByCharactersInSet:
+        [NSCharacterSet whitespaceAndNewlineCharacterSet]]
+        componentsJoinedByString:@""];
+    if (![self vcamLicenseVerifyBlob:blob]) return NO;
     NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithDictionary:
         [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath] ?: @{}];
-    dict[@"licenseKey"] = norm;
+    dict[@"licBlob"] = blob;
     dict[@"activated"] = @YES;
+    dict[@"dcPub"] = [self vcamDeviceCode];
     [dict writeToFile:VCamPlistPath atomically:YES];
     [dict writeToFile:VCamStateBackupPath atomically:YES];
     return YES;
+}
+
+// SB 侧发布本进程设备码(打开激活页/激活成功时调用) → md 侧互证
++ (void)vcamPublishDeviceCode {
+    NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithDictionary:
+        [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath] ?: @{}];
+    dict[@"dcPub"] = [self vcamDeviceCode];
+    [dict writeToFile:VCamPlistPath atomically:YES];
+    [dict writeToFile:VCamStateBackupPath atomically:YES];
+}
+
+// md 侧跨进程互证: SB 发布的 dcPub 与本机计算值一致(单边被 Hook →
+// 不一致 → VCamCore licMark 关门禁)
++ (BOOL)vcamCrossDeviceCodeOK {
+    NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath];
+    if (!dict) dict = [NSDictionary dictionaryWithContentsOfFile:VCamStateBackupPath];
+    NSString *pub = dict[@"dcPub"];
+    if (![pub isKindOfClass:[NSString class]] || pub.length != 16) return NO;
+    return [pub isEqualToString:[self vcamDeviceCode]];
 }
 
 @end
