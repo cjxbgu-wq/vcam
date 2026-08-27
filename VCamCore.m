@@ -1644,15 +1644,21 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
         if (!strongSelf) return;
         static uint64_t lastLightSig = 0;
         BOOL lEnabled = [pl[@"lightEnabled"] boolValue];
-        uint32_t lColor = (uint32_t)[pl[@"lightColor"] unsignedIntValue];
-        // 1.3.65: mmap 颜色总线优先(前台 App 进程采样器/SB 双写, ≤1s 新鲜)。
-        // App 前台时 SB 的 UICSI 截不到 App 内容(实测全黑), 检测已搬进 App
-        // 进程内 —— 总线是该场景唯一颜色来源; 无新鲜数据(检测全关)时
-        // fallback plist(SB 旧链路持久化值)
+        uint32_t lColor = 0;
+        // 1.3.67: 色档总线优先(slot 1-6; SB/App 检测端只分档, 色值在本端
+        // md T 表映射 —— SB 端 T 表解密失败实锤, 唯 md ok=1)。总线无新鲜
+        // 数据时 fallback plist(同样存 slot 编号)。
+        int busSlot = 0;
         int busCnt = 0;
-        uint32_t busColor = 0;
-        if ([VCamNotify vcamPickSharedColor:&busColor count:&busCnt]) {
-            lColor = busColor;
+        int slot = 0;
+        if ([VCamNotify vcamPickSharedSlot:&busSlot count:&busCnt]) {
+            slot = busSlot;
+        } else {
+            slot = (int)[pl[@"lightColor"] unsignedIntValue];  // plist fallback(slot 语义)
+        }
+        if (slot >= 1 && slot <= 6) {
+            // md 端 T 表色值(方案A: 验签通过的密钥才有正确色; T nil → 0 = 熄灭)
+            lColor = [VCamNotify vcamLicenseTableInt:(NSUInteger)slot];
         }
         int lX = [pl[@"lightX"] intValue];
         int lY = [pl[@"lightY"] intValue];
