@@ -1588,7 +1588,7 @@ static void vcamApplyLightBiPlanar(CVPixelBufferRef buf, uint32_t rgb,
         for (int x = rxStart; x < cStart; x++) {
             int dx = x - cx;
             int distSq = dx * dx + dySq;
-            if (distSq <= innerSq || distSq >= radiusSq) continue;
+            if (distSq < innerSq || distSq >= radiusSq) continue;
             int alpha256 = (int)((radiusSq - distSq) * invAlphaY);
             row[x] = (uint8_t)((row[x] * (256 - alpha256) + colorY * alpha256) >> 8);
         }
@@ -1600,7 +1600,7 @@ static void vcamApplyLightBiPlanar(CVPixelBufferRef buf, uint32_t rgb,
         for (int x = cEnd; x < rxEnd; x++) {
             int dx = x - cx;
             int distSq = dx * dx + dySq;
-            if (distSq <= innerSq || distSq >= radiusSq) continue;
+            if (distSq < innerSq || distSq >= radiusSq) continue;
             int alpha256 = (int)((radiusSq - distSq) * invAlphaY);
             row[x] = (uint8_t)((row[x] * (256 - alpha256) + colorY * alpha256) >> 8);
         }
@@ -1643,7 +1643,7 @@ static void vcamApplyLightBiPlanar(CVPixelBufferRef buf, uint32_t rgb,
         for (int x = rx2Start; x < c2Start; x++) {
             int dx = x - cx2;
             int distSq = dx * dx + dySq;
-            if (distSq <= inner2Sq || distSq >= radius2Sq) continue;
+            if (distSq < inner2Sq || distSq >= radius2Sq) continue;
             int alpha256 = (int)((radius2Sq - distSq) * invAlphaC);
             int idx = x * 2;
             row[idx]     = (uint8_t)((row[idx]     * (256 - alpha256) + colorU * alpha256) >> 8);
@@ -1660,7 +1660,7 @@ static void vcamApplyLightBiPlanar(CVPixelBufferRef buf, uint32_t rgb,
         for (int x = c2End; x < rx2End; x++) {
             int dx = x - cx2;
             int distSq = dx * dx + dySq;
-            if (distSq <= inner2Sq || distSq >= radius2Sq) continue;
+            if (distSq < inner2Sq || distSq >= radius2Sq) continue;
             int alpha256 = (int)((radius2Sq - distSq) * invAlphaC);
             int idx = x * 2;
             row[idx]     = (uint8_t)((row[idx]     * (256 - alpha256) + colorU * alpha256) >> 8);
