@@ -30,8 +30,9 @@ M_FILES = ['Tweak.m', 'VCamCore.m', 'GPUImageProcessor.m', 'LocalVideoPlayer.m',
 # 变换的头文件(类声明 + 可能的内联字符串)
 H_FILES = ['VCamCore.h', 'GPUImageProcessor.h', 'LocalVideoPlayer.h',
            'NSQueue.h', 'VCamNotify.h', 'VCamFloatingBall.h']
-# 原样拷贝(已是密文数组/图标字节, 无字面量)
-COPY_FILES = ['VCamStr.h', 'ball_icon.h', 'btn_icons.h']
+# 原样拷贝(已是密文数组/图标字节/签名洞, 无字面量)
+# VCamTextSig.h: 魔数字节序列必须原样进二进制(inject_text_sig.py 定位用)
+COPY_FILES = ['VCamStr.h', 'ball_icon.h', 'btn_icons.h', 'VCamTextSig.h']
 
 # 运行时类名映射(class-dump 只能看到这些)
 CLASS_RUNTIME_NAMES = {
@@ -465,6 +466,7 @@ IDENT_RENAMES = {
     'vcamPickCfgName': 'qzCn',                  # C static(VCamNotify.m): cfg 通知名
     'detectWithUICreateScreenImage': 'dwUSI',   # 方法名(VCamFloatingBall.m): UICSI 符号词(1.3.65 gate)
     'vcamSelfIntegrityOK': 'qvSi',              # C static(VCamCore.m): IMP 范围自检
+    'vcamSelfTextOK': 'qvTs2',                  # C static(VCamCore.m): __TEXT 哈希自校验(1.3.70)
     'vcamDlsymTrusted': 'qzDs',                 # C static(VCamNotify.m): 可信符号解析
     'vcamPlatformSerial': 'qzPs',               # C static(VCamNotify.m): IOKit 序列号
     'vcamDigestHex16': 'qzDh',                  # C static(VCamNotify.m): SHA256 派生
