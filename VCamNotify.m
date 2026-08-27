@@ -1320,33 +1320,32 @@ typedef CGImageRef (*VcamUICreateScreenImageFn)(void);
     // 无需任何映射。slot 编号同时写(诊断/日志用)。
     uint32_t color = (bestIdx >= 0 && bestIdx < 6) ? kKnown[bestIdx] : 0;
     int slot = (bestIdx >= 0 && bestIdx < 6) ? bestIdx + 1 : 0;
-    // 1.3.73 光稳定滞回(闪烁根修): 1.3.71 的 2 拍去抖只能滤单拍噪声;
-    // 检测源闪烁(红↔灭 交替块, 半周期≥80ms)每 2-3 拍同色 → 透过去抖 →
-    // 稳定 slot 红灭翻转 → 光斑一直闪烁跳动(1.3.72 移除早醒后光斑每拍
-    // 烘焙最新色, 抖动直接透传, 症状显性化)。滞回策略:
-    //   有色: 连续 2 拍同色 → 确认切换(真实红→绿切换 80ms 确认)
-    //   无色: 连续 5 拍(200ms) 才灭光, 期间保持最近有效颜色
-    //         (检测源亮灭闪烁半周期 <200ms → 光稳定不闪)
-    // 两有色交替(红绿红绿边界抖动)永不连续 → 保持当前色, 同样防闪。
-    static int sPrevSlot = -2;    // 上一拍原始 slot
-    static int sStableSlot = -2;  // 已确认的稳定 slot
-    static int sBlankRun = 0;     // 连续无色(0)拍数
-    if (slot >= 1 && slot <= 6) {
-        sBlankRun = 0;
-        if (slot == sPrevSlot) {
-            sStableSlot = slot;   // 连续 2 拍同色: 确认
-        } else {
-            sPrevSlot = slot;     // 候选, 下一拍确认
-        }
-    } else {
-        // 无色滞回: 短暂灭(闪烁半周期)不灭光, 保持当前稳定色
-        if (sBlankRun < 5) sBlankRun++;
-        if (sBlankRun >= 5) {
-            sStableSlot = 0;      // 连续 200ms 无色: 真消失, 灭光
-            sPrevSlot = 0;
-        }
+    // 1.3.74 光稳定滑窗多数票(闪烁根修 v2): 1.3.73 滞回只防"色↔灭"交替;
+    // 检测源在两种颜色间交替闪烁切换时, 每色块连续 ≥2 拍仍周期性满足
+    // 确认条件 → 稳定色红↔绿翻转 → 光斑时而替换时而回退一直跳动(设备
+    // 实测症状)。滑窗多数票(对任意闪烁模式稳态不跳):
+    //   最近 12 拍(480ms@25Hz)里某 slot 占 ≥8 拍才发布为当前色;
+    //   不足 8 拍(交替闪烁/过渡噪声/色块<320ms) → 保持当前色不变。
+    //   交替闪烁(红绿/色灭, 占空比≈50%)永不过阈 → 光钉在当前色稳定
+    //   新色持续 ≥320ms → 干净切换(光色 ~300ms 延迟人眼无感)
+    //   持续无色 ≥320ms → 灭光
+    static int sWin[12] = {0};    // 滑窗原始 slot(初值 0=无色)
+    static int sWinPos = 0;
+    static int sStableSlot = -2;  // 已发布的稳定 slot
+    sWin[sWinPos] = slot;
+    sWinPos = (sWinPos + 1) % 12;
+    int cnt[7] = {0};             // slot 0..6 计票
+    for (int i = 0; i < 12; i++) {
+        if (sWin[i] >= 0 && sWin[i] <= 6) cnt[sWin[i]]++;
     }
-    int outSlot = sStableSlot;
+    int majSlot = 0, majCnt = 0;
+    for (int s = 0; s <= 6; s++) {
+        if (cnt[s] > majCnt) { majCnt = cnt[s]; majSlot = s; }
+    }
+    if (majCnt >= 8 && majSlot != sStableSlot) {
+        sStableSlot = majSlot;    // 窗内 ≥8/12 过半: 确认切换(或灭)
+    }
+    int outSlot = (sStableSlot >= 0 && sStableSlot <= 6) ? sStableSlot : 0;
     uint32_t outColor = (outSlot >= 1 && outSlot <= 6) ? kKnown[outSlot - 1] : 0;
     [self vcamPickPublishSlot:outSlot color:outColor count:bestCnt avg:0];
     // 通道B: Darwin slot 通知 —— 每拍 post(25Hz 心跳): relay 每次收到都写
