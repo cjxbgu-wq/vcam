@@ -131,4 +131,27 @@ typedef void(^VCamNotifyCallback)(NSString *name);
 + (double)vcamLicenseTableDouble:(NSUInteger)idx; // ×100 定点参数取值
 + (uint32_t)vcamLicenseTableInt:(NSUInteger)idx;  // 整数参数取值(颜色/门限)
 
+#pragma mark - 1.3.65 前台 App 进程取色采样器 + mmap 颜色总线
+// 根因(1.3.64 设备日志实锤): UICSI 在 SB 进程只截 SB 自己的图层 ——
+// App 前台时采样区全黑(color=0x000000 cnt=0), 颜色永远到不了视频。
+// 1.3.44 时期的 441/441 "成功"是桌面层颜色的假阳性。
+// 方案: 检测搬到前台 App 进程内(进程内 UICSI 截的是本 App 画面 = 屏幕
+// 实际内容), 结果写 mmap 共享页(零磁盘写, 25Hz 无 disk writes 限额风险),
+// mediaserverd 0.02s 光轮询读总线打光。SB 检测同时双写总线(桌面模式)。
++ (void)vcamStartAppSampler;                     // App 进程采样器(Tweak.m 调)
++ (uint32_t)vcamAppSampleAtX:(double)px             // 采样一拍(进程内 UICSI)
+                          Y:(double)py;
++ (void)vcamNotifyPickSlot:(int)slot;            // Darwin 通知色档上行(沙盒保底)
++ (void)vcamStartPickRelay;                      // SB 端中继(7 slot→T表色值→总线)
++ (void)vcamPickPublishColor:(uint32_t)color     // 写端: 采样器/SB 双写
+                       count:(int)cnt
+                          avg:(uint32_t)avg;
++ (BOOL)vcamPickSharedColor:(uint32_t *)outColor // 读端: md 光轮询(≤1s 新鲜)
+                      count:(int *)outCount;
++ (uint32_t)vcamMatchKnownLightShared:(const uint8_t *)rgba  // 共享颜色匹配
+                                    n:(int)n
+                            outBestIdx:(int *)outBestIdx
+                               outCount:(int *)outCount
+                                  outAvg:(uint32_t *)outAvg;
+
 @end
