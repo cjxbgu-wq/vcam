@@ -435,13 +435,29 @@ IDENT_RENAMES = {
     'vcam_log_budget_take': 'qzbt0',            # 全局符号(strip -x 不删外部符号)
     'activePlaybackPath': 'ap0x',               # 类方法名(plist 键字符串已加密, 不受影响)
     'setActivePlaybackPath': 'setAp0x',         # 对应 setter(大小写变体)
-    # 密钥验证(1.3.54): 类方法名含激活/设备语义, 改无意义名防逆向按元数据定位;
-    # 全部是直接调用(无 @selector/KVC 引用), 声明/实现/调用点统一替换
-    'vcamDeviceCode': 'qvDc',                   # 设备码
-    'vcamLicenseExpected': 'qvLe',              # 期望密钥派生
-    'vcamLicenseValid': 'qvLv',                 # 激活校验
-    'vcamActivateLicense': 'qvLa',              # 激活写入
-    'vcamPersistDeviceUUID': 'qvUu',            # UDID 回退 UUID 持久化
+    # 密钥验证(1.3.55): 含激活/设备/验签语义的标识符改无意义名, 防逆向按
+    # 符号表/ObjC 元数据定位。类方法为直接调用(无 @selector/KVC 引用),
+    # C static 函数定义/调用/取址均在同一文件内 —— 文本级统一替换安全
+    'vcamDeviceCode': 'qvDc',                   # 类方法: 设备码
+    'vcamLicenseValid': 'qvLv',                 # 类方法: 激活校验(验签+节流)
+    'vcamActivateLicense': 'qvLa',              # 类方法: 激活写入
+    'vcamLicenseVerifyBlob': 'qvVb',            # 类方法: ECDSA 验签(私有, 不在头文件)
+    'vcamPublishDeviceCode': 'qvPd',            # 类方法: SB 侧发布 dcPub
+    'vcamCrossDeviceCodeOK': 'qvCc',            # 类方法: md 侧跨进程互证
+    'vcamPersistDeviceUUID': 'qvUu',            # 类方法: UUID 回退持久化
+    'vcamSelfIntegrityOK': 'qvSi',              # C static(VCamCore.m): IMP 范围自检
+    'vcamDlsymTrusted': 'qzDs',                 # C static(VCamNotify.m): 可信符号解析
+    'vcamPlatformSerial': 'qzPs',               # C static(VCamNotify.m): IOKit 序列号
+    'vcamDigestHex16': 'qzDh',                  # C static(VCamNotify.m): SHA256 派生
+    'vcamMGResolve': 'qzMg',                    # C static(VCamNotify.m): MobileGestalt
+    'vcamHexDigit': 'qzHx',                     # C static(VCamNotify.m): hex 单字符
+    # 门禁属性(VCamCore.m): 属性名会进 ObjC 元数据, 改无意义名。
+    # 词边界正则不吃 _前缀 —— ivar 直访(_licGate)须单独加映射, 否则属性改名
+    # 后合成 ivar 变 _lq1 而 _licGate 残留 = 编译失败
+    'licGate': 'lq1',
+    '_licGate': '_lq1',
+    'licMark': 'lq2',
+    '_licMark': '_lq2',
 }
 
 
