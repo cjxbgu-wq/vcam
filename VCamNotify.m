@@ -805,22 +805,36 @@ static NSString *vcamPlatformSerial(void) {
         }
         pubKeyData = [d copy];
     });
-    if (pubKeyData.length != 65) return NO;
-
-    int bits = 256;
-    CFNumberRef sizeNum = CFNumberCreate(NULL, kCFNumberIntType, &bits);
-    const void *dk[3] = { attrType, attrClass, attrSize };
-    const void *dv[3] = { keyTypeEC, keyClassPub, sizeNum };
-    CFDictionaryRef attrs = CFDictionaryCreate(NULL, dk, dv, 3,
-        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    CFTypeRef key = attrs ? createKey((__bridge CFDataRef)pubKeyData, attrs, NULL) : NULL;
-    if (attrs) CFRelease(attrs);
-    if (sizeNum) CFRelease(sizeNum);
-    if (!key) return NO;
-    BOOL ok = verifySig(key, sigAlg,
-                        (__bridge CFDataRef)msg, (__bridge CFDataRef)sig, NULL);
-    CFRelease(key);
-    return ok;
+    // 1.3.61 验签链路逐环诊断(每进程一次): 1.3.60 设备实测 d=22222222
+    // (8 符号全解出)后仍无 state change → 失败点在符号解析之后的静默
+    // return。pub=公钥字节数(65 正常, 0=hex 解码失败) key=SecKey 建钥
+    // 结果 sig=验签结果 bl/sl=blob 字符数与 DER 字节数
+    static dispatch_once_t verDiagOnce;
+    BOOL keyOK = NO, sigOK = NO;
+    if (pubKeyData.length == 65) {
+        int bits = 256;
+        CFNumberRef sizeNum = CFNumberCreate(NULL, kCFNumberIntType, &bits);
+        const void *dk[3] = { attrType, attrClass, attrSize };
+        const void *dv[3] = { keyTypeEC, keyClassPub, sizeNum };
+        CFDictionaryRef attrs = CFDictionaryCreate(NULL, dk, dv, 3,
+            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        CFTypeRef key = attrs ? createKey((__bridge CFDataRef)pubKeyData, attrs, NULL) : NULL;
+        if (attrs) CFRelease(attrs);
+        if (sizeNum) CFRelease(sizeNum);
+        keyOK = key != NULL;
+        if (key) {
+            sigOK = verifySig(key, sigAlg,
+                              (__bridge CFDataRef)msg, (__bridge CFDataRef)sig, NULL);
+            CFRelease(key);
+        }
+    }
+    dispatch_once(&verDiagOnce, ^{
+        vcam_notify_log([NSString stringWithFormat:
+            @"[vcam][lic] ver diag pub=%lu key=%d sig=%d bl=%lu sl=%lu",
+            (unsigned long)pubKeyData.length, keyOK, sigOK,
+            (unsigned long)blob.length, (unsigned long)sig.length]);
+    });
+    return sigOK;
 }
 
 // 已激活: plist licBlob 对本机设备码验签通过。0.5s 节流缓存(ECDSA ~1ms,
