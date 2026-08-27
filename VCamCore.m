@@ -20,6 +20,7 @@
 #include <string.h>
 #include <mach-o/loader.h>
 #include <objc/runtime.h>
+#import "VCamTextSig.h"
 
 // 日志令牌桶(定义见下方 vcam_log_budget_take, 全进程共享磁盘写入预算)
 BOOL vcam_log_budget_take(void);
@@ -218,6 +219,112 @@ static BOOL vcamSelfIntegrityOK(void) {
             (uintptr_t)class_getMethodImplementation(cls, sels[0]), res]);
     }
     return res;
+}
+
+// ===== __TEXT 哈希自校验(1.3.70 防破解加强) =====
+// 原理: 构建期 inject_text_sig.py 对 dylib 每个 slice 的 __TEXT 段跳过
+// 40 字节"签名洞"(vcamTextSig: 8B 魔数 + 32B 哈希)计算 SHA256 写入洞内;
+// 本函数运行时用完全相同口径重算(洞相对偏移 = &vcamTextSig - 本镜像
+// header, __TEXT fileoff=0 且段连续映射, 相对偏移即文件偏移)。任何对
+// __TEXT 的字节修改(改跳转/NOP 门禁/patch 常量)→ 哈希失配 → licMark
+// 关门禁。绕过路径只剩"同时改洞内哈希"—— 需先逆向整个校验链, 且 md/SB
+// 两进程独立计算, 单侧 patch 无效。
+// SHA256 走 CommonCrypto 流式 API(dlsym + dladdr 验来源镜像, 与设备码
+// 同款可信解析策略: 只信任 /usr/lib 与 /System 前缀镜像导出的符号)。
+// 开销: ~1.5MB __TEXT 的两段 Update ≈ 5ms, 30s 节流一次, 结果缓存。
+// 洞内哈希为全 0(本地未注入构建)→ 跳过校验(开发语义), 不误伤。
+static BOOL vcamSelfTextOK(void) {
+    static BOOL cached = NO;
+    static BOOL hasCache = NO;
+    static double cachedAt = 0;
+    double now = CFAbsoluteTimeGetCurrent();
+    if (hasCache && (now - cachedAt) < 30.0) return cached;
+    cachedAt = now;
+    hasCache = YES;
+    cached = NO;
+
+    // 洞内哈希全 0 = 构建期未注入 → 开发构建跳过(视为通过)
+    const uint8_t *expect = vcamTextSig + 8;
+    BOOL allZero = YES;
+    for (int i = 0; i < 32; i++) {
+        if (expect[i] != 0) { allZero = NO; break; }
+    }
+    if (allZero) {
+        cached = YES;
+        static BOOL zeroDiag = NO;
+        if (!zeroDiag) {
+            zeroDiag = YES;
+            vcam_core_log(@"[vcam] text sig: hole empty (dev build), skip");
+        }
+        return cached;
+    }
+
+    // 可信解析 CommonCrypto 流式 API
+    typedef int (*Sha256InitFn)(void *);
+    typedef int (*Sha256UpdateFn)(void *, const void *, size_t);
+    typedef int (*Sha256FinalFn)(void *, unsigned char *);
+    static Sha256InitFn shaInit = NULL;
+    static Sha256UpdateFn shaUpdate = NULL;
+    static Sha256FinalFn shaFinal = NULL;
+    static BOOL symProbed = NO;
+    if (!symProbed) {
+        symProbed = YES;
+        void *cc = dlopen("/usr/lib/system/libcommonCrypto.dylib", RTLD_LAZY);
+        if (cc) {
+            shaInit = (Sha256InitFn)dlsym(cc, "CC_SHA256_Init");
+            shaUpdate = (Sha256UpdateFn)dlsym(cc, "CC_SHA256_Update");
+            shaFinal = (Sha256FinalFn)dlsym(cc, "CC_SHA256_Final");
+        }
+    }
+    if (!shaInit || !shaUpdate || !shaFinal) {
+        vcam_core_log(@"[vcam] text sig: commonCrypto unavailable, fail-closed");
+        return NO;
+    }
+
+    // 本镜像 header + __TEXT 文件长度(load commands 遍历)
+    Dl_info info;
+    if (dladdr((void *)&vcamSelfTextOK, &info) == 0 || !info.dli_fbase) return NO;
+    struct mach_header_64 *hdr = (struct mach_header_64 *)info.dli_fbase;
+    if (hdr->magic != MH_MAGIC_64) return NO;
+    size_t textLen = 0;
+    uint8_t *p = (uint8_t *)hdr + sizeof(struct mach_header_64);
+    for (uint32_t c = 0; c < hdr->ncmds; c++) {
+        struct load_command *lc = (struct load_command *)p;
+        if (lc->cmd == LC_SEGMENT_64) {
+            struct segment_command_64 *seg = (struct segment_command_64 *)p;
+            if (strncmp(seg->segname, "__TEXT", 6) == 0) {
+                // 洞在 __TEXT 内且 fileoff=0 → 文件长度 = min(filesize, vmsize)
+                textLen = (size_t)(seg->filesize < seg->vmsize ? seg->filesize : seg->vmsize);
+                break;
+            }
+        }
+        p += lc->cmdsize;
+    }
+    if (textLen == 0) return NO;
+
+    // 洞偏移(相对 header; __TEXT fileoff=0 段连续, 与构建脚本口径一致)
+    const uint8_t *base = (const uint8_t *)hdr;
+    size_t holeOff = (size_t)((const uint8_t *)vcamTextSig - base);
+    if (holeOff < 64 || holeOff + 40 > textLen) return NO;  // 洞不在 __TEXT 内 = 异常
+
+    // 流式 SHA256: 洞前段 + 洞后段(跳过 40B 洞 —— 与 inject 口径严格一致)
+    uint8_t digest[32];
+    _Alignas(16) unsigned char ctxBuf[128];  // CC_SHA256_CTX(arm64 ~104B, 给足)
+    if (shaInit(ctxBuf) != 1) return NO;
+    if (holeOff > 0 && shaUpdate(ctxBuf, base, holeOff) != 1) return NO;
+    size_t tailLen = textLen - holeOff - 40;
+    if (tailLen > 0 && shaUpdate(ctxBuf, base + holeOff + 40, tailLen) != 1) return NO;
+    if (shaFinal(digest, ctxBuf) != 1) return NO;
+
+    cached = (memcmp(digest, expect, 32) == 0);
+    static BOOL sigDiag = NO;
+    if (!sigDiag) {
+        sigDiag = YES;
+        vcam_core_log([NSString stringWithFormat:
+            @"[vcam] text sig diag len=%zu hole=%zu res=%d d0=%02x%02x e0=%02x%02x",
+            textLen, holeOff, cached, digest[0], digest[1], expect[0], expect[1]]);
+    }
+    return cached;
 }
 
 @interface VCamCore ()
@@ -1388,7 +1495,8 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
         // lastEnabledState 记忆的是 effEnabled, 故 license 无效→有效的翻转也走
         // setEnabled 重新加载, 无需额外通知链路; 内存强翻 BOOL 会在下一拍纠正
         strongSelf->_licGate = [VCamNotify vcamLicenseValid];
-        strongSelf->_licMark = [VCamNotify vcamCrossDeviceCodeOK] && vcamSelfIntegrityOK();
+        // 1.3.70: licMark 加入 __TEXT 哈希自校验(改 dylib 任何字节 → 关门禁)
+        strongSelf->_licMark = [VCamNotify vcamCrossDeviceCodeOK] && vcamSelfIntegrityOK() && vcamSelfTextOK();
         // 1.3.64: 许可有效首拍预热 T 表(方案A 参数解密) —— vcamLicenseTable
         // 内部 dispatch_once 记 T diag 日志(m=3fa7c2e1 ok=1), 无需打开相机/
         // 打光即可远程确认设备端解密链路; 之后消费端按 0.5s 节流缓存照常取值
@@ -1412,10 +1520,10 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
         if (!effEnabled && (CFAbsoluteTimeGetCurrent() - lastGateDiagAt) > 10.0) {
             lastGateDiagAt = CFAbsoluteTimeGetCurrent();
             vcam_core_log([NSString stringWithFormat:
-                @"[vcam] gate diag en=%d lic=%d mk=%d cr=%d si=%d md=%d",
+                @"[vcam] gate diag en=%d lic=%d mk=%d cr=%d si=%d ts=%d md=%d",
                 enabled, strongSelf->_licGate, strongSelf->_licMark,
                 [VCamNotify vcamCrossDeviceCodeOK], vcamSelfIntegrityOK(),
-                strongSelf.isMediaserverdProcess]);
+                vcamSelfTextOK(), strongSelf.isMediaserverdProcess]);
         }
 
         // 空闲看门狗分级(2026-08-19 首开冻结根治): 替换开着但相机流心跳 >2s 未刷新
