@@ -2,10 +2,20 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<!-- 1.3.65: 全进程注入(无 Filter = 注入所有)。
-	原因: 取色检测必须在内容所在进程内做 —— SB 的 UICSI 截不到前台
-	App(1.3.64 设备日志实锤全黑), 每个 App 进程内跑采样器才能取到
-	App 自己的画面。App 分支只启动轻量采样器(Tweak.m constructor),
-	无 VCamCore/hook 开销; 守护进程分支保持原逻辑。 -->
+	<key>Filter</key>
+	<dict>
+		<key>Mode</key>
+		<string>Any</string>
+		<key>Bundles</key>
+		<array>
+			<string>com.apple.UIKit</string>
+		</array>
+		<key>Executables</key>
+		<array>
+			<string>mediaserverd</string>
+			<string>SpringBoard</string>
+			<string>lskdd</string>
+		</array>
+	</dict>
 </dict>
 </plist>
