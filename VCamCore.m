@@ -151,6 +151,10 @@ static void vcam_core_log(NSString *msg) {
 @property (nonatomic, strong) dispatch_source_t pollingTimer;
 @property (nonatomic, assign) BOOL pollingActive;
 @property (nonatomic, assign) BOOL lastEnabledState;
+// 密钥门禁(1.3.54): 激活状态由主轮询每拍重算(plist licenseKey 与本机重算
+// 期望比对), render 入口硬拦截 —— 未激活时即使 enabled=YES 也不渲染替换帧,
+// 相机真实画面透传(双保险: UI 门禁在 SB, 帧门禁在 md)
+@property (nonatomic, assign) BOOL licGate;
 // 帧缓存: 避免每次 render 都调用 processPixelBuffer（24fps 视频 vs 60fps 相机）
 @property (nonatomic, assign) CVPixelBufferRef cachedProcessedFrame;
 @property (nonatomic, assign) uint64_t lastProcessedFrameCount;
@@ -349,6 +353,10 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
 
 - (void)renderReplacementToPixelBuffer:(CVPixelBufferRef)pixelBuffer pts:(double)pts {
     if (!pixelBuffer || !_enabled) return;
+    // 密钥门禁(1.3.54): 未激活不渲染替换帧, 真实相机画面直接透传。
+    // 双保险位 —— 轮询已按 effEnabled 停管线, 此处拦截竞态窗口
+    // (plist enabled=YES 而 licGate 尚未轮询到/被绕过 UI 直改 plist)
+    if (!_licGate) return;
 
     // 同帧去重 v2(2026-08-19 IOFence GPU 死锁根治): 指针 + PTS 双重判定, 检查与
     // 登记同锁原子完成。旧"指针+5ms 窗"两个缺陷(设备实证 00:00:13 gpuEvent
@@ -842,7 +850,7 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
 }
 
 - (BOOL)hasReplacementFrame {
-    if (!_enabled) return NO;
+    if (!_enabled || !_licGate) return NO;  // 1.3.54 未激活 = 无替换帧(拍照流也走真实相机)
     CVPixelBufferRef frame = [_videoPlayer getCurrentFrame];
     return frame != NULL;
 }
@@ -1295,10 +1303,17 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
         if (!strongSelf) return;
         // poll 心跳日志已移除(2026-08-16): mediaserverd disk writes 限额 12.43KB/s,
         // 高频日志按 4KB 脏页/行记账 → EXC_RESOURCE 杀进程(崩溃循环根因)
-        if (enabled != strongSelf.lastEnabledState) {
-            vcam_core_log([NSString stringWithFormat:@"[vcam] state change: %d -> %d, calling setEnabled", strongSelf.lastEnabledState, enabled]);
-            strongSelf.lastEnabledState = enabled;
-            [strongSelf setEnabled:enabled];
+        // 密钥门禁(1.3.54): 每拍重算激活状态(plist 读 ~0.1ms + 比对, 开销可忽略)。
+        // effEnabled = plist enabled && 已激活 —— 未激活时把 md 侧管线一并停掉
+        // (省 CPU, 双保险之外再省解码); 激活写入 plist 后 0.15s 内自动拉起。
+        // lastEnabledState 记忆的是 effEnabled, 故 license 无效→有效的翻转也走
+        // setEnabled 重新加载, 无需额外通知链路
+        strongSelf->_licGate = [VCamNotify vcamLicenseValid];
+        BOOL effEnabled = enabled && strongSelf->_licGate;
+        if (effEnabled != strongSelf.lastEnabledState) {
+            vcam_core_log([NSString stringWithFormat:@"[vcam] state change: %d -> %d (lic=%d), calling setEnabled", strongSelf.lastEnabledState, effEnabled, strongSelf->_licGate]);
+            strongSelf.lastEnabledState = effEnabled;
+            [strongSelf setEnabled:effEnabled];
         }
 
         // 空闲看门狗分级(2026-08-19 首开冻结根治): 替换开着但相机流心跳 >2s 未刷新
