@@ -148,60 +148,18 @@ static void vcamFillT(uint32_t *t) {
 }
 
 // RGBA 像素数组 → 已知色匹配。返回 0=无匹配, 否则标准色值; outName/outCount 诊断
-// 1.3.46 匹配算法重写(RGB 欧氏距离 → HSV 色相分档):
-// 紫色打不上是 RGB 距离的盲区 —— 屏幕实际"紫"很少是纯品红 FF00FF,
-// 深紫(800080)亮度<180 被饱和度过滤直接丢弃, 系统紫(AF52DE)/蓝紫(8A2BE2)
-// 离纯紫 RGB 距离>120, 全部 miss(实测 0/441)。红绿蓝黄青是极端色,
-// 渲染偏差后仍在 120 半径内, 所以只有紫全灭。
-// HSV 色相每 60° 一档(区间无重叠无间隙): [330,30)红 [30,90)黄 [90,150)绿
-// [150,210)青 [210,270)蓝 [270,330)紫 —— 亮度/深浅变化不改变色相,
-// 暗紫/亮紫/偏蓝紫/偏红紫全命中; 白/灰 delta=0 仍被滤(白光移除语义不变)。
-// outAvg: 未命中诊断(采样区平均 RGB, 打进熄灭日志, 下次再 miss 直接看像素值)
+// 1.3.65: 算法主体移入 VCamNotify vcamMatchKnownLightShared(SB/App 采样器共用;
+// 1.3.64 实锤 SB 的 UICSI 截不到前台 App → App 进程内采样是链路主体)。
+// 本外壳保留 name 包装(诊断日志用)。HSV 色相分档/T 表门限语义见 VCamNotify。
 static uint32_t vcamMatchKnownLight(const uint8_t *rgba, int n, NSString **outName, int *outCount, uint32_t *outAvg) {
-    // 1.3.63: 颜色表/门限从许可 T 表取 —— idx1-6 色, idx7 V/S 门限,
-    // idx8 计票阈值。T 无来源(未激活/被跳过)时全 0: 门限 0 会让黑/白/灰
-    // 全通过(色相环仍分档), 但返回色=0x000000(黑) → 下游 rgb==0 直接
-    // 熄灭 —— 打光失效而非打错光(垃圾参数语义)
-    uint32_t t[18];
-    vcamFillT(t);
-    int hsvGate = (int)t[7];    // 60
-    int voteGate = (int)t[8];   // 30
-    if (hsvGate < 0) hsvGate = 0;
-    if (voteGate < 0) voteGate = 0;
-    int counts[6] = {0};
-    long sr = 0, sg = 0, sb = 0;
-    for (int i = 0; i < n; i++) {
-        int r = rgba[i * 4], g = rgba[i * 4 + 1], b = rgba[i * 4 + 2];
-        sr += r; sg += g; sb += b;
-        int maxc = MAX(MAX(r, g), b), minc = MIN(MIN(r, g), b);
-        int delta = maxc - minc;
-        if (maxc < hsvGate || delta < hsvGate) continue;  // V/S 门限(许可 T 表)
-        // 色相(0..360)
-        double h;
-        if (maxc == r)      h = 60.0 * (double)(g - b) / (double)delta;
-        else if (maxc == g) h = 60.0 * (2.0 + (double)(b - r) / (double)delta);
-        else                h = 60.0 * (4.0 + (double)(r - g) / (double)delta);
-        if (h < 0) h += 360.0;
-        int idx;
-        if (h < 30.0 || h >= 330.0)      idx = 0;  // 红(0/360 环绕)
-        else if (h < 90.0)               idx = 3;  // 黄
-        else if (h < 150.0)              idx = 1;  // 绿
-        else if (h < 210.0)              idx = 4;  // 青
-        else if (h < 270.0)              idx = 2;  // 蓝
-        else                             idx = 5;  // 紫
-        counts[idx]++;
+    int bestIdx = -1, cnt = 0;
+    uint32_t color = [VCamNotify vcamMatchKnownLightShared:rgba n:n
+        outBestIdx:&bestIdx outCount:&cnt outAvg:outAvg];
+    if (outCount) *outCount = cnt;
+    if (color != 0 && outName && bestIdx >= 0 && bestIdx < 6) {
+        *outName = vcamKnownLightName(bestIdx);
     }
-    if (outAvg) *outAvg = (uint32_t)(((sr / n) << 16) | ((sg / n) << 8) | (sb / n));
-    int bestK = -1, bestC = 0;
-    for (int k = 0; k < 6; k++) {
-        if (counts[k] > bestC) { bestC = counts[k]; bestK = k; }
-    }
-    if (bestK >= 0 && bestC >= voteGate) {  // 441 像素的 ~7%(许可 T 表)
-        if (outName) *outName = vcamKnownLightName(bestK);
-        if (outCount) *outCount = bestC;
-        return t[bestK + 1];  // idx1-6 标准色(许可 T 表)
-    }
-    return 0;
+    return color;
 }
 
 // ===== CARenderServer 捕获策略链(1.3.39 看门狗架构) =====
@@ -1124,7 +1082,7 @@ static void *vcamPickCaptureMain(void *ctx) {
     [_licensePageView addSubview:_licenseCodeLabel];
 
     _licenseCodeHint = [[UILabel alloc] initWithFrame:CGRectMake(pad, 70, contentW, 14)];
-    _licenseCodeHint.text = @"点击上方设备码复制, 发送给开发者获取密钥";
+    _licenseCodeHint.text = @"点击上方设备码复制";
     _licenseCodeHint.textColor = [UIColor colorWithRed:0.72 green:0.73 blue:0.75 alpha:1.0];
     _licenseCodeHint.textAlignment = NSTextAlignmentCenter;
     _licenseCodeHint.font = [UIFont systemFontOfSize:11];
@@ -1606,6 +1564,15 @@ static NSString *vcamLightColorName(uint32_t c) {
                 @"[vcam][light] diag #%d UICSI color=0x%06x cnt=%d pos(%.0f,%.0f)",
                 diagTicks, detected, detCount, gVcamPick.px, gVcamPick.py]);
         }
+    }
+
+    // 1.3.65: 每拍发布 mmap 颜色总线(md 0.02s 光轮询读, 时间戳新鲜度要求
+    // 持续写)。写仲裁: SB 仅 Active(桌面)时写 —— App 前台时 SB Inactive 且
+    // SB 的 UICSI 只截 SB 层(全黑), 此时 App 进程采样器独占总线(其 mmap
+    // 直写 + Darwin slot 通知→SB relay 双通道), 防止 SB 的黑帧覆盖 App 色
+    UIApplication *sbApp = [UIApplication sharedApplication];
+    if (!sbApp || sbApp.applicationState == UIApplicationStateActive) {
+        [VCamNotify vcamPickPublishColor:detected count:detCount avg:gVcamPick.avg];
     }
 
     if (detected != _lastDetectedColor) {
@@ -2162,12 +2129,12 @@ static double vcamClamp(double v, double lo, double hi) {
 - (void)licenseCopyTapped {
     UIPasteboard *pb = [UIPasteboard generalPasteboard];
     pb.string = vcamGrouped16([VCamNotify vcamDeviceCode]);
-    _licenseCodeHint.text = @"已复制, 发送给开发者获取密钥";
+    _licenseCodeHint.text = @"已复制";
     _licenseCodeHint.textColor = [UIColor colorWithRed:0.30 green:0.85 blue:0.45 alpha:1.0];
     vcam_ball_log(@"[vcam][lic] device code copied");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        self->_licenseCodeHint.text = @"点击上方设备码复制, 发送给开发者获取密钥";
+        self->_licenseCodeHint.text = @"点击上方设备码复制";
         self->_licenseCodeHint.textColor = [UIColor colorWithRed:0.72 green:0.73 blue:0.75 alpha:1.0];
     });
 }
