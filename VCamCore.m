@@ -1151,21 +1151,28 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                 CVPixelBufferRelease(frame);
                 if (!rotated) continue;
 
-                // 1.5 用户画面变换(箭头/＋/−/复, 画布合成): zoom/pan 烘焙进像素 ——
+                // 1.5 三色打光注入(1.3.37, 复刻 Android vcplax; 1.3.51 移到 bake 前):
+                // 屏幕取色检测到的颜色以圆形渐变光斑注入【完整内容帧】(内部 3 槽
+                // 画布副本, 不污染旋转/bake 池)。关闭/无色时直通零开销; 打光签名
+                // 参与上方跳过判定。
+                // 1.3.51 光斑锚定内容(用户要求): 旧顺序(bake 后注入)光斑画在"烘焙
+                // 后画布"上 —— zoom>1 时画布=可见窗口本身, 光斑%坐标恒钉在窗口上,
+                // 放大缩小光斑纹丝不动(钉在屏幕而非内容)。新顺序(bake 前注入):
+                // 光斑先画进内容像素(用户在原始大小下调好的位置/直径即内容坐标),
+                // 之后 zoom/pan 烘焙裁窗口+下游 Trim 放大 —— 光斑跟着内容一起
+                // 放大/移动/裁掉, 等效"光打在视频画面本身上"
+                CVPixelBufferRef lit = [strongSelf.gpuProcessor injectLightIntoFrame:rotated];
+                CVPixelBufferRelease(rotated);
+                if (!lit) continue;
+                rotated = lit;
+
+                // 1.6 用户画面变换(箭头/＋/−/复, 画布合成): zoom/pan 烘焙进像素 ——
                 // zoom>1 画布=源窗口(memcpy); zoom<=1 黑底+画面区域(平移出界露黑)。
                 // 默认无变换时直通零开销。pan/zoom 参与上方跳过判定: 变化时重新
                 // 产出 → token 刷新, 暂停状态点箭头也即时生效
                 CVPixelBufferRef baked = [strongSelf.gpuProcessor bakeUserTransformIntoCanvas:rotated];
                 CVPixelBufferRelease(rotated);
                 if (!baked) continue;
-
-                // 1.6 三色打光注入(1.3.37, 复刻 Android vcplax): 屏幕取色检测到的
-                // 颜色以圆形渐变光斑注入帧内(内部 3 槽画布副本, 不污染旋转/bake 池)。
-                // 关闭/无色时直通零开销; 打光签名参与上方跳过判定
-                CVPixelBufferRef lit = [strongSelf.gpuProcessor injectLightIntoFrame:baked];
-                CVPixelBufferRelease(baked);
-                if (!lit) continue;
-                baked = lit;
 
                 // 2. 懒 BGRA(产能优化): 不再每帧预转 BGRA —— 旋转+转换两个 VT 调用
                 //    每帧 ~68ms > 41.6ms(24fps 帧间隔), 预渲染只跑出 14.6fps → 卡顿。
