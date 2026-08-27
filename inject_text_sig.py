@@ -25,32 +25,45 @@ HOLE = 40
 
 
 def process_slice(data):
-    """thin slice: 找洞(__TEXT,__vcsig) → __TEXT 跳洞哈希 → 写洞。
+    """thin slice: 解析 __TEXT 的 section 表定位 __vcsig 洞 → 跳洞哈希 → 写洞。
     返回 (hole_off_in_slice, hash32)。
     注意: Mach-O load commands 是小端(iOS dylib 实际字节序); fat 头是大端。
-    洞必须在 __TEXT 内(设备实锤: __DATA 洞被 dyld chained fixups 清零)。"""
+    洞必须在 __TEXT 内(设备实锤: __DATA 洞被 dyld chained fixups 清零)。
+    定位方式: section 表(运行时代码内联魔数常量会让全文搜索命中多次,
+    改从 __TEXT 段的 nsects 个 section_64 头找 __vcsig 的 offset)。"""
     magic = struct.unpack("<I", data[:4])[0]
     assert magic == 0xFEEDFACF, "not little-endian arm64 Mach-O: 0x%x" % magic
-    # __TEXT segment
     ncmds = struct.unpack("<I", data[16:20])[0]
     p = 32
     text_len = 0
+    hole = -1
     for _ in range(ncmds):
         cmd, cmdsize = struct.unpack("<II", data[p:p + 8])
         if cmd == 0x19:  # LC_SEGMENT_64
             segname = data[p + 8:p + 24].rstrip(b"\x00").decode()
             if segname == "__TEXT":
                 vmaddr, vmsize, fileoff, filesize = struct.unpack("<QQQQ", data[p + 24:p + 56])
+                nsects = struct.unpack("<I", data[p + 64:p + 68])[0]
                 assert fileoff == 0, "__TEXT fileoff != 0, 口径破坏"
                 text_len = min(vmsize, filesize)
+                # section_64 表(紧跟 segment 命令): 每项 80B
+                # sectname(16) segname(16) addr(8) size(8) offset(4) ...
+                sp = p + 72
+                for s in range(nsects):
+                    sect = data[sp + 80 * s: sp + 80 * (s + 1)]
+                    sectname = sect[:16].rstrip(b"\x00").decode()
+                    if sectname == "__vcsig":
+                        saddr, ssize = struct.unpack("<QQ", sect[32:48])
+                        soff = struct.unpack("<I", sect[48:52])[0]
+                        assert ssize == 40, "__vcsig size != 40: %d" % ssize
+                        hole = soff
+                        break
                 break
         p += cmdsize
     assert text_len > 0, "__TEXT segment not found"
-    # 洞定位(唯一性; 必须在 __TEXT 内)
-    hole = data.find(MAGIC8)
-    assert hole != -1, "sig hole magic not found"
-    assert data.find(MAGIC8, hole + 1) == -1, "sig hole magic not unique"
+    assert hole >= 0, "__vcsig section not found in __TEXT"
     assert hole + HOLE <= text_len, "sig hole outside __TEXT: 0x%x > 0x%x" % (hole + HOLE, text_len)
+    assert data[hole:hole + 8] == MAGIC8, "__vcsig magic mismatch(口径破坏)"
     # 哈希: __TEXT 跳洞(自引用消解 —— 与运行时 vcamSelfTextOK 口径一致)
     h = hashlib.sha256()
     h.update(data[:hole])
