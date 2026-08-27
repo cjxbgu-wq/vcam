@@ -1329,29 +1329,32 @@ typedef CGImageRef (*VcamUICreateScreenImageFn)(void);
     //   无色: 必须连续 8 拍(320ms)全部无色才灭光 —— 闪烁期窗内总夹着
     //         有效色拍, 连 0 被打断 → 光钉住永不灭; 光源真正消失
     //         320ms 后才灭(与前版本灭光时延一致)
-    static int sWin[12] = {0};    // 滑窗原始 slot(初值 0=无色)
+    // 1.3.77 采样降频 25→12.5Hz(发热根修): UICreateScreenImage 全屏捕获
+    // 是 App 进程 CPU 大头; 打光已有滑窗投票保持稳定, 无需高频跟踪闪烁。
+    // 窗口等比缩短: 12 拍@40ms → 6 拍@80ms, 时序语义完全不变。
+    static int sWin[6] = {0};     // 滑窗原始 slot(初值 0=无色)
     static int sWinPos = 0;
     static int sStableSlot = -2;  // 已发布的稳定 slot
     static int sZeroRun = 0;      // 连续无色(0)拍数
     sWin[sWinPos] = slot;
-    sWinPos = (sWinPos + 1) % 12;
+    sWinPos = (sWinPos + 1) % 6;
     if (slot >= 1 && slot <= 6) {
         sZeroRun = 0;             // 有效色拍打断连续无色计数
         int cnt[7] = {0};         // slot 1..6 有色计票
-        for (int i = 0; i < 12; i++) {
+        for (int i = 0; i < 6; i++) {
             if (sWin[i] >= 1 && sWin[i] <= 6) cnt[sWin[i]]++;
         }
         int majSlot = 0, majCnt = 0;
         for (int s = 1; s <= 6; s++) {
             if (cnt[s] > majCnt) { majCnt = cnt[s]; majSlot = s; }
         }
-        if (majCnt >= 8 && majSlot != sStableSlot) {
-            sStableSlot = majSlot;  // 窗内 ≥8/12 过半: 确认切换
+        if (majCnt >= 4 && majSlot != sStableSlot) {
+            sStableSlot = majSlot;  // 窗内 ≥4/6 过半: 确认切换
         }
     } else {
-        // 无色滞回(硬条件): 连续 8 拍全无色才灭, 单拍/交替混入的 0 无效
-        if (sZeroRun < 8) sZeroRun++;
-        if (sZeroRun >= 8 && sStableSlot != 0) {
+        // 无色滞回(硬条件): 连续 4 拍(320ms)全无色才灭, 单拍/交替混入的 0 无效
+        if (sZeroRun < 4) sZeroRun++;
+        if (sZeroRun >= 4 && sStableSlot != 0) {
             sStableSlot = 0;        // 连续 320ms 无任何有效色: 真消失, 灭光
         }
     }
@@ -1399,9 +1402,12 @@ typedef CGImageRef (*VcamUICreateScreenImageFn)(void);
         dispatch_queue_t sampQ = dispatch_queue_create("com.vcam.samp", NULL);
         dispatch_source_t timer = dispatch_source_create(
             DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+        // 1.3.77 降频 25→12.5Hz(发热根修): UICreateScreenImage 全屏捕获 +
+        // 降采样缩放是 App 进程 CPU/整机发热主力; 打光有滑窗投票保稳定,
+        // 检测延迟 +40ms 人眼无感。总线心跳(保活 1s 窗口)12.5Hz 仍充裕。
         dispatch_source_set_timer(timer,
             dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
-            (uint64_t)(0.04 * NSEC_PER_SEC), (uint64_t)(0.01 * NSEC_PER_SEC));
+            (uint64_t)(0.08 * NSEC_PER_SEC), (uint64_t)(0.02 * NSEC_PER_SEC));
         dispatch_source_set_event_handler(timer, ^{
             // 前台判定: 后台/锁屏/分屏非 Active → 跳过(SB 是桌面模式的写者)
             UIApplication *app = [UIApplication sharedApplication];
