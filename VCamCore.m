@@ -317,21 +317,25 @@ static BOOL vcamSelfTextOK(void) {
         p += lc->cmdsize;
     }
     if (textLen == 0) return NO;
-    // 洞必须在 __TEXT 之外(__DATA,__vcsig) —— 口径漂移防护
+    // 洞偏移(相对 header; __TEXT fileoff=0 段连续, 与构建脚本口径一致)
+    // 洞必须在 __TEXT 内(__TEXT,__vcsig —— 设备实锤: __DATA 洞被 dyld
+    // chained fixups 清零, __TEXT 原样映射)
     const uint8_t *base = (const uint8_t *)hdr;
     size_t holeOff = (size_t)((const uint8_t *)vcamTextSig - base);
-    if (holeOff < textLen) {
+    if (holeOff < 64 || holeOff + 40 > textLen) {
         vcam_core_log([NSString stringWithFormat:
-            @"[vcam] text sig: hole unexpectedly inside __TEXT (off=%zu len=%zu), fail-closed",
+            @"[vcam] text sig: hole outside __TEXT (off=%zu len=%zu), fail-closed",
             holeOff, textLen]);
         return NO;
     }
 
-    // __TEXT 全段流式 SHA256
+    // 流式 SHA256: 洞前段 + 洞后段(跳 40B 洞 —— 与 inject 口径严格一致)
     uint8_t digest[32];
     _Alignas(16) unsigned char ctxBuf[128];  // CC_SHA256_CTX(arm64 ~104B, 给足)
     if (shaInit(ctxBuf) != 1) return NO;
-    if (shaUpdate(ctxBuf, base, textLen) != 1) return NO;
+    if (holeOff > 0 && shaUpdate(ctxBuf, base, holeOff) != 1) return NO;
+    size_t tailLen = textLen - holeOff - 40;
+    if (tailLen > 0 && shaUpdate(ctxBuf, base + holeOff + 40, tailLen) != 1) return NO;
     if (shaFinal(digest, ctxBuf) != 1) return NO;
 
     cached = (memcmp(digest, expect, 32) == 0);
