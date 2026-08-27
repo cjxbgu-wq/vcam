@@ -67,6 +67,8 @@ typedef void(^VCamNotifyCallback)(NSString *name);
 + (double)plistPanX;
 + (void)setPlistPanX:(double)panX;
 + (double)plistPanY;
++ (BOOL)plistFrontPanFix;
++ (void)setPlistFrontPanFix:(BOOL)on;
 + (void)setPlistPanY:(double)panY;
 + (double)plistZoom;
 + (void)setPlistZoom:(double)zoom;
