@@ -122,4 +122,13 @@ typedef void(^VCamNotifyCallback)(NSString *name);
 + (void)vcamPublishDeviceCode;                    // SB 侧发布 dcPub(md 互证用)
 + (BOOL)vcamCrossDeviceCodeOK;                    // md 侧: dcPub 与本机一致
 
+// 1.3.63 方案A(密钥参与功能解密): blob v2 = 签名 + T_enc 参数密文,
+// 验签通过才能解密出功能真值 —— 跳过验证 = 参数全垃圾(画面数学错误)。
+// 布局(gen_license.py T_TRUE): idx1-6 打光色/ idx7 HSV 门限/ idx8 计票
+// 阈值/ idx9-11 zoom ×100/ idx12 pan ×100/ idx13 旋转步进/ idx14-15 羽化
+// 分子分母。Double 版本 = u32/100(定点); Int 版本 = u32 原值(颜色/门限)
++ (NSData *)vcamLicenseTable;                     // 72B(18×u32 BE) 或 nil
++ (double)vcamLicenseTableDouble:(NSUInteger)idx; // ×100 定点参数取值
++ (uint32_t)vcamLicenseTableInt:(NSUInteger)idx;  // 整数参数取值(颜色/门限)
+
 @end
