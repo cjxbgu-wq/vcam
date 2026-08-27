@@ -37,6 +37,7 @@ def process_slice(data):
     p = 32
     text_len = 0
     hole = -1
+    first_sect_off = None  # __TEXT 第一个 section 的物理 offset(内容区起点)
     for _ in range(ncmds):
         cmd, cmdsize = struct.unpack("<II", data[p:p + 8])
         if cmd == 0x19:  # LC_SEGMENT_64
@@ -47,11 +48,12 @@ def process_slice(data):
                 assert fileoff == 0, "__TEXT fileoff != 0, 口径破坏"
                 text_len = min(vmsize, filesize)
                 # section_64 表(紧跟 segment 命令): 每项 80B
-                # sectname(16) segname(16) addr(8) size(8) offset(4) ...
                 sp = p + 72
                 for s in range(nsects):
                     sect = data[sp + 80 * s: sp + 80 * (s + 1)]
                     sectname = sect[:16].rstrip(b"\x00").decode()
+                    if s == 0:
+                        first_sect_off = struct.unpack("<I", sect[48:52])[0]
                     if sectname == "__vcsig":
                         saddr, ssize = struct.unpack("<QQ", sect[32:48])
                         soff = struct.unpack("<I", sect[48:52])[0]
@@ -63,10 +65,16 @@ def process_slice(data):
     assert text_len > 0, "__TEXT segment not found"
     assert hole >= 0, "__vcsig section not found in __TEXT"
     assert hole + HOLE <= text_len, "sig hole outside __TEXT: 0x%x > 0x%x" % (hole + HOLE, text_len)
-    assert data[hole:hole + 8] == MAGIC8, "__vcsig magic mismatch(口径破坏)"
-    # 哈希: __TEXT 跳洞(自引用消解 —— 与运行时 vcamSelfTextOK 口径一致)
+    # 哈希起始 = __TEXT 第一个 section 的 offset(物理内容区起点):
+    # ldid -S 重签会改 ncmds/sizeofcmds(逻辑值含 padding)与签名命令字节
+    # (CI before/after diff 实锤), 但物理内容区起点(第一个 section offset)
+    # 不变 —— 用它做口径比 sizeofcmds 稳(逻辑值≠物理边界)。load command
+    # 区由 trustcache CD hash 保护(改它=加载失败), 不在本校验范围。
+    skip = first_sect_off
+    assert skip is not None and skip < hole, "first section offset invalid"
+    # 哈希: [skip, text_len) 跳洞(自引用消解 —— 与运行时 vcamSelfTextOK 严格一致)
     h = hashlib.sha256()
-    h.update(data[:hole])
+    h.update(data[skip:hole])
     h.update(data[hole + HOLE:text_len])
     digest = h.digest()
     # 写洞(魔数 8B 保持, 后 32B 写哈希)
