@@ -1644,21 +1644,14 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
         if (!strongSelf) return;
         static uint64_t lastLightSig = 0;
         BOOL lEnabled = [pl[@"lightEnabled"] boolValue];
-        uint32_t lColor = 0;
-        // 1.3.67: 色档总线优先(slot 1-6; SB/App 检测端只分档, 色值在本端
-        // md T 表映射 —— SB 端 T 表解密失败实锤, 唯 md ok=1)。总线无新鲜
-        // 数据时 fallback plist(同样存 slot 编号)。
-        int busSlot = 0;
+        // 1.3.69 原版逻辑回退: 总线直接携带标准纯色(检测端内置色表, 不经
+        // T 表 —— SB 端 T 表解密失败导致光永远不亮的教训)。md 无任何映射,
+        // 读到什么打什么。总线不新鲜(检测全关)时 fallback plist(同样存色值)。
+        uint32_t lColor = (uint32_t)[pl[@"lightColor"] unsignedIntValue];
         int busCnt = 0;
-        int slot = 0;
-        if ([VCamNotify vcamPickSharedSlot:&busSlot count:&busCnt]) {
-            slot = busSlot;
-        } else {
-            slot = (int)[pl[@"lightColor"] unsignedIntValue];  // plist fallback(slot 语义)
-        }
-        if (slot >= 1 && slot <= 6) {
-            // md 端 T 表色值(方案A: 验签通过的密钥才有正确色; T nil → 0 = 熄灭)
-            lColor = [VCamNotify vcamLicenseTableInt:(NSUInteger)slot];
+        uint32_t busColor = 0;
+        if ([VCamNotify vcamPickSharedColor:&busColor count:&busCnt]) {
+            lColor = busColor;
         }
         int lX = [pl[@"lightX"] intValue];
         int lY = [pl[@"lightY"] intValue];
