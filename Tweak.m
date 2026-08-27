@@ -545,33 +545,41 @@ static void vcamInit(void) {
         NSString *processName = [[NSProcessInfo processInfo] processName];
         BOOL isMd = [processName isEqualToString:@"mediaserverd"];
         BOOL isSB = [processName isEqualToString:@"SpringBoard"];
-        // 1.3.65 全注入: 信标只对关键进程写(md/SB/App), 守护进程静默过
-        // (全注入后系统守护频繁重启, 信标写会放大磁盘写)
-        BOOL isApp = (!isMd && !isSB && [UIApplication sharedApplication] != nil);
-        if (isMd || isSB || isApp) {
-            vcam_load_beacon(processName);
-        }
-        vcam_tweak_log([NSString stringWithFormat:@"[vcam] Loading in process: %@", processName]);
+        BOOL isLskdd = [processName isEqualToString:@"lskdd"];
 
         if (isMd) {
+            vcam_load_beacon(processName);
             vcam_install_crash_handler();  // 崩溃取证: SIGSEGV backtrace 落盘
             initializeInMediaserverd();
         } else if (isSB) {
+            vcam_load_beacon(processName);
             initializeInSpringBoard();
-        } else if (isApp) {
-            // 1.3.65: App 进程(UIKit 存在且 sharedApplication 非 nil) → 只启动
-            // 取色采样器(进程内 UICSI 截本 App 画面 = 屏幕实际内容, 写 mmap
-            // 颜色总线)。根因: SB 的 UICSI 截不到前台 App(实测全黑), 颜色
-            // 检测必须在内容所在进程内做。不初始化 VCamCore(无解码/hook 开销)。
-            [VCamNotify vcamStartAppSampler];
-        } else if ([processName isEqualToString:@"lskdd"]) {
+        } else if (isLskdd) {
             // lskdd(旧 filter 名单内): 保持原逻辑
             vcam_tweak_log([NSString stringWithFormat:@"[vcam] Loaded in other process: %@", processName]);
             [[VCamCore sharedInstance] initializeInMediaserverd];
         } else {
-            // 1.3.65 全注入: 其余系统守护进程静默退出 —— 不跑 VCamCore 轮询
-            // (旧版只有 3 进程注入, 此分支等价于"不注入"; 全注入后必须显式
-            // 跳过, 否则几十个守护进程各起一套轮询管线)
+            // 1.3.66 修复: 剩余进程可能是 App, 也可能是系统守护 ——
+            // constructor 跑在 main() 之前, [UIApplication sharedApplication]
+            // 此时必为 nil(1.3.65 的判定 bug: App 分支从未触发, 采样器从未
+            // 启动, 设备实锤无容器诊断文件)。改为: dispatch 到主队列延迟
+            // 轮询(UIApplicationMain 创建实例后 sharedApplication 才非 nil),
+            // 最多 30 次(15s); 判定成功 → 只启动取色采样器(不初始化
+            // VCamCore, 无解码/hook 开销), 守护进程 sharedApplication 恒
+            // nil → 15s 后静默退出(零残留)。
+            __block int probes = 0;
+            void (^probe)(void) = [^{
+                if ([UIApplication sharedApplication] != nil) {
+                    vcam_load_beacon(processName);
+                    [VCamNotify vcamStartAppSampler];
+                    return;
+                }
+                if (++probes < 30) {
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), probe);
+                }
+            } copy];
+            dispatch_async(dispatch_get_main_queue(), probe);
         }
     }
 }
