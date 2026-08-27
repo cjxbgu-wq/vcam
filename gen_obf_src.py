@@ -453,15 +453,18 @@ IDENT_RENAMES = {
     'vcamFillT': 'qvFt',                        # C static(VCamFloatingBall.m): T 快照
     # 1.3.65 取色采样器: 采样/共享总线方法名(含检测语义)
     'vcamStartAppSampler': 'qvSa',              # 类方法: App 采样器入口
-    'vcamAppSampleAtX': 'qvAp',                 # 类方法: 采样一拍(进程内 UICSI)
+    'vcamAppSampleSlotAtX': 'qvAp',             # 类方法: 采样一拍(返色档)
     'vcamNotifyPickSlot': 'qvNp',               # 类方法: Darwin slot 上行
     'vcamStartPickRelay': 'qvSr',               # 类方法: SB 中继
-    'vcamPickPublishColor': 'qvPb',             # 类方法: 总线写端
-    'vcamPickSharedColor': 'qvRd',              # 类方法: 总线读端
+    'vcamPublishPickCfg': 'qvPc',               # 类方法: 配置下行(Darwin+state)
+    'vcamPickPublishSlot': 'qvPb',              # 类方法: 总线写端(slot)
+    'vcamPickSharedSlot': 'qvRd',               # 类方法: 总线读端(slot)
     'vcamMatchKnownLightShared': 'qvMk',        # 类方法: 共享颜色匹配
     'vcamMatchKnownLight': 'qvMl',              # C static(VCamFloatingBall.m): name 外壳
+    'vcamSlotPreviewColor': 'qzSp',             # C static(VCamFloatingBall.m): 档位预览色
     'vcamPickShmMap': 'qzSm',                   # C static(VCamNotify.m): mmap 映射
     'vcamPickSlotName': 'qzPn',                 # C static(VCamNotify.m): slot 通知名
+    'vcamPickCfgName': 'qzCn',                  # C static(VCamNotify.m): cfg 通知名
     'detectWithUICreateScreenImage': 'dwUSI',   # 方法名(VCamFloatingBall.m): UICSI 符号词(1.3.65 gate)
     'vcamSelfIntegrityOK': 'qvSi',              # C static(VCamCore.m): IMP 范围自检
     'vcamDlsymTrusted': 'qzDs',                 # C static(VCamNotify.m): 可信符号解析
