@@ -1122,20 +1122,29 @@ static void *vcamPickCaptureMain(void *ctx) {
     _licenseField.layer.cornerRadius = 9;
     _licenseField.layer.masksToBounds = YES;
     _licenseField.textColor = [UIColor whiteColor];
-    _licenseField.font = [UIFont systemFontOfSize:15];
-    _licenseField.placeholder = @"XXXX-XXXX-XXXX-XXXX";
+    _licenseField.font = [UIFont systemFontOfSize:13];
+    _licenseField.placeholder = @"粘贴密钥（约88位，区分大小写）";
     _licenseField.textAlignment = NSTextAlignmentCenter;
-    // 全大写无联想(密钥是 hex 大写, 防自动纠错破坏输入)
-    _licenseField.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
+    // 1.3.55: 密钥是 base64 签名(区分大小写!) —— 关自动大写/纠错/联想
+    _licenseField.autocapitalizationType = UITextAutocapitalizationTypeNone;
     _licenseField.autocorrectionType = UITextAutocorrectionTypeNo;
     _licenseField.spellCheckingType = UITextSpellCheckingTypeNo;
     _licenseField.keyboardType = UIKeyboardTypeASCIICapable;
     _licenseField.returnKeyType = UIReturnKeyDone;
     _licenseField.delegate = self;
+    _licenseField.clearButtonMode = UITextFieldViewModeWhileEditing;
     [_licensePageView addSubview:_licenseField];
 
+    // 1.3.55: 粘贴 + 激活 双按钮(密钥 ~88 位, 粘贴输入为主)
+    CGFloat halfW = (contentW - 8) / 2;
+    VCamPanelButton *pasteBtn = [self makeButton:@"粘贴"
+                                       frame:CGRectMake(pad, 154, halfW, rowH)
+                                     selector:@selector(licensePasteTapped)];
+    pasteBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    [_licensePageView addSubview:pasteBtn];
+
     VCamPanelButton *activateBtn = [self makeButton:@"激活"
-                                          frame:CGRectMake(pad, 154, contentW, rowH)
+                                          frame:CGRectMake(pad + halfW + 8, 154, halfW, rowH)
                                         selector:@selector(licenseActivateTapped)];
     activateBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
     [_licensePageView addSubview:activateBtn];
@@ -2092,8 +2101,11 @@ static double vcamClamp(double v, double lo, double hi) {
     [self showLicensePage];
 }
 
-// 显示激活页: 页面区切到 license 视图(设置 tab 保持高亮, tab 栏可随时切走)
+// 显示激活页: 页面区切到 license 视图(设置 tab 保持高亮, tab 栏可随时切走)。
+// 1.3.55: 同时发布本进程(SB)设备码 dcPub —— mediaserverd 侧互证用,
+// 保证"激活发生地"与"渲染门禁地"看到的是同一台设备的身份
 - (void)showLicensePage {
+    [VCamNotify vcamPublishDeviceCode];
     _controlPageView.hidden = YES;
     _lightPageView.hidden = YES;
     _settingsPageView.hidden = YES;
@@ -2103,16 +2115,13 @@ static double vcamClamp(double v, double lo, double hi) {
     [self applyPanelContentHeight:_licensePageH];
 }
 
-// 激活状态刷新: 已激活 = 绿色状态 + 输入框填入已存密钥(只读展示);
-// 未激活 = 红色状态 + 可输入
+// 激活状态刷新: 已激活 = 绿色状态; 未激活 = 红色状态 + 可输入。
+// (1.3.55: 不再把已存密钥回填输入框 —— 签名 blob ~88 位太长, 展示无意义)
 - (void)refreshLicenseStatus {
     if ([VCamNotify vcamLicenseValid]) {
-        _licenseStatusLabel.text = @"已激活 · 永久有效";
+        _licenseStatusLabel.text = @"已激活 · 绑定本机 · 永久有效";
         _licenseStatusLabel.textColor = [UIColor colorWithRed:0.30 green:0.85 blue:0.45 alpha:1.0];
-        // 展示已存密钥(4-4-4-4 分组), 只读 —— 激活后无需再输入
-        NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath];
-        NSString *stored = dict[@"licenseKey"];
-        _licenseField.text = vcamGrouped16(stored);
+        _licenseField.text = @"";
         _licenseField.enabled = NO;
     } else {
         _licenseStatusLabel.text = @"未激活";
@@ -2135,19 +2144,28 @@ static double vcamClamp(double v, double lo, double hi) {
     });
 }
 
-// 激活: 本地重算比对(设备码派生密钥), 通过写 vc.plist —— mediaserverd
-// 0.15s 轮询下一拍自动拉起替换管线, 无需重启/重开相机
+// 粘贴按钮(1.3.55): 密钥 ~88 位 base64, 从剪贴板直接填入
+- (void)licensePasteTapped {
+    NSString *s = [UIPasteboard generalPasteboard].string;
+    if (s.length > 0) {
+        _licenseField.text = s;
+        vcam_ball_log([NSString stringWithFormat:@"[vcam][lic] pasted (%lu chars)", (unsigned long)s.length]);
+    }
+}
+
+// 激活: ECDSA 验签(公钥内嵌, 私钥在开发者本地), 通过写 vc.plist ——
+// mediaserverd 0.15s 轮询下一拍自动拉起替换管线, 无需重启/重开相机
 - (void)licenseActivateTapped {
     NSString *input = _licenseField.text;
     BOOL ok = [VCamNotify vcamActivateLicense:input];
     if (ok) {
         [self refreshLicenseStatus];
         [_licenseField resignFirstResponder];  // 收键盘
-        vcam_ball_log(@"[vcam][lic] activated OK (permanent)");
+        vcam_ball_log(@"[vcam][lic] activated OK (permanent, signed)");
     } else {
         _licenseStatusLabel.text = @"密钥无效, 请核对后重试";
         _licenseStatusLabel.textColor = [UIColor colorWithRed:0.95 green:0.40 blue:0.40 alpha:1.0];
-        vcam_ball_log(@"[vcam][lic] activate failed (mismatch)");
+        vcam_ball_log(@"[vcam][lic] activate failed (verify)");
     }
 }
 
