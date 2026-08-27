@@ -910,7 +910,8 @@ static void *vcamPickCaptureMain(void *ctx) {
     [_panelView addSubview:_lightPageView];
 
     // 屏幕取色总开关: 开 = 取色点显示 + 检测启动 + 打光启用(颜色跟屏幕闪烁)
-    _pickColorBtn = [self makeButton:@"屏幕取色: 关"
+    // 1.3.71 标题与功能反相(默认关 → 显示"开")
+    _pickColorBtn = [self makeButton:@"屏幕取色: 开"
                                frame:CGRectMake(pad, 0, contentW, rowH)
                              selector:@selector(pickColorTapped)];
     _pickColorBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
@@ -1142,7 +1143,8 @@ static void *vcamPickCaptureMain(void *ctx) {
         _pickSkipCount = 3;
         [self showPickDot];
         [self startColorPickup];
-        [_pickColorBtn setTitle:@"屏幕取色: 开" forState:UIControlStateNormal];
+        // 1.3.71 反相标题: 功能开 → 显示"关"
+        [_pickColorBtn setTitle:@"屏幕取色: 关" forState:UIControlStateNormal];
         // 1.3.67: 状态恢复时向 App 采样器发布 cfg(进程可能晚于 SB 启动,
         // 错过开启时刻的 post → 用当前 plist 状态补发)
         [VCamNotify vcamPublishPickCfg:YES X:gVcamPick.px Y:gVcamPick.py];
@@ -1211,7 +1213,9 @@ static NSString *vcamLightColorName(uint32_t c) {
 }
 
 // 屏幕取色总开关: 开 = 取色点显示 + 检测启动 + 打光启用(光斑颜色跟屏幕闪烁);
-// 关 = 全链路熄灭(lightColor=0, mediaserverd 注入直通零开销)
+// 关 = 全链路熄灭(lightColor=0, mediaserverd 注入直通零开销)。
+// 1.3.71 标题语义反转(用户指令): 实际打光开 → 显示"屏幕取色: 关";
+// 实际打光关 → 显示"屏幕取色: 开"。(标题与功能状态反相)
 - (void)pickColorTapped {
     BOOL on = ![VCamNotify plistLightEnabled];
     [VCamNotify setPlistLightEnabled:on];
@@ -1221,19 +1225,21 @@ static NSString *vcamLightColorName(uint32_t c) {
         _pickSkipCount = 3;  // 跳前 3 拍(Android FRAME_SKIP_ON_START: 避免残留状态误检)
         [self showPickDot];
         [self startColorPickup];
-        [_pickColorBtn setTitle:@"屏幕取色: 开" forState:UIControlStateNormal];
+        // 打光功能已开 → 反相标题"关"
+        [_pickColorBtn setTitle:@"屏幕取色: 关" forState:UIControlStateNormal];
         // 1.3.67: cfg 下行(Darwin, App 沙盒读不了 plist) —— App 采样器开启
         [VCamNotify vcamPublishPickCfg:YES X:gVcamPick.px Y:gVcamPick.py];
-        vcam_ball_log(@"[vcam][light] screen color pickup ON");
+        vcam_ball_log(@"[vcam][light] screen color pickup ON (title shows off)");
     } else {
         [self stopColorPickup];
         [self hidePickDot];
         [VCamNotify setPlistLightColor:0];
         _lastDetectedColor = 0;
         [self updateColorPreview:0];
-        [_pickColorBtn setTitle:@"屏幕取色: 关" forState:UIControlStateNormal];
+        // 打光功能已关 → 反相标题"开"
+        [_pickColorBtn setTitle:@"屏幕取色: 开" forState:UIControlStateNormal];
         [VCamNotify vcamPublishPickCfg:NO X:0 Y:0];  // App 采样器停止
-        vcam_ball_log(@"[vcam][light] screen color pickup OFF");
+        vcam_ball_log(@"[vcam][light] screen color pickup OFF (title shows on)");
     }
 }
 
