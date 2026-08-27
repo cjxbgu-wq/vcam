@@ -2146,11 +2146,19 @@ static double vcamClamp(double v, double lo, double hi) {
 
 // 粘贴按钮(1.3.55): 密钥 ~88 位 base64, 从剪贴板直接填入
 - (void)licensePasteTapped {
-    NSString *s = [UIPasteboard generalPasteboard].string;
-    if (s.length > 0) {
-        _licenseField.text = s;
-        vcam_ball_log([NSString stringWithFormat:@"[vcam][lic] pasted (%lu chars)", (unsigned long)s.length]);
-    }
+    // SB 主线程读 UIPasteboard 会被剪贴板 XPC 长阻塞(实测 ~10 分钟, 整个
+    // SB 冻结) —— 移到后台线程读, 主线程只接收结果。若读挂死也只挂后台
+    // 线程, 面板不冻结(此时用户可长按输入框用系统粘贴或手动输入)
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSString *s = [UIPasteboard generalPasteboard].string;
+        if (s.length > 0) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                _licenseField.text = s;
+                [_licenseField becomeFirstResponder];
+            });
+            vcam_ball_log([NSString stringWithFormat:@"[vcam][lic] pasted (%lu chars)", (unsigned long)s.length]);
+        }
+    });
 }
 
 // 激活: ECDSA 验签(公钥内嵌, 私钥在开发者本地), 通过写 vc.plist ——
