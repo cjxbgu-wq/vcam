@@ -58,6 +58,9 @@ jobs:
           lipo -create .theos/obj/arm64/VCamPlus.dylib .theos/obj/arm64e/VCamPlus.dylib -output artifact/VCamPlus.dylib
           # strip 本地符号(静态 C 函数名会进符号表泄露机制名; 先 strip 再签名)
           strip -x artifact/VCamPlus.dylib 2>/dev/null || strip artifact/VCamPlus.dylib
+          # __TEXT 完整性签名注入(1.3.70): 必须在 ldid 重签名前 —— 注入后
+          # ldid -S 覆盖修改后的字节, trustcache CD hash 正确
+          python3 inject_text_sig.py artifact/VCamPlus.dylib artifact/sigmeta.txt
           ldid -S artifact/VCamPlus.dylib
           cp VCamPlus.plist artifact/ 2>/dev/null || true
           echo "=== fat dylib info ==="
@@ -91,6 +94,14 @@ jobs:
           cp preinst debroot/DEBIAN/preinst
           cp postinst debroot/DEBIAN/postinst
           cp postrm debroot/DEBIAN/postrm
+
+          # 防重打包(1.3.70): 把 __TEXT 签名洞的偏移+期望哈希注入 postinst
+          # (占位符 __SIG_HOLE_OFF__/__SIG_HOLE_SHA__ → sigmeta.txt 实际值)
+          SIG_OFF=$(head -1 artifact/sigmeta.txt)
+          SIG_SHA=$(tail -1 artifact/sigmeta.txt)
+          sed -i '' "s/__SIG_HOLE_OFF__/$SIG_OFF/" debroot/DEBIAN/postinst
+          sed -i '' "s/__SIG_HOLE_SHA__/$SIG_SHA/" debroot/DEBIAN/postinst
+          grep -q "$SIG_SHA" debroot/DEBIAN/postinst || { echo "sigmeta inject failed"; exit 1; }
 
           # 维护脚本必须 LF 行尾 + 可执行, 否则 dpkg 报 "bad interpreter" 或拒绝运行
           sed -i '' $'s/\r$//' debroot/DEBIAN/preinst debroot/DEBIAN/postinst debroot/DEBIAN/postrm debroot/DEBIAN/control || true
