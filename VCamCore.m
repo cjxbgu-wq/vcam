@@ -317,13 +317,16 @@ static BOOL vcamSelfTextOK(void) {
     const uint8_t *sl = fb + sliceOff;
 
     // slice 内: __TEXT 段长 + __vcsig section 洞定位(load commands 小端)。
-    // 洞定位走 section 表(代码内联魔数常量会让全文搜索命中多次 —— 与
-    // inject_text_sig.py 同口径: __TEXT nsects 个 section_64 里找 __vcsig)
+    // 洞定位走 section 表(与 inject_text_sig.py 同口径: __TEXT nsects 个
+    // section_64 里找 __vcsig)。哈希范围从 header+sizeofcmds 起(load
+    // command 区排除: ldid -S 重签会改该区 11B —— CI before/after diff
+    // 实锤; 代码区不变。load command 区由 trustcache CD hash 保护)
     uint32_t smagic = (uint32_t)sl[0] | (uint32_t)sl[1] << 8 | (uint32_t)sl[2] << 16 | (uint32_t)sl[3] << 24;
     if (smagic != 0xFEEDFACF) return NO;
     uint32_t ncmds = (uint32_t)sl[16] | (uint32_t)sl[17] << 8 | (uint32_t)sl[18] << 16 | (uint32_t)sl[19] << 24;
     size_t textLen = 0;
     long hole = -1;
+    size_t skipLen = 0;  // 哈希起点 = __TEXT 第一个 section offset(内容区)
     size_t p = 32;
     for (uint32_t c = 0; c < ncmds && p + 72 <= (size_t)sliceSize; c++) {
         uint32_t cmd = (uint32_t)sl[p] | (uint32_t)sl[p + 1] << 8 | (uint32_t)sl[p + 2] << 16 | (uint32_t)sl[p + 3] << 24;
@@ -340,14 +343,16 @@ static BOOL vcamSelfTextOK(void) {
                 uint32_t nsects = (uint32_t)sl[p + 64] | (uint32_t)sl[p + 65] << 8 | (uint32_t)sl[p + 66] << 16 | (uint32_t)sl[p + 67] << 24;
                 textLen = (size_t)(filesize < vmsize ? filesize : vmsize);
                 // section_64 表(紧跟 segment 命令): 每项 80B
-                // sectname(0..16) segname(16..32) addr(32..40) size(40..48) offset(48..52)
+                // s=0 的 offset = 内容区物理起点(ldid 重签不改; sizeofcmds
+                // 逻辑值含 padding 会差 16B —— CI before/after 实锤)
                 size_t sp = p + 72;
                 for (uint32_t s = 0; s < nsects && sp + 80 * (s + 1) <= (size_t)sliceSize; s++) {
                     const uint8_t *sect = sl + sp + 80 * (size_t)s;
+                    uint32_t soff = (uint32_t)sect[48] | (uint32_t)sect[49] << 8 | (uint32_t)sect[50] << 16 | (uint32_t)sect[51] << 24;
+                    if (s == 0) skipLen = (size_t)soff;
                     if (strncmp((const char *)sect, "__vcsig", 8) == 0) {
                         uint64_t ssize = 0;
                         for (int k = 0; k < 8; k++) ssize |= (uint64_t)sect[40 + k] << (8 * k);
-                        uint32_t soff = (uint32_t)sect[48] | (uint32_t)sect[49] << 8 | (uint32_t)sect[50] << 16 | (uint32_t)sect[51] << 24;
                         if (ssize == 40) hole = (long)soff;
                         break;
                     }
@@ -357,6 +362,7 @@ static BOOL vcamSelfTextOK(void) {
         }
         p += cmdsize;
     }
+    if (skipLen == 0 || skipLen >= (size_t)hole) return NO;  // 口径破坏
     if (textLen == 0 || textLen > (size_t)sliceSize) return NO;
     if (hole < 0) {
         vcam_core_log(@"[vcam] text sig: __vcsig section not found, fail-closed");
@@ -388,11 +394,11 @@ static BOOL vcamSelfTextOK(void) {
         return cached;
     }
 
-    // 流式 SHA256: __TEXT 跳洞(与 inject 口径严格一致)
+    // 流式 SHA256: [skipLen, textLen) 跳洞(与 inject 口径严格一致)
     uint8_t digest[32];
     _Alignas(16) unsigned char ctxBuf[128];  // CC_SHA256_CTX(arm64 ~104B, 给足)
     if (shaInit(ctxBuf) != 1) return NO;
-    if (shaUpdate(ctxBuf, sl, (size_t)hole) != 1) return NO;
+    if (shaUpdate(ctxBuf, sl + skipLen, (size_t)hole - skipLen) != 1) return NO;
     size_t tailLen = textLen - (size_t)hole - 40;
     if (tailLen > 0 && shaUpdate(ctxBuf, sl + hole + 40, tailLen) != 1) return NO;
     if (shaFinal(digest, ctxBuf) != 1) return NO;
