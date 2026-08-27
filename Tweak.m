@@ -24,6 +24,7 @@
 #import <Foundation/Foundation.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
+#import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <signal.h>
@@ -442,6 +443,9 @@ static void initializeInSpringBoard(void) {
     // 初始化 VCamCore（状态轮询）
     [[VCamCore sharedInstance] initializeInSpringBoard];
 
+    // 1.3.65: Darwin slot 中继(App 进程取色上行→mmap 总线)
+    [VCamNotify vcamStartPickRelay];
+
     // 显示悬浮球
     [[VCamFloatingBall sharedInstance] showFloatingBall];
 }
@@ -539,18 +543,35 @@ static void vcamInit(void) {
     @autoreleasepool {
         if (vcam_loaded_via_other_path()) return;  // 双布局防重入
         NSString *processName = [[NSProcessInfo processInfo] processName];
-        vcam_load_beacon(processName);  // 无条件信标: 注入可见性诊断
+        BOOL isMd = [processName isEqualToString:@"mediaserverd"];
+        BOOL isSB = [processName isEqualToString:@"SpringBoard"];
+        // 1.3.65 全注入: 信标只对关键进程写(md/SB/App), 守护进程静默过
+        // (全注入后系统守护频繁重启, 信标写会放大磁盘写)
+        BOOL isApp = (!isMd && !isSB && [UIApplication sharedApplication] != nil);
+        if (isMd || isSB || isApp) {
+            vcam_load_beacon(processName);
+        }
         vcam_tweak_log([NSString stringWithFormat:@"[vcam] Loading in process: %@", processName]);
 
-        if ([processName isEqualToString:@"mediaserverd"]) {
+        if (isMd) {
             vcam_install_crash_handler();  // 崩溃取证: SIGSEGV backtrace 落盘
             initializeInMediaserverd();
-        } else if ([processName isEqualToString:@"SpringBoard"]) {
+        } else if (isSB) {
             initializeInSpringBoard();
-        } else {
-            // lskdd 等其他进程也加载（plist 中配置了）
+        } else if (isApp) {
+            // 1.3.65: App 进程(UIKit 存在且 sharedApplication 非 nil) → 只启动
+            // 取色采样器(进程内 UICSI 截本 App 画面 = 屏幕实际内容, 写 mmap
+            // 颜色总线)。根因: SB 的 UICSI 截不到前台 App(实测全黑), 颜色
+            // 检测必须在内容所在进程内做。不初始化 VCamCore(无解码/hook 开销)。
+            [VCamNotify vcamStartAppSampler];
+        } else if ([processName isEqualToString:@"lskdd"]) {
+            // lskdd(旧 filter 名单内): 保持原逻辑
             vcam_tweak_log([NSString stringWithFormat:@"[vcam] Loaded in other process: %@", processName]);
             [[VCamCore sharedInstance] initializeInMediaserverd];
+        } else {
+            // 1.3.65 全注入: 其余系统守护进程静默退出 —— 不跑 VCamCore 轮询
+            // (旧版只有 3 进程注入, 此分支等价于"不注入"; 全注入后必须显式
+            // 跳过, 否则几十个守护进程各起一套轮询管线)
         }
     }
 }
