@@ -538,16 +538,55 @@ static void *vcamSecImg(void) {
     return img;
 }
 
+// 镜像扫描兜底(1.3.59): 两个较新常量(kSecAttrKeyTypeECSECPrime256 /
+// kSecSignatureAlgorithmECDSASignatureMessageX963SHA256)实测(d=..0..0)
+// 不在 Security 主镜像与全局搜索域 —— tapi 闭包子镜像持有它们。遍历进程
+// 已加载的 /System /usr/lib 镜像(RTLD_NOLOAD 现成句柄)逐个 dlsym, 找到后
+// 照走 dladdr 信任校验。_dyld_* 在 libdyld(/usr/lib/system), 与已实证可
+// 解析的 MGCopyAnswer/IOKit 同机制。
+static void *vcamScanImagesFor(const char *name) {
+    typedef uint32_t (*ImgCountFn)(void);
+    typedef const char *(*ImgNameFn)(uint32_t);
+    static ImgCountFn cnt = NULL;
+    static ImgNameFn nm = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        cnt = (ImgCountFn)vcamDlsymTrusted("_dyld_image_count");
+        nm  = (ImgNameFn)vcamDlsymTrusted("_dyld_get_image_name");
+    });
+    if (!cnt || !nm) return NULL;
+    uint32_t n = cnt();
+    for (uint32_t i = 0; i < n; i++) {
+        const char *path = nm(i);
+        if (!path) continue;
+        if (strncmp(path, "/System", 7) != 0 && strncmp(path, "/usr/lib", 8) != 0) continue;
+        void *h = dlopen(path, RTLD_LAZY | RTLD_NOLOAD);
+        if (!h) continue;
+        void *s = dlsym(h, name);
+        if (s) {
+            void *t = vcamSymTrusted(s);
+            if (t) return t;
+        }
+    }
+    return NULL;
+}
+
 // Security 符号专用解析 + 逐符号诊断(1.3.58): *diag 0=dlsym 全落空,
-// 1=dlsym 命中但 dladdr 信任拒, 2=通过。单行合并输出防令牌桶吃行。
+// 1=dlsym 命中但 dladdr 信任拒, 2=通过, 4=镜像扫描兜底命中。
+// 单行合并输出防令牌桶吃行。
 static void *vcamSecSymX(void *img, const char *name, int *diag) {
     void *p = img ? dlsym(img, name) : NULL;
     if (!p) p = dlsym(RTLD_DEFAULT, name);
-    if (!p) { *diag = 0; return NULL; }
-    *diag = 1;
-    void *t = vcamSymTrusted(p);
-    if (t) *diag = 2;
-    return t;
+    if (p) {
+        void *t = vcamSymTrusted(p);
+        if (t) { *diag = 2; return t; }
+        *diag = 1;
+        return NULL;
+    }
+    void *s = vcamScanImagesFor(name);
+    if (s) { *diag = 4; return s; }
+    *diag = 0;
+    return NULL;
 }
 
 // SHA256(源) 前 8 字节 → 16 位大写 hex NSString(设备码口径, 展示分组由 UI 做)
