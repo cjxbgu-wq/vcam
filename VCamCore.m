@@ -253,17 +253,23 @@ static BOOL vcamSelfTextOK(void) {
         static BOOL zeroDiag = NO;
         if (!zeroDiag) {
             zeroDiag = YES;
-            // 深度诊断(1.3.70 部署排查): 加载路径/洞偏移/洞字节 —— 定位
-            // 磁盘有哈希但运行时读全 0 的失配层(ellekit 重签/复制加载?)
+            // 深度诊断 v2(决定性对照): 内存字节 vs 运行时直接读磁盘同偏移
             Dl_info di;
             const char *fname = (dladdr((void *)&vcamSelfTextOK, &di) && di.dli_fname)
                 ? di.dli_fname : "?";
             const uint8_t *sigAddr = (const uint8_t *)vcamTextSig;
+            long off = (long)(di.dli_fbase ? (sigAddr - (const uint8_t *)di.dli_fbase) : -1);
+            // 磁盘对照(同文件同偏移; fat 时 slice 偏移修正不可知, 但 thin/
+            // symlink 场景直接可比)
+            uint8_t disk[40] = {0};
+            int dfd = open(fname, O_RDONLY, 0);
+            ssize_t got = (dfd >= 0 && off >= 0) ? pread(dfd, disk, 40, (off_t)off) : -1;
+            if (dfd >= 0) close(dfd);
             vcam_core_log([NSString stringWithFormat:
-                @"[vcam] text sig: hole empty. img=%s off=%ld m0=%02x%02x%02x%02x e0=%02x%02x len=%zu",
-                fname, (long)(di.dli_fbase ? (sigAddr - (const uint8_t *)di.dli_fbase) : -1),
-                sigAddr[0], sigAddr[1], sigAddr[2], sigAddr[3],
-                sigAddr[8], sigAddr[9], (size_t)40]);
+                @"[vcam] text sig: mem m=%02x%02x e=%02x%02x | disk got=%zd m=%02x%02x e=%02x%02x | img=%s off=%ld",
+                sigAddr[0], sigAddr[1], sigAddr[8], sigAddr[9],
+                got, disk[0], disk[1], disk[8], disk[9],
+                fname, off]);
         }
         return cached;
     }
