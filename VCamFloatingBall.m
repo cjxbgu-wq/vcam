@@ -1375,17 +1375,16 @@ static NSString *vcamLightColorName(uint32_t c) {
         // (读共享变量, UICSI 模式 ~3ms)
         _colorPickQueue = dispatch_get_main_queue();
     }
-    // 1.3.45: 0.05s → 0.04s(25Hz)。1.3.49: 自适应双档 —— 颜色活跃(0.5s 内
-    // 有跳变, 闪烁跟随正是活跃期)快档 0.02s(50Hz, 检测相位延迟平均 10ms,
-    // 主线程 ~15% 但相机 App 前台时 SB 主线程基本空闲); 稳定后回落 25Hz。
+    // 1.3.45: 0.05s → 0.04s(25Hz)。1.3.49: 自适应双档。1.3.77: 降半(发热
+    // 根修)快档 0.04s(25Hz), 稳定回落 12.5Hz; SB 非前台时 tick 直接跳过。
     // 开启即快档: 第一抹颜色最快出现
     _pickFastMode = YES;
     _lastPickChangeAt = CFAbsoluteTimeGetCurrent();
     _colorPickTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _colorPickQueue);
     dispatch_source_set_timer(_colorPickTimer,
-                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.02 * NSEC_PER_SEC)),
-                              (uint64_t)(0.02 * NSEC_PER_SEC),
-                              (uint64_t)(0.008 * NSEC_PER_SEC));
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.04 * NSEC_PER_SEC)),
+                              (uint64_t)(0.04 * NSEC_PER_SEC),
+                              (uint64_t)(0.015 * NSEC_PER_SEC));
     __weak typeof(self) weakSelf = self;
     dispatch_source_set_event_handler(_colorPickTimer, ^{
         __strong typeof(weakSelf) strongSelf = weakSelf;
@@ -1464,6 +1463,14 @@ static NSString *vcamLightColorName(uint32_t c) {
     if (_pickSuspended) return;
     if (_pickSkipCount > 0) { _pickSkipCount--; return; }
 
+    // 1.3.77 CPU 根修: SB 非前台(任意 App 在前)时, 本端检测结果全部被
+    // 丢弃(写仲裁: App 前台时总线被 App 进程采样器独占), 但检测/截屏
+    // 仍以 25-50Hz 全速运行 —— 纯烧 CPU 且 SpringBoard 卡 = 整机卡顿
+    // (设备实测: 打光开启后手机非常卡发热严重)。Inactive 直接跳过检测,
+    // 回桌面(Active)自动恢复。
+    UIApplication *sbAppEarly = [UIApplication sharedApplication];
+    if (sbAppEarly && sbAppEarly.applicationState != UIApplicationStateActive) return;
+
     // tick 心跳诊断(1.3.40, 1.3.49 改时间驱动): 每秒一行, 定位 检测timer/
     // 捕获线程/看门狗 哪层没动(自适应节拍下 tick 数不再与秒数对应)
     static long tickCount = 0;
@@ -1481,16 +1488,18 @@ static NSString *vcamLightColorName(uint32_t c) {
 
     // 1.3.49 自适应节拍: 颜色活跃(0.5s 内有跳变)→快档, 稳定→回落。
     // 切换在主队列 timer handler 内改 timer 参数(dispatch 允许, 线程正确)
+    // 1.3.77 降半(发热根修): 50/25Hz → 25/12.5Hz —— 桌面检测全屏捕获成本
+    // 减半; 打光有滑窗投票保稳定, 无需高频跟踪。
     BOOL wantFast = (CFAbsoluteTimeGetCurrent() - _lastPickChangeAt) < 0.5;
     if (wantFast != _pickFastMode) {
         _pickFastMode = wantFast;
-        double iv = wantFast ? 0.02 : 0.04;
+        double iv = wantFast ? 0.04 : 0.08;
         dispatch_source_set_timer(_colorPickTimer,
                                   dispatch_time(DISPATCH_TIME_NOW, (int64_t)(iv * NSEC_PER_SEC)),
                                   (uint64_t)(iv * NSEC_PER_SEC),
-                                  (uint64_t)((wantFast ? 0.008 : 0.015) * NSEC_PER_SEC));
+                                  (uint64_t)((wantFast ? 0.015 : 0.03) * NSEC_PER_SEC));
         vcam_ball_log([NSString stringWithFormat:
-            @"[vcam][light] pick cadence -> %@ (%@)", wantFast ? @"50Hz" : @"25Hz",
+            @"[vcam][light] pick cadence -> %@ (%@)", wantFast ? @"25Hz" : @"12.5Hz",
             wantFast ? @"color active" : @"stable"]);
     }
 
