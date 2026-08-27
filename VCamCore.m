@@ -18,6 +18,8 @@
 #import <mach/mach.h>
 #include <dlfcn.h>
 #include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <mach-o/loader.h>
 #include <objc/runtime.h>
 #import "VCamTextSig.h"
@@ -221,17 +223,21 @@ static BOOL vcamSelfIntegrityOK(void) {
     return res;
 }
 
-// ===== __TEXT 哈希自校验(1.3.70 防破解加强) =====
-// 原理: 构建期 inject_text_sig.py 对 dylib 每个 slice 的 __TEXT 段【全段】
-// 计算 SHA256, 写入 __DATA,__vcsig 段的"签名洞"(vcamTextSig: 8B 魔数 +
-// 32B 哈希; 洞不在 __TEXT → 无自引用, 哈希 100% 覆盖代码字节)。本函数
-// 运行时同口径重算: 任何对 __TEXT 的字节修改(改跳转/NOP 门禁/patch 常量)
-// → 哈希失配 → licMark 关门禁 → 替换/打光静默失效。
-// 洞在 __DATA(运行时只读映射), 篡改需 vm_protect 绕过; 且 md/SB 两侧
-// 独立计算, 单侧 patch 无效。
-// SHA256 走 CommonCrypto 流式 API(dlopen 显式加载 + dlsym)。
-// 开销: ~0.4MB __TEXT ≈ 2ms, 30s 节流一次, 结果缓存。
-// 洞内哈希全 0(本地未注入构建)→ 跳过校验(开发语义), 不误伤。
+// ===== __TEXT 哈希自校验(1.3.70 防破解加强, 磁盘口径) =====
+// 原理: 构建期 inject_text_sig.py 对 fat dylib 的 arm64e slice __TEXT 段
+// 跳 40B 签名洞计算 SHA256 写入洞内; 本函数运行时【直接读磁盘文件】用
+// 完全相同口径重算比对(洞在 __TEXT,__vcsig, inject 与本函数同源)。
+// 任何对 dylib __TEXT 的字节修改(改跳转/NOP 门禁/patch 常量)→ 磁盘
+// 哈希失配 → licMark 关门禁 → 替换/打光静默失效。
+//
+// 为什么磁盘口径而非内存口径(设备实锤教训): 洞放 __DATA 被 dyld chained
+// fixups 清零; 洞放 __TEXT 内存魔数在但哈希区仍被加载链路清零(ellekit
+// 缓存副本处理) —— 内存侧洞不可信。磁盘侧: dylib 文件被 RootHide
+// trustcache 锁定(CD hash 注册, 改文件=加载失败), 运行时磁盘校验与
+// trustcache 形成双保险; 内存 patch(改 COW 页)属高门槛攻击(需调试器+
+// root), 由 IMP 范围自检(vcamSelfIntegrityOK)另行覆盖。
+// 开销: ~760KB 读 + SHA256 ≈ 8ms, 30s 节流, md/SB 双侧独立。
+// 洞内哈希全 0(本地构建未注入)→ 跳过(开发语义)。
 static BOOL vcamSelfTextOK(void) {
     static BOOL cached = NO;
     static BOOL hasCache = NO;
@@ -241,38 +247,6 @@ static BOOL vcamSelfTextOK(void) {
     cachedAt = now;
     hasCache = YES;
     cached = NO;
-
-    // 洞内哈希全 0 = 构建期未注入 → 开发构建跳过(视为通过)
-    const uint8_t *expect = vcamTextSig + 8;
-    BOOL allZero = YES;
-    for (int i = 0; i < 32; i++) {
-        if (expect[i] != 0) { allZero = NO; break; }
-    }
-    if (allZero) {
-        cached = YES;
-        static BOOL zeroDiag = NO;
-        if (!zeroDiag) {
-            zeroDiag = YES;
-            // 深度诊断 v2(决定性对照): 内存字节 vs 运行时直接读磁盘同偏移
-            Dl_info di;
-            const char *fname = (dladdr((void *)&vcamSelfTextOK, &di) && di.dli_fname)
-                ? di.dli_fname : "?";
-            const uint8_t *sigAddr = (const uint8_t *)vcamTextSig;
-            long off = (long)(di.dli_fbase ? (sigAddr - (const uint8_t *)di.dli_fbase) : -1);
-            // 磁盘对照(同文件同偏移; fat 时 slice 偏移修正不可知, 但 thin/
-            // symlink 场景直接可比)
-            uint8_t disk[40] = {0};
-            int dfd = open(fname, O_RDONLY, 0);
-            ssize_t got = (dfd >= 0 && off >= 0) ? pread(dfd, disk, 40, (off_t)off) : -1;
-            if (dfd >= 0) close(dfd);
-            vcam_core_log([NSString stringWithFormat:
-                @"[vcam] text sig: mem m=%02x%02x e=%02x%02x | disk got=%zd m=%02x%02x e=%02x%02x | img=%s off=%ld",
-                sigAddr[0], sigAddr[1], sigAddr[8], sigAddr[9],
-                got, disk[0], disk[1], disk[8], disk[9],
-                fname, off]);
-        }
-        return cached;
-    }
 
     // CommonCrypto 流式 API(显式加载)
     typedef int (*Sha256InitFn)(void *);
@@ -296,46 +270,115 @@ static BOOL vcamSelfTextOK(void) {
         return NO;
     }
 
-    // 本镜像 header + __TEXT 文件长度(load commands 遍历)
+    // 本镜像文件路径(dladdr)
     Dl_info info;
-    if (dladdr((void *)&vcamSelfTextOK, &info) == 0 || !info.dli_fbase) return NO;
-    struct mach_header_64 *hdr = (struct mach_header_64 *)info.dli_fbase;
-    if (hdr->magic != MH_MAGIC_64) return NO;
-    size_t textLen = 0;
-    uint8_t *p = (uint8_t *)hdr + sizeof(struct mach_header_64);
-    for (uint32_t c = 0; c < hdr->ncmds; c++) {
-        struct load_command *lc = (struct load_command *)p;
-        if (lc->cmd == LC_SEGMENT_64) {
-            struct segment_command_64 *seg = (struct segment_command_64 *)p;
-            if (strncmp(seg->segname, "__TEXT", 6) == 0) {
-                // __TEXT fileoff=0 → 文件长度 = min(filesize, vmsize)
-                // (与 inject_text_sig.py 口径严格一致)
-                textLen = (size_t)(seg->filesize < seg->vmsize ? seg->filesize : seg->vmsize);
+    if (dladdr((void *)&vcamSelfTextOK, &info) == 0 || !info.dli_fname) return NO;
+    const char *fname = info.dli_fname;
+
+    // 读磁盘文件全文(763KB; 30s 节流一次可接受)
+    int fd = open(fname, O_RDONLY, 0);
+    if (fd < 0) return NO;
+    off_t fsz = lseek(fd, 0, SEEK_END);
+    if (fsz <= 0 || fsz > (64 << 20)) { close(fd); return NO; }
+    NSMutableData *fileData = [NSMutableData dataWithLength:(NSUInteger)fsz];
+    if (!fileData) { close(fd); return NO; }
+    if (pread(fd, fileData.mutableBytes, (size_t)fsz, 0) != (ssize_t)fsz) {
+        close(fd);
+        return NO;
+    }
+    close(fd);
+    const uint8_t *fb = (const uint8_t *)fileData.bytes;
+    size_t flen = (size_t)fsz;
+
+    // fat 定位 arm64e slice(fat 头大端: magic CAFEBABE/F, nfat, 20B/项)
+    uint32_t sliceOff = 0, sliceSize = 0;
+    uint32_t fmagic = (uint32_t)fb[0] << 24 | (uint32_t)fb[1] << 16 | (uint32_t)fb[2] << 8 | fb[3];
+    if (fmagic == 0xCAFEBABEu || fmagic == 0xCAFEBABFu) {
+        if (flen < 8) return NO;
+        uint32_t nfat = (uint32_t)fb[4] << 24 | (uint32_t)fb[5] << 16 | (uint32_t)fb[6] << 8 | fb[7];
+        for (uint32_t i = 0; i < nfat && 8 + 20 * (i + 1) <= flen; i++) {
+            const uint8_t *e = fb + 8 + 20 * i;
+            uint32_t cputype = (uint32_t)e[0] << 24 | (uint32_t)e[1] << 16 | (uint32_t)e[2] << 8 | e[3];
+            uint32_t cpusub  = (uint32_t)e[4] << 24 | (uint32_t)e[5] << 16 | (uint32_t)e[6] << 8 | e[7];
+            uint32_t off     = (uint32_t)e[8] << 24 | (uint32_t)e[9] << 16 | (uint32_t)e[10] << 8 | e[11];
+            uint32_t size    = (uint32_t)e[12] << 24 | (uint32_t)e[13] << 16 | (uint32_t)e[14] << 8 | e[15];
+            if (cputype == 0x0100000C && (cpusub & 0x00FFFFFF) == 2) {
+                sliceOff = off;
+                sliceSize = size;
                 break;
             }
         }
-        p += lc->cmdsize;
+        if (sliceOff == 0 || sliceOff + sliceSize > flen) return NO;
+    } else {
+        // thin: 整个文件
+        sliceOff = 0;
+        sliceSize = (uint32_t)flen;
     }
-    if (textLen == 0) return NO;
-    // 洞偏移(相对 header; __TEXT fileoff=0 段连续, 与构建脚本口径一致)
-    // 洞必须在 __TEXT 内(__TEXT,__vcsig —— 设备实锤: __DATA 洞被 dyld
-    // chained fixups 清零, __TEXT 原样映射)
-    const uint8_t *base = (const uint8_t *)hdr;
-    size_t holeOff = (size_t)((const uint8_t *)vcamTextSig - base);
-    if (holeOff < 64 || holeOff + 40 > textLen) {
-        vcam_core_log([NSString stringWithFormat:
-            @"[vcam] text sig: hole outside __TEXT (off=%zu len=%zu), fail-closed",
-            holeOff, textLen]);
+    const uint8_t *sl = fb + sliceOff;
+
+    // slice 内: __TEXT 段长(load commands 小端) + 洞定位
+    uint32_t smagic = (uint32_t)sl[0] | (uint32_t)sl[1] << 8 | (uint32_t)sl[2] << 16 | (uint32_t)sl[3] << 24;
+    if (smagic != 0xFEEDFACF) return NO;
+    uint32_t ncmds = (uint32_t)sl[16] | (uint32_t)sl[17] << 8 | (uint32_t)sl[18] << 16 | (uint32_t)sl[19] << 24;
+    size_t textLen = 0;
+    size_t p = 32;
+    for (uint32_t c = 0; c < ncmds && p + 8 <= (size_t)sliceSize; c++) {
+        uint32_t cmd = (uint32_t)sl[p] | (uint32_t)sl[p + 1] << 8 | (uint32_t)sl[p + 2] << 16 | (uint32_t)sl[p + 3] << 24;
+        uint32_t cmdsize = (uint32_t)sl[p + 4] | (uint32_t)sl[p + 5] << 8 | (uint32_t)sl[p + 6] << 16 | (uint32_t)sl[p + 7] << 24;
+        if (cmd == 0x19 && p + 56 <= (size_t)sliceSize) {  // LC_SEGMENT_64
+            const char *segname = (const char *)(sl + p + 8);
+            if (strncmp(segname, "__TEXT", 6) == 0) {
+                // vmaddr(24..32) vmsize(32..40) fileoff(40..48) filesize(48..56) 小端
+                uint64_t vmsize = 0, filesize = 0;
+                for (int k = 0; k < 8; k++) {
+                    vmsize |= (uint64_t)sl[p + 32 + k] << (8 * k);
+                    filesize |= (uint64_t)sl[p + 48 + k] << (8 * k);
+                }
+                textLen = (size_t)(filesize < vmsize ? filesize : vmsize);
+                break;
+            }
+        }
+        p += cmdsize;
+    }
+    if (textLen == 0 || textLen > (size_t)sliceSize) return NO;
+
+    // 洞定位(slice 内魔数唯一性) —— 与 inject_text_sig.py 同口径
+    const uint8_t MAGIC[8] = {0x56, 0x43, 0x54, 0x58, 0x53, 0x49, 0x47, 0x31};
+    long hole = -1;
+    for (size_t i = 0; i + 8 <= (size_t)sliceSize; i++) {
+        if (memcmp(sl + i, MAGIC, 8) == 0) { hole = (long)i; break; }
+    }
+    if (hole < 0) {
+        vcam_core_log(@"[vcam] text sig: hole magic not found on disk, fail-closed");
         return NO;
     }
+    if ((size_t)hole + 40 > textLen) {
+        vcam_core_log(@"[vcam] text sig: hole outside __TEXT on disk, fail-closed");
+        return NO;
+    }
+    // 洞内哈希(磁盘侧, 加载链路不碰)
+    const uint8_t *expect = sl + hole + 8;
+    BOOL allZero = YES;
+    for (int i = 0; i < 32; i++) {
+        if (expect[i] != 0) { allZero = NO; break; }
+    }
+    if (allZero) {
+        cached = YES;  // 本地构建未注入 → 开发语义跳过
+        static BOOL zeroDiag = NO;
+        if (!zeroDiag) {
+            zeroDiag = YES;
+            vcam_core_log(@"[vcam] text sig: hole empty (dev build), skip");
+        }
+        return cached;
+    }
 
-    // 流式 SHA256: 洞前段 + 洞后段(跳 40B 洞 —— 与 inject 口径严格一致)
+    // 流式 SHA256: __TEXT 跳洞(与 inject 口径严格一致)
     uint8_t digest[32];
     _Alignas(16) unsigned char ctxBuf[128];  // CC_SHA256_CTX(arm64 ~104B, 给足)
     if (shaInit(ctxBuf) != 1) return NO;
-    if (holeOff > 0 && shaUpdate(ctxBuf, base, holeOff) != 1) return NO;
-    size_t tailLen = textLen - holeOff - 40;
-    if (tailLen > 0 && shaUpdate(ctxBuf, base + holeOff + 40, tailLen) != 1) return NO;
+    if (shaUpdate(ctxBuf, sl, (size_t)hole) != 1) return NO;
+    size_t tailLen = textLen - (size_t)hole - 40;
+    if (tailLen > 0 && shaUpdate(ctxBuf, sl + hole + 40, tailLen) != 1) return NO;
     if (shaFinal(digest, ctxBuf) != 1) return NO;
 
     cached = (memcmp(digest, expect, 32) == 0);
@@ -343,8 +386,8 @@ static BOOL vcamSelfTextOK(void) {
     if (!sigDiag) {
         sigDiag = YES;
         vcam_core_log([NSString stringWithFormat:
-            @"[vcam] text sig diag len=%zu hole=%zu res=%d d0=%02x%02x e0=%02x%02x",
-            textLen, holeOff, cached, digest[0], digest[1], expect[0], expect[1]]);
+            @"[vcam] text sig diag(disk) len=%zu hole=%ld res=%d d0=%02x%02x e0=%02x%02x img=%s",
+            textLen, hole, cached, digest[0], digest[1], expect[0], expect[1], fname]);
     }
     return cached;
 }
