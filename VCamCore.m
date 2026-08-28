@@ -21,6 +21,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <mach-o/loader.h>
+#include <mach-o/dyld.h>
 #include <objc/runtime.h>
 #import "VCamTextSig.h"
 
@@ -194,15 +195,28 @@ static BOOL vcamSelfIntegrityOK(void) {
     while (vaMask <= textEnd) vaMask <<= 1;
     vaMask -= 1;
     // 关键方法 IMP 必须在本镜像内(被换到别的镜像 = swizzle)
-    Class cls = [VCamCore class];
-    SEL sels[3] = {
+    // 1.3.78 扩展: VCamCore 3 个渲染入口之外, 纳入 VCamNotify 两个激活
+    // 判定方法 —— 直接 swizzle +vcamLicenseValid 恒 YES / +vcamCrossDeviceCodeOK
+    // 恒 OK 是最省事的破解点(改一个方法换全家桶), 现在同样被范围自检覆盖
+    Class clsA = [VCamCore class];
+    SEL selsA[3] = {
         @selector(setEnabled:),
         @selector(renderReplacementToPixelBuffer:pts:),
         @selector(hasReplacementFrame),
     };
+    Class clsB = [VCamNotify class];
+    SEL selsB[2] = {
+        @selector(vcamLicenseValid),
+        @selector(vcamCrossDeviceCodeOK),
+    };
     BOOL res = YES;
     for (int i = 0; i < 3; i++) {
-        IMP imp = class_getMethodImplementation(cls, sels[i]);
+        IMP imp = class_getMethodImplementation(clsA, selsA[i]);
+        uintptr_t a = ((uintptr_t)imp) & vaMask;
+        if (a < textStart || a >= textEnd) res = NO;
+    }
+    for (int i = 0; i < 2; i++) {
+        IMP imp = class_getMethodImplementation(clsB, selsB[i]);
         uintptr_t a = ((uintptr_t)imp) & vaMask;
         if (a < textStart || a >= textEnd) res = NO;
     }
@@ -212,13 +226,15 @@ static BOOL vcamSelfIntegrityOK(void) {
     if (!intDiagLogged) {
         intDiagLogged = YES;
         vcam_core_log([NSString stringWithFormat:
-            @"[vcam] self int diag text=[%lx,%lx) mask=%lx a0=%lx a1=%lx a2=%lx raw0=%lx res=%d",
+            @"[vcam] self int diag text=[%lx,%lx) mask=%lx a0=%lx a1=%lx a2=%lx b0=%lx b1=%lx raw0=%lx res=%d",
             (unsigned long)textStart, (unsigned long)textEnd,
             (unsigned long)vaMask,
-            ((uintptr_t)class_getMethodImplementation(cls, sels[0])) & vaMask,
-            ((uintptr_t)class_getMethodImplementation(cls, sels[1])) & vaMask,
-            ((uintptr_t)class_getMethodImplementation(cls, sels[2])) & vaMask,
-            (uintptr_t)class_getMethodImplementation(cls, sels[0]), res]);
+            ((uintptr_t)class_getMethodImplementation(clsA, selsA[0])) & vaMask,
+            ((uintptr_t)class_getMethodImplementation(clsA, selsA[1])) & vaMask,
+            ((uintptr_t)class_getMethodImplementation(clsA, selsA[2])) & vaMask,
+            ((uintptr_t)class_getMethodImplementation(clsB, selsB[0])) & vaMask,
+            ((uintptr_t)class_getMethodImplementation(clsB, selsB[1])) & vaMask,
+            (uintptr_t)class_getMethodImplementation(clsA, selsA[0]), res]);
     }
     return res;
 }
@@ -403,15 +419,85 @@ static BOOL vcamSelfTextOK(void) {
     if (tailLen > 0 && shaUpdate(ctxBuf, sl + hole + 40, tailLen) != 1) return NO;
     if (shaFinal(digest, ctxBuf) != 1) return NO;
 
-    cached = (memcmp(digest, expect, 32) == 0);
+    BOOL diskOK = (memcmp(digest, expect, 32) == 0);
+
+    // 1.3.78 内存口径(补运行时 COW patch 的洞): 磁盘校验只见文件改动,
+    // 进程内 patch 代码页(改运行中指令)磁盘不变 → 旧版看不见。同口径
+    // (同 skip/同跳洞)哈希【内存镜像】__TEXT, 与磁盘哈希比对: 内存被
+    // patch → 失配 → 关门禁。洞区本就被口径跳过, ellekit 清零洞区无感
+    // (1.3.70 教训只影响洞内容, 不影响跳洞哈希); __TEXT 无 dyld fixup
+    // (chained fixups 只动 __DATA/__DATA_CONST), 内存==磁盘是稳态。
+    const uint8_t *mem = (const uint8_t *)info.dli_fbase;
+    uint8_t mdigest[32];
+    _Alignas(16) unsigned char mctx[128];
+    BOOL memOK = NO;
+    if (shaInit(mctx) == 1
+        && shaUpdate(mctx, mem + skipLen, (size_t)hole - skipLen) == 1
+        && (tailLen == 0 || shaUpdate(mctx, mem + hole + 40, tailLen) == 1)
+        && shaFinal(mdigest, mctx) == 1) {
+        memOK = (memcmp(mdigest, digest, 32) == 0);
+    }
+    cached = diskOK && memOK;
     static BOOL sigDiag = NO;
-    if (!sigDiag) {
-        sigDiag = YES;
+    if (!sigDiag || !cached) {
+        if (!sigDiag) sigDiag = YES;
         vcam_core_log([NSString stringWithFormat:
-            @"[vcam] text sig diag(disk) len=%zu hole=%ld res=%d d0=%02x%02x e0=%02x%02x img=%s",
-            textLen, hole, cached, digest[0], digest[1], expect[0], expect[1], fname]);
+            @"[vcam] text sig diag(disk=%d mem=%d) len=%zu hole=%ld d0=%02x%02x m0=%02x%02x e0=%02x%02x img=%s",
+            diskOK, memOK, textLen, hole,
+            digest[0], digest[1], mdigest[0], mdigest[1], expect[0], expect[1], fname]);
     }
     return cached;
+}
+
+// ===== 1.3.78 延迟注入检测(反 frida/二次 hook 框架注入) =====
+// 原理: 首次调用(进程启动后首拍, ~0.15s)快照全部已加载 image 路径 ——
+// 正常加载链路装载我们的 hook 框架(ellekit/libhooker 等)此时已在场,
+// 全部进快照永不误报。此后每 30s 重枚举: 新出现且路径含注入框架特征词
+// → 在我们【之后】被 dlopen 进来的 hook 框架(frida-agent 注入破解/
+// 破解者的 interposer dylib) → 关门禁。系统框架/相机管线后续懒加载的
+// 正常 dylib 不含特征词, 不受影响。
+static BOOL vcamNoLateHookLibs(void) {
+    static NSArray<NSString *> *snapshot = nil;
+    static double lastScan = 0;
+    static BOOL lastRes = YES;
+    double now = CFAbsoluteTimeGetCurrent();
+    if (snapshot && now - lastScan < 30.0) return lastRes;
+    lastScan = now;
+
+    uint32_t n = _dyld_image_count();
+    if (!snapshot) {
+        NSMutableArray *a = [NSMutableArray arrayWithCapacity:(NSUInteger)n];
+        for (uint32_t i = 0; i < n; i++) {
+            const char *nm = _dyld_get_image_name(i);
+            if (nm) [a addObject:[NSString stringWithUTF8String:nm]];
+        }
+        snapshot = [a copy];
+        vcam_core_log([NSString stringWithFormat:
+            @"[vcam] hook watch: snapshot %u images", (unsigned)n]);
+        return YES;
+    }
+    static NSArray<NSString *> *kw = nil;
+    if (!kw) kw = @[@"frida", @"substrate", @"substitute", @"libhooker",
+                    @"ellekit", @"elup", @"psunday", @"cynject", @"dobby",
+                    @"stalker", @"flexdecrypt", @"dumpdecrypt"];
+    BOOL res = YES;
+    for (uint32_t i = 0; i < n; i++) {
+        const char *nm = _dyld_get_image_name(i);
+        if (!nm) continue;
+        NSString *s = [NSString stringWithUTF8String:nm];
+        if ([snapshot containsObject:s]) continue;
+        NSString *low = [s lowercaseString];
+        for (NSString *k in kw) {
+            if ([low containsString:k]) {
+                res = NO;
+                vcam_core_log([NSString stringWithFormat:
+                    @"[vcam] hook watch: LATE hook lib detected: %@ — closing gate", s]);
+                break;
+            }
+        }
+    }
+    lastRes = res;
+    return res;
 }
 
 @interface VCamCore ()
@@ -1594,14 +1680,17 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
         // setEnabled 重新加载, 无需额外通知链路; 内存强翻 BOOL 会在下一拍纠正
         strongSelf->_licGate = [VCamNotify vcamLicenseValid];
         // 1.3.70: licMark 加入 __TEXT 哈希自校验(改 dylib 任何字节 → 关门禁)
-        strongSelf->_licMark = [VCamNotify vcamCrossDeviceCodeOK] && vcamSelfIntegrityOK() && vcamSelfTextOK();
-        // 1.3.64: 许可有效首拍预热 T 表(方案A 参数解密) —— vcamLicenseTable
-        // 内部 dispatch_once 记 T diag 日志(m=3fa7c2e1 ok=1), 无需打开相机/
-        // 打光即可远程确认设备端解密链路; 之后消费端按 0.5s 节流缓存照常取值
+        // 1.3.78: 再串 vcamNoLateHookLibs(快照后新出现的 hook 框架 → 关门禁)
+        strongSelf->_licMark = [VCamNotify vcamCrossDeviceCodeOK] && vcamSelfIntegrityOK()
+            && vcamSelfTextOK() && vcamNoLateHookLibs();
+        // 1.3.64: 许可有效首拍预热 T 表(方案A 参数解密) —— 内部 dispatch_once
+        // 记 T diag 日志(m=3fa7c2e1 ok=1), 无需打开相机/打光即可远程确认
+        // 设备端解密链路。1.3.78: vcamLicenseTable 已改为栈式解码(明文不驻
+        // 留), 预热改走 vcamLicenseTableInt(0=校验+擦除路径, 诊断语义不变)
         static dispatch_once_t tWarmOnce;
         if (strongSelf->_licGate) {
             dispatch_once(&tWarmOnce, ^{
-                [VCamNotify vcamLicenseTable];
+                (void)[VCamNotify vcamLicenseTableInt:0];
             });
         }
         BOOL effEnabled = enabled && strongSelf->_licGate && strongSelf->_licMark;
