@@ -127,9 +127,11 @@ typedef void(^VCamNotifyCallback)(NSString *name);
 // 布局(gen_license.py T_TRUE): idx1-6 打光色/ idx7 HSV 门限/ idx8 计票
 // 阈值/ idx9-11 zoom ×100/ idx12 pan ×100/ idx13 旋转步进/ idx14-15 羽化
 // 分子分母。Double 版本 = u32/100(定点); Int 版本 = u32 原值(颜色/门限)
-+ (NSData *)vcamLicenseTable;                     // 72B(18×u32 BE) 或 nil
 + (double)vcamLicenseTableDouble:(NSUInteger)idx; // ×100 定点参数取值
 + (uint32_t)vcamLicenseTableInt:(NSUInteger)idx;  // 整数参数取值(颜色/门限)
+// 1.3.78 栈式解码(明文不驻留内存): 解码直写调用方 uint32_t[18] 缓冲,
+// 调用方读值后须自行 memset 擦除; 失败时函数内部已擦
++ (BOOL)vcamLicenseDecodeT:(uint32_t *)outT;
 
 #pragma mark - 1.3.65 前台 App 进程取色采样器 + mmap 颜色总线
 // 根因(1.3.64 设备日志实锤): UICSI 在 SB 进程只截 SB 自己的图层 ——
