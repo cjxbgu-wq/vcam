@@ -1102,6 +1102,23 @@ static VCamPickShm *vcamPickShmMap(void) {
     return (mapped == MAP_FAILED) ? NULL : mapped;
 }
 
+// 1.3.79 总线写者仲裁(双写者根修): App 采样器与 SB 悬浮球是两套独立投票
+// 状态机写同一条 mmap 总线 —— SB 的 applicationState 恒 Active(实锤:
+// App 前台窗口 13:37:30-35 SB 仍在 pick cadence 翻转), 两套稳定色以
+// ~100ms 周期交替写总线 → 光在 0x000000(灭)↔色 间高频翻转("时而打时而
+// 不打")且每次变色触发 md 全帧重烘焙 → 视频掉帧。
+// 仲裁规则: SB tick 前查总线 —— ts 新鲜(<300ms)且写者 pid≠本进程
+// (= 前台 App 在采样) → SB 完全让位(不采样不发布); App 退后台后其
+// ts 陈旧 → SB 自动恢复桌面检测。App 侧无需对称检查(非 Active 本就跳过)。
++ (BOOL)vcamBusHasLiveOtherWriter {
+    VCamPickShm *shm = vcamPickShmMap();
+    if (!shm) return NO;
+    uint32_t wpid = shm->pid;
+    double wts = shm->ts;
+    if (wpid == 0 || (pid_t)wpid == getpid()) return NO;
+    return (CFAbsoluteTimeGetCurrent() - wts) < 0.3;
+}
+
 // 写端: 采样器(App/SB 进程)调用; slot=色档, color=标准纯色(检测端自带);
 // timestamp 最后写(seqlock 发布点)
 + (void)vcamPickPublishSlot:(int)slot color:(uint32_t)color count:(int)cnt avg:(uint32_t)avg {
