@@ -215,6 +215,12 @@ def transform(text, in_directive=False):
                         depth -= 1
                     j += 1
                 sel = ''.join(text[i + m.end():j - 1].split())
+                # 1.3.78: 选择器名命中高危改名表时注册【改名后】的值 ——
+                # 方法定义在后续标识符改名阶段已变为 qvLv 等无意义名,
+                # @selector 字面量若不同步改名, 运行时 sel_registerName 查
+                # 不到方法(IMP 自检返回 msgForward 地址 → 恒误报 → 门禁
+                # 恒关, 1.3.78 首部署设备日志实锤 b0==b1==msgForward)
+                sel = IDENT_RENAMES.get(sel, sel)
                 out.append('obfSEL(%d)' % register(sel))
                 i = j
                 continue
@@ -607,6 +613,8 @@ def verify_source_fidelity(paths):
                     problems.append('%s: CFSTR 值不在密表: %r' % (fname, val))
             elif m.group(2) is not None:
                 val = ''.join(m.group(2).split())
+                # 1.3.78: 与 @selector 变换同步走改名映射(注册值是改名后的)
+                val = IDENT_RENAMES.get(val, val)
                 if val and val not in _str_map:
                     problems.append('%s: selector 不在密表: %r' % (fname, val))
             else:
