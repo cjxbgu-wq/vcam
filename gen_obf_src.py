@@ -450,7 +450,8 @@ IDENT_RENAMES = {
     # (词边界正则防前缀互吃: \bvcamLicenseTable\b 不会命中 vcamLicenseTableDouble)
     'vcamLicenseTableDouble': 'qvTd',           # 类方法: T 表定点参数取值
     'vcamLicenseTableInt': 'qvTi',              # 类方法: T 表整数参数取值
-    'vcamLicenseTable': 'qvTa',                 # 类方法: T 表解密(72B)
+    'vcamLicenseTable': 'qvTa',                 # 类方法: T 表解密(72B, 1.3.78 已删)
+    'vcamLicenseDecodeT': 'qvDt',               # 1.3.78 类方法: T 表栈式解码
     # 1.3.65 取色采样器: 采样/共享总线方法名(含检测语义)
     'vcamStartAppSampler': 'qvSa',              # 类方法: App 采样器入口
     'vcamAppSampleSlotAtX': 'qvAp',             # 类方法: 采样一拍(返色档)
