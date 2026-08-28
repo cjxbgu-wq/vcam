@@ -547,8 +547,8 @@ static size_t vcam_decode_max_edge(void) {
             if (!r) return;
             NSDictionary *outputSettings = @{
                 (id)kCVPixelBufferPixelFormatTypeKey: @((OSType)'420f'),
-                (id)kCVPixelBufferWidthKey:  @(NSUInteger)w,
-                (id)kCVPixelBufferHeightKey: @(NSUInteger)h,
+                (id)kCVPixelBufferWidthKey:  @((NSUInteger)w),
+                (id)kCVPixelBufferHeightKey: @((NSUInteger)h),
             };
             AVAssetReaderTrackOutput *out =
                 [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:track outputSettings:outputSettings];
