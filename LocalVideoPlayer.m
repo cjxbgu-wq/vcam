@@ -109,8 +109,24 @@ static void vcam_player_log(NSString *msg) {
 @property (nonatomic, assign) BOOL shouldDecode;
 @property (nonatomic, strong) NSThread *decodeThread;
 
+// 无缝循环预取(1.3.80 循环点断流根修): 8s 循环视频每轮结束 resetReaderForLoop
+// 同步重建 reader(create+startReading+首帧解码 50-200ms)期间解码断供 → 预渲染
+// 回退重复帧 → 每 8 秒可见卡一下("容易掉帧卡顿"主源)。修: 循环开始后即在
+// 后台串行队列用【独立 AVURLAsset】预建下一轮 reader(不复用主 asset —— 新旧
+// reader 并存同一 asset 会双重持有/派发 CommonURLAsset* 通知, 2026-08-15
+// watchdog 崩溃根因, 绝不重蹈); 循环完成瞬间原子换入, 重建成本归零。
+// 预取对象: 后台线程构建、解码线程消费, 声明 atomic 保证跨线程可见性;
+// _prefetchGen 绑加载代数, 换源/重播后旧预取作废。
+@property (atomic, strong) AVAssetReader *prefetchReader;
+@property (atomic, strong) AVAssetReaderTrackOutput *prefetchOutput;
+@property (atomic, assign) int64_t prefetchGen;
+@property (nonatomic, strong) dispatch_queue_t prefetchQueue;
+
 // 锁
 @property (nonatomic, strong) NSLock *stateLock;
+
+// 1.3.80 无缝循环: 预取下一轮 reader(后台串行队列, 独立 asset)
+- (void)prefetchNextLoopReaderAsync;
 @end
 
 @implementation LocalVideoPlayer
@@ -126,6 +142,9 @@ static void vcam_player_log(NSString *msg) {
         _preloadCache = [[NSMutableArray alloc] init];
         _preloadInfo = [[NSMutableDictionary alloc] init];
         _stateLock = [[NSLock alloc] init];
+        // 1.3.80 无缝循环: 预取串行队列(后台低频, 每循环 1 次)
+        _prefetchQueue = dispatch_queue_create("com.vcam.prefetch", DISPATCH_QUEUE_SERIAL);
+        _prefetchGen = -1;
         _reloadGeneration = 0;
         _currentGeneration = 0;
         _effectiveFpsInternal = 0;
@@ -146,6 +165,9 @@ static void vcam_player_log(NSString *msg) {
     [self stopDecodingThread];
     [self stopWatchingFile];
     [self clearFrameQueue];
+    // 1.3.80: 预取 reader 一并退役(防悬空解码资源)
+    AVAssetReader *pr = _prefetchReader;
+    if (pr) [pr cancelReading];
     if (_cachedImageBuffer) {
         CVPixelBufferRelease(_cachedImageBuffer);
         _cachedImageBuffer = NULL;
@@ -388,6 +410,10 @@ static size_t vcam_decode_max_edge(void) {
     }
     vcam_player_log([NSString stringWithFormat:@"[vcam] Reader rebuilt on decode thread: %@ (prefilled %lu frames, gen=%lld)",
                      _pendingPath.lastPathComponent, (unsigned long)prefilled, (long long)_appliedLoadGen]);
+    // 1.3.80: 换源/重载后旧预取作废(gen 已变, 换入时会校验) → 立刻预取新一轮
+    self.prefetchReader = nil;
+    self.prefetchOutput = nil;
+    [self prefetchNextLoopReaderAsync];
 }
 
 - (void)loadImageFile:(NSString *)path completion:(void(^)(BOOL success, NSError *error))completion {
@@ -500,6 +526,43 @@ static size_t vcam_decode_max_edge(void) {
     return pixelBuffer;
 }
 
+// 1.3.80 无缝循环预取: 后台串行队列用独立 AVURLAsset 预建下一轮 reader。
+// 独立 asset 规避"新旧 reader 并存同一 asset → CommonURLAsset* 双重派发
+// (watchdog 根因)"; 每循环仅 1 次低频 track 解析, 远低于云闪付崩溃场景的
+// 频率密度。预取成功 → 循环点换入零成本; 失败 → 换入路径自然回退同步重建。
+- (void)prefetchNextLoopReaderAsync {
+    if (_prefetchReader) return;  // 本轮已预取
+    if (_mediaType != VCamMediaTypeVideo) return;  // 图片/未知模式不预取
+    NSString *path = _currentVideoPath;
+    if (path.length == 0) return;
+    int64_t gen = _appliedLoadGen;
+    NSUInteger w = _videoWidth, h = _videoHeight;
+    dispatch_async(_prefetchQueue, ^{
+        @autoreleasepool {
+            AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path]
+                                                     options:@{AVURLAssetPreferPreciseDurationAndTimingKey: @NO}];
+            AVAssetTrack *track = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
+            if (!track) return;
+            AVAssetReader *r = [[AVAssetReader alloc] initWithAsset:asset error:NULL];
+            if (!r) return;
+            NSDictionary *outputSettings = @{
+                (id)kCVPixelBufferPixelFormatTypeKey: @((OSType)'420f'),
+                (id)kCVPixelBufferWidthKey:  @(NSUInteger)w,
+                (id)kCVPixelBufferHeightKey: @(NSUInteger)h,
+            };
+            AVAssetReaderTrackOutput *out =
+                [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:track outputSettings:outputSettings];
+            out.alwaysCopiesSampleData = NO;
+            [r addOutput:out];
+            if (![r startReading]) return;
+            // atomic 属性写入(跨线程可见); 绑代数: 换源/重播后旧预取作废
+            self.prefetchOutput = out;
+            self.prefetchGen = gen;
+            self.prefetchReader = r;  // 最后写: reader 就绪标志
+        }
+    });
+}
+
 - (void)resetReaderForLoop {
     // 限流(2026-08-16): 每 12 次循环记 1 条(5s 视频 ~1 分钟 1 条, disk writes 限额保护)
     static int loopLogCounter = 0;
@@ -507,29 +570,50 @@ static size_t vcam_decode_max_edge(void) {
         vcam_player_log(@"[vcam] Looping video from beginning");
     }
 
-    // 显式释放旧 reader/output 后再新建(2026-08-15): 避免新旧 reader 并存瞬间
-    // 对同一 asset 双重持有/派发通知, 加重 CommonURLAsset* 队列负担(watchdog 根因)
-    [_assetReader cancelReading];
-    _assetReader = nil;
-    _videoOutput = nil;
+    // 1.3.80 无缝循环: 优先换入预取 reader(独立 asset, 已 startReading, 后台
+    // 提前建好) —— 循环点重建成本从 50-200ms 归零, 消除每轮一次的解码断流
+    // 卡顿。gen 不匹配(换源/重播)或预取失败 → 回退同步重建(行为不变保底)。
+    AVAssetReader *pr = self.prefetchReader;
+    if (pr && pr.status == AVAssetReaderStatusReading
+        && self.prefetchGen == _appliedLoadGen && _prefetchOutput) {
+        self.prefetchReader = nil;   // 取走(单次消费)
+        AVAssetReaderTrackOutput *po = self.prefetchOutput;
+        self.prefetchOutput = nil;
+        [_assetReader cancelReading];  // 旧 reader 退役(显式, 与预取不同 asset 无冲突)
+        _assetReader = pr;
+        _videoOutput = po;
+        vcam_player_log(@"[vcam] Loop seamless swap (prefetched reader)");
+    } else {
+        // 显式释放旧 reader/output 后再新建(2026-08-15): 避免新旧 reader 并存瞬间
+        // 对同一 asset 双重持有/派发通知, 加重 CommonURLAsset* 队列负担(watchdog 根因)
+        [_assetReader cancelReading];
+        _assetReader = nil;
+        _videoOutput = nil;
+        // 过期预取清理(换源后作废)
+        self.prefetchReader = nil;
+        self.prefetchOutput = nil;
 
-    NSError *err = nil;
-    _assetReader = [[AVAssetReader alloc] initWithAsset:_urlAsset error:&err];
-    if (err || !_assetReader) {
-        vcam_player_log([NSString stringWithFormat:@"[vcam] Failed to create asset reader for loop: %@", err]);
-        return;
+        NSError *err = nil;
+        _assetReader = [[AVAssetReader alloc] initWithAsset:_urlAsset error:&err];
+        if (err || !_assetReader) {
+            vcam_player_log([NSString stringWithFormat:@"[vcam] Failed to create asset reader for loop: %@", err]);
+            return;
+        }
+
+        // 重新创建输出（420f, 同上）
+        NSDictionary *outputSettings = @{
+            (id)kCVPixelBufferPixelFormatTypeKey: @((OSType)'420f'),
+            (id)kCVPixelBufferWidthKey:  @(_videoWidth),
+            (id)kCVPixelBufferHeightKey: @(_videoHeight),
+        };
+        _videoOutput = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:_videoTrack outputSettings:outputSettings];
+        _videoOutput.alwaysCopiesSampleData = NO;
+        [_assetReader addOutput:_videoOutput];
+        [_assetReader startReading];
     }
 
-    // 重新创建输出（420f, 同上）
-    NSDictionary *outputSettings = @{
-        (id)kCVPixelBufferPixelFormatTypeKey: @((OSType)'420f'),
-        (id)kCVPixelBufferWidthKey:  @(_videoWidth),
-        (id)kCVPixelBufferHeightKey: @(_videoHeight),
-    };
-    _videoOutput = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:_videoTrack outputSettings:outputSettings];
-    _videoOutput.alwaysCopiesSampleData = NO;
-    [_assetReader addOutput:_videoOutput];
-    [_assetReader startReading];
+    // 循环开始即预取下一轮(整个循环周期都是 lead time, 无时间压力)
+    [self prefetchNextLoopReaderAsync];
 }
 
 #pragma mark - 解码线程
@@ -601,6 +685,11 @@ static size_t vcam_decode_max_edge(void) {
     _videoOutput = nil;
     _urlAsset = nil;
     _videoTrack = nil;
+    // 1.3.80: 空闲卸载同时作废预取 reader(gen 校验兜底, 双保险不留悬空对象)
+    AVAssetReader *pr = self.prefetchReader;
+    if (pr) [pr cancelReading];
+    self.prefetchReader = nil;
+    self.prefetchOutput = nil;
     [self clearFrameQueue];
     if (_cachedImageBuffer) {
         CVPixelBufferRelease(_cachedImageBuffer);
@@ -678,10 +767,21 @@ static size_t vcam_decode_max_edge(void) {
                     double frameInterval = 1.0 / effFps;
                     nextTick += frameInterval;
                     double wait = nextTick - CFAbsoluteTimeGetCurrent();
-                    if (wait > 0.001) {
+                    // 1.3.80 队列空时即时补给(相位自愈): 双 30Hz 时钟相位漂移/解码
+                    // 抖动使队列瞬时见底 → 预渲染回退重复帧 = 拍频微卡顿。队列空时
+                    // 本帧跳过节拍等待立即入队(补到 1 帧), 有存货才按节拍出帧 ——
+                    // 长期节律仍由 nextTick 绝对节拍锁定 1:1, 不会跑赢(队列≥1 即
+                    // 恢复等待), 只把相位往"及时"方向修正, 不引入积压(积压>1 会触发
+                    // 预渲染 FIFO 丢帧)。
+                    if (wait > 0.001 && [_frameQueue count] > 0) {
                         [NSThread sleepForTimeInterval:wait];
                     } else {
-                        nextTick = CFAbsoluteTimeGetCurrent();  // 解码耗时超帧间隔, 重置基线防追帧爆发
+                        if (wait > 0.001) {
+                            // 队列空: 即时补给, 但 nextTick 保持累计(下一帧补回等待,
+                            // 节律不漂移)
+                        } else {
+                            nextTick = CFAbsoluteTimeGetCurrent();  // 解码耗时超帧间隔, 重置基线防追帧爆发
+                        }
                     }
                 } else {
                     // 没有读到帧，短暂休眠避免忙等; 重置基线避免恢复后爆发
