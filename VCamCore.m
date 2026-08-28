@@ -204,7 +204,12 @@ static BOOL vcamSelfIntegrityOK(void) {
         @selector(renderReplacementToPixelBuffer:pts:),
         @selector(hasReplacementFrame),
     };
-    Class clsB = [VCamNotify class];
+    // 1.3.78 修正: vcamLicenseValid/vcamCrossDeviceCodeOK 是 +(类方法),
+    // 挂在元类上 —— class_getMethodImplementation 传【元类】才查到真实
+    // IMP; 传类本身查的是实例方法表 → miss → 返回 _objc_msgForward
+    // (libobjc 镜像, 恒在本镜像外) → 恒误报 res=0。1.3.78 首部署日志
+    // 实锤(b0==b1==197a5a2c0 = msgForward 地址)
+    Class clsB = object_getClass([VCamNotify class]);  // VCamNotify 元类
     SEL selsB[2] = {
         @selector(vcamLicenseValid),
         @selector(vcamCrossDeviceCodeOK),
@@ -1680,9 +1685,11 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
         // setEnabled 重新加载, 无需额外通知链路; 内存强翻 BOOL 会在下一拍纠正
         strongSelf->_licGate = [VCamNotify vcamLicenseValid];
         // 1.3.70: licMark 加入 __TEXT 哈希自校验(改 dylib 任何字节 → 关门禁)
-        // 1.3.78: 再串 vcamNoLateHookLibs(快照后新出现的 hook 框架 → 关门禁)
-        strongSelf->_licMark = [VCamNotify vcamCrossDeviceCodeOK] && vcamSelfIntegrityOK()
-            && vcamSelfTextOK() && vcamNoLateHookLibs();
+        // 1.3.78: 串入 vcamNoLateHookLibs(快照后新出现的 hook 框架 → 关门禁)。
+        // 放链首: && 短路会让排后面的检查在前面失败时被跳过 —— 反注入快照
+        // 必须每拍都建立/扫描(破解者故意让互证失败以跳过反注入扫描的路径封死)
+        strongSelf->_licMark = vcamNoLateHookLibs() && [VCamNotify vcamCrossDeviceCodeOK]
+            && vcamSelfIntegrityOK() && vcamSelfTextOK();
         // 1.3.64: 许可有效首拍预热 T 表(方案A 参数解密) —— 内部 dispatch_once
         // 记 T diag 日志(m=3fa7c2e1 ok=1), 无需打开相机/打光即可远程确认
         // 设备端解密链路。1.3.78: vcamLicenseTable 已改为栈式解码(明文不驻
