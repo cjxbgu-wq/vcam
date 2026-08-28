@@ -1463,13 +1463,16 @@ static NSString *vcamLightColorName(uint32_t c) {
     if (_pickSuspended) return;
     if (_pickSkipCount > 0) { _pickSkipCount--; return; }
 
-    // 1.3.77 CPU 根修: SB 非前台(任意 App 在前)时, 本端检测结果全部被
-    // 丢弃(写仲裁: App 前台时总线被 App 进程采样器独占), 但检测/截屏
-    // 仍以 25-50Hz 全速运行 —— 纯烧 CPU 且 SpringBoard 卡 = 整机卡顿
-    // (设备实测: 打光开启后手机非常卡发热严重)。Inactive 直接跳过检测,
-    // 回桌面(Active)自动恢复。
+    // 1.3.77 CPU 根修: SB 非前台时跳过检测(applicationState 判定 —— 后
+    // 续实测 SB 恒 Active 此检查对 SB 无效, 由下方 1.3.79 总线仲裁接管)
     UIApplication *sbAppEarly = [UIApplication sharedApplication];
     if (sbAppEarly && sbAppEarly.applicationState != UIApplicationStateActive) return;
+
+    // 1.3.79 总线写者仲裁(双写者根修): App 前台时 App 采样器在写总线
+    // (ts 新鲜且 pid≠本进程) → SB 完全让位。1.3.77 前 SB 与 App 双写者
+    // 各持独立投票状态机以 ~100ms 周期交替发布 → 光黑↔色高频翻转
+    // ("时而打时而不打") + 每次变色 md 全帧重烘焙 → 视频掉帧。
+    if ([VCamNotify vcamBusHasLiveOtherWriter]) return;
 
     // tick 心跳诊断(1.3.40, 1.3.49 改时间驱动): 每秒一行, 定位 检测timer/
     // 捕获线程/看门狗 哪层没动(自适应节拍下 tick 数不再与秒数对应)
