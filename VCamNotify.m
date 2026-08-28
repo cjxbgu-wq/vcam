@@ -927,30 +927,29 @@ static NSString *vcamPlatformSerial(void) {
 //   devHash32 = SHA256(设备码) 前 32B 按 8×u32(BE)
 // 防抄许可: T_enc 加密端已预混签发设备的 devHash32, 本机再混自己值,
 // 他人许可在本机掺混后必为垃圾(魔数校验拦截)。
-// 返回 72 字节(18×u32 BE) 或 nil; 0.5s 节流缓存与 vcamLicenseValid 同拍。
-+ (NSData *)vcamLicenseTable {
+// 1.3.78 明文驻留最小化(防内存 dump): 旧版把 72B 明文表作为 NSData 缓存
+// 在堆上 0.5s —— 持合法许可的本机 dump mediaserverd 内存可整表拿走
+// (破解链: 买一个真许可 → 全链本机正常解密 → dump T_TRUE → patch 常量
+// + 跳门禁)。现改为解码直写【调用方栈缓冲】, 调用方读值后立即擦除 ——
+// 明文仅在栈上存活微秒级, dump 拿不到连续 72B 明文表。验签每次全跑
+// (~1ms, 消费端均为低频参数读取, 不做结果缓存)。
+// 成功返回 YES 且 outT 为 18×u32(BE 语义值); 失败返回 NO 并擦除。
++ (BOOL)vcamLicenseDecodeT:(uint32_t *)outT {
     @synchronized ([VCamNotify class]) {
-        static NSData *cached = nil;
-        static double cachedAt = 0;
-        static BOOL hasCache = NO;
-        double now = [NSDate timeIntervalSinceReferenceDate];
-        if (hasCache && now - cachedAt < 0.5) return cached;
-        cached = nil;
-        cachedAt = now;
-        hasCache = YES;
+        if (!outT) return NO;
         NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:VCamPlistPath];
         if (!dict) dict = [NSDictionary dictionaryWithContentsOfFile:VCamStateBackupPath];
         NSString *blob = dict[@"licBlob"];
         if (![blob isKindOfClass:[NSString class]] ||
-            ![self vcamLicenseVerifyBlob:blob]) return nil;
+            ![self vcamLicenseVerifyBlob:blob]) return NO;
         // 复用验签内部同款解析: sig 段(解 K 不需要) + T_enc 段
         NSRange dot = [blob rangeOfString:@"."];
         NSData *tEnc = [[NSData alloc] initWithBase64EncodedString:
             [blob substringFromIndex:dot.location + 1]
             options:NSDataBase64DecodingIgnoreUnknownCharacters];
-        if (tEnc.length != 72) return nil;
+        if (tEnc.length != 72) return NO;
         NSString *dc = [self vcamDeviceCode];
-        if (dc.length != 16) return nil;
+        if (dc.length != 16) return NO;
         NSData *dcData = [dc dataUsingEncoding:NSUTF8StringEncoding];
 
         // CC_SHA256(可信解析, 与设备码同链路)
@@ -959,7 +958,7 @@ static NSString *vcamPlatformSerial(void) {
         dispatch_once(&shaOnce, ^{
             sha = (vcamSHA256Fn)vcamDlsymTrusted("CC_SHA256");
         });
-        if (!sha) return nil;
+        if (!sha) return NO;
 
         // T_SALT(构建期盐, hex 32 字符 → 16B; 与 gen_license.py 一致)。
         // 局部变量(非 static): 混淆器把 C 字符串换成运行时解密调用,
@@ -969,7 +968,7 @@ static NSString *vcamPlatformSerial(void) {
         for (int i = 0; i < 16; i++) {
             int hi = vcamHexDigit(saltHex[i * 2]);
             int lo = vcamHexDigit(saltHex[i * 2 + 1]);
-            if (hi < 0 || lo < 0) return nil;
+            if (hi < 0 || lo < 0) return NO;
             salt[i] = (uint8_t)((hi << 4) | lo);
         }
 
@@ -989,9 +988,8 @@ static NSString *vcamPlatformSerial(void) {
                        ((uint32_t)devHash[i * 4 + 2] << 8) | (uint32_t)devHash[i * 4 + 3];
         }
 
-        // 解密: t[i] = T_enc_u32[i] ^ 流_u32[i] ^ dev32[i%8]
+        // 解密: t[i] = T_enc_u32[i] ^ 流_u32[i] ^ dev32[i%8](直写调用方缓冲)
         const uint8_t *enc = (const uint8_t *)tEnc.bytes;
-        uint32_t t[18];
         uint8_t ctr[32 + 4];
         memcpy(ctr, k, 32);
         for (int blk = 0; blk < 3; blk++) {  // 72B = 3 块 SHA256
@@ -1005,45 +1003,47 @@ static NSString *vcamPlatformSerial(void) {
                              ((uint32_t)enc[idx * 4 + 2] << 8) | (uint32_t)enc[idx * 4 + 3];
                 uint32_t s = ((uint32_t)st[j * 4] << 24) | ((uint32_t)st[j * 4 + 1] << 16) |
                              ((uint32_t)st[j * 4 + 2] << 8) | (uint32_t)st[j * 4 + 3];
-                t[idx] = e ^ s ^ dev32[idx % 8];
+                outT[idx] = e ^ s ^ dev32[idx % 8];
             }
         }
         // 自校验: idx0 魔数 + idx17 = idx0..16 XOR
         // (先拷标量再进 block: C 数组不能被 block 捕获)
         static dispatch_once_t tDiagOnce;
-        BOOL ok = (t[0] == 0x3FA7C2E1u);
+        BOOL ok = (outT[0] == 0x3FA7C2E1u);
         uint32_t x = 0;
-        for (int i = 0; i < 17; i++) x ^= t[i];
-        if (x != t[17]) ok = NO;
-        uint32_t m0 = t[0], m17 = t[17];
+        for (int i = 0; i < 17; i++) x ^= outT[i];
+        if (x != outT[17]) ok = NO;
+        uint32_t m0 = outT[0], m17 = outT[17];
         dispatch_once(&tDiagOnce, ^{
             vcam_notify_log([NSString stringWithFormat:
                 @"[vcam][lic] T diag m=%08x c=%08x ok=%d",
                 m0, m17, ok]);
         });
-        if (!ok) return nil;
-        cached = [NSData dataWithBytes:t length:72];
-        return cached;
+        if (!ok) {
+            memset(outT, 0, 72);  // 失败也擦: 半解密态不留明文残留
+            return NO;
+        }
+        return YES;
     }
 }
 
-// T 表参数取值(u32 → double, ×100 定点): 消费端统一入口
+// T 表参数取值(u32 → double, ×100 定点): 消费端统一入口。
+// 1.3.78 栈式解码: 不落堆不缓存, 取值后立即擦除(明文只存活于本栈帧)
 + (double)vcamLicenseTableDouble:(NSUInteger)idx {
-    NSData *t = [self vcamLicenseTable];
-    if (!t || idx > 17) return 0.0;
-    const uint8_t *b = (const uint8_t *)t.bytes + idx * 4;
-    uint32_t v = ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
-                 ((uint32_t)b[2] << 8) | (uint32_t)b[3];
-    return (double)v / 100.0;
+    uint32_t t[18];
+    double v = 0.0;
+    if (idx <= 17 && [self vcamLicenseDecodeT:t]) v = (double)t[idx] / 100.0;
+    memset(t, 0, sizeof(t));
+    return v;
 }
 
-// T 表参数取值(u32 原值): 颜色表/门限等整数参数
+// T 表参数取值(u32 原值): 颜色表/门限等整数参数。同上栈式解码+擦除
 + (uint32_t)vcamLicenseTableInt:(NSUInteger)idx {
-    NSData *t = [self vcamLicenseTable];
-    if (!t || idx > 17) return 0;
-    const uint8_t *b = (const uint8_t *)t.bytes + idx * 4;
-    return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
-           ((uint32_t)b[2] << 8) | (uint32_t)b[3];
+    uint32_t t[18];
+    uint32_t v = 0;
+    if (idx <= 17 && [self vcamLicenseDecodeT:t]) v = t[idx];
+    memset(t, 0, sizeof(t));
+    return v;
 }
 
 #pragma mark - 1.3.65 前台 App 进程取色采样器 + mmap 颜色总线
