@@ -154,6 +154,8 @@ typedef void(^VCamNotifyCallback)(NSString *name);
                          avg:(uint32_t)avg;
 + (BOOL)vcamPickSharedColor:(uint32_t *)outColor // 读端: md 光轮询(≤1s 新鲜,
                       count:(int *)outCount;         // outColor 直接可打光)
+// 1.3.79 总线写者仲裁: SB tick 前查询(有存活他进程写者 → SB 让位不采样)
++ (BOOL)vcamBusHasLiveOtherWriter;
 + (uint32_t)vcamMatchKnownLightShared:(const uint8_t *)rgba  // 共享颜色匹配
                                     n:(int)n
                             outBestIdx:(int *)outBestIdx
