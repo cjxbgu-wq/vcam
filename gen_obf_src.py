@@ -466,6 +466,7 @@ IDENT_RENAMES = {
     'vcamPublishPickCfg': 'qvPc',               # 类方法: 配置下行(Darwin+state)
     'vcamPickPublishSlot': 'qvPb',              # 类方法: 总线写端(slot+color)
     'vcamPickSharedColor': 'qvRd',              # 类方法: 总线读端(色值直用)
+    'vcamBusHasLiveOtherWriter': 'qvBo',        # 1.3.79 类方法: 总线写者仲裁
     'vcamMatchKnownLightShared': 'qvMk',        # 类方法: 共享颜色匹配
     'vcamMatchKnownLight': 'qvMl',              # C static(VCamFloatingBall.m): name 外壳
     'vcamPickShmMap': 'qzSm',                   # C static(VCamNotify.m): mmap 映射
