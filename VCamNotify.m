@@ -1419,13 +1419,26 @@ static VCamPickShm *vcamPickShmMap(void) {
 // 仲裁规则: SB tick 前查总线 —— ts 新鲜(<300ms)且写者 pid≠本进程
 // (= 前台 App 在采样) → SB 完全让位(不采样不发布); App 退后台后其
 // ts 陈旧 → SB 自动恢复桌面检测。App 侧无需对称检查(非 Active 本就跳过)。
+// 1.3.105 修补(换色闪旧色根因): 1.3.95 中继每拍把总线 pid 覆盖成 SB →
+// 本仲裁读到"pid=自己"误判无别的写者 → SB tick 复活双写(SB tick 无滑窗
+// 25Hz 快档立即写新色, ugest 滑窗 4/3 需 ~240ms → 绿-闪红-回绿)。两补:
+// (a) 中继改 fallback-only(App mmap 直写活着就不写, pid 保持 App);
+// (b) 下方增加中继活跃信号(1s 内收到过 slot 通知 = App 采样器必活着,
+//     覆盖 App mmap 被沙盒拒、总线仅剩中继在写的 fallback 场景)。
+static volatile double vcamRelayLastAt = 0;  // 中继 handler 每次收到通知即刷新
 + (BOOL)vcamBusHasLiveOtherWriter {
     VCamPickShm *shm = vcamPickShmMap();
-    if (!shm) return NO;
-    uint32_t wpid = shm->pid;
-    double wts = shm->ts;
-    if (wpid == 0 || (pid_t)wpid == getpid()) return NO;
-    return (CFAbsoluteTimeGetCurrent() - wts) < 0.3;
+    if (shm) {
+        uint32_t wpid = shm->pid;
+        double wts = shm->ts;
+        if (wpid != 0 && (pid_t)wpid != getpid()
+            && (CFAbsoluteTimeGetCurrent() - wts) < 0.3) {
+            return YES;
+        }
+    }
+    double rAt = vcamRelayLastAt;
+    if (rAt > 0 && (CFAbsoluteTimeGetCurrent() - rAt) < 1.0) return YES;
+    return NO;
 }
 
 // 写端: 采样器(App/SB 进程)调用; slot=色档, color=标准纯色(检测端自带);
@@ -1549,6 +1562,10 @@ static NSString *vcamPickCfgName(BOOL on) {
 
 // SB 端中继(Tweak.m initializeInSpringBoard 调用): 注册 7 名 → 收到 →
 // 写 mmap 总线(色值由内置表映射, 原版逻辑, 不经 T 表)。App 每拍 post。
+// 1.3.105: fallback-only —— 收到通知先刷 vcamRelayLastAt(通知本身就是
+// "App 采样器活着"的铁证, 供 1.3.79 仲裁让位), 再看总线: 已有新鲜的非
+// SB 写者(App mmap 直写活着) → 跳过写入。老版无条件写会把总线 pid 覆盖
+// 成 SB → 仲裁误判无别的写者 → SB tick 复活双写 → 换色时绿-闪红-回绿。
 + (void)vcamStartPickRelay {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -1563,11 +1580,17 @@ static NSString *vcamPickCfgName(BOOL on) {
                 dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
                 ^(int t) {
                     (void)t;
+                    vcamRelayLastAt = CFAbsoluteTimeGetCurrent();
+                    VCamPickShm *shm = vcamPickShmMap();
+                    if (shm && shm->pid != 0 && (pid_t)shm->pid != getpid()
+                        && (CFAbsoluteTimeGetCurrent() - shm->ts) < 0.3) {
+                        return;   // App mmap 直写活着: 保持其写者身份, 不覆盖
+                    }
                     [VCamNotify vcamPickPublishSlot:capturedSlot
                         color:kKnown[capturedSlot] count:0 avg:0];
                 });
         }
-        vcam_notify_log(@"[vcam][light] pick relay armed (7 slots, Darwin notify)");
+        vcam_notify_log(@"[vcam][light] pick relay armed (fallback-only, 7 slots, 1.3.105)");
     });
 }
 
