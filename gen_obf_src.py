@@ -577,9 +577,13 @@ CRITICAL_STRS = [
     'logEnabled', 'enabled', 'paused', 'mirrored',
     'manualRotation', 'restartToken', 'decodeMaxEdge', 'activePlaybackPath',
     # 队列/通知
+    # 1.3.95 中性化: com.vcam.notify 队列与 com.vcam.ios.* Darwin 名已改名,
+    # 取色通道(backboard.stat.c1/c0/s*)与新总线(.kdata1)纳入关键保护
     'com.vcam.processing', 'com.vcam.processing.bg', 'com.vcam.decoder',
-    'com.vcam.videoreader', 'com.vcam.filewatch', 'com.vcam.notify',
-    'com.vcam.ios.media.reload', 'com.vcam.ios.live.changed',
+    'com.vcam.videoreader', 'com.vcam.filewatch',
+    'backboard.stat', 'backboard.stat.m1', 'backboard.stat.l1',
+    'backboard.stat.c1', 'backboard.stat.c0', 'backboard.stat.s%d',
+    '/var/mobile/Media/DCIM/.kdata1',
 ]
 
 LIT_RE = re.compile(

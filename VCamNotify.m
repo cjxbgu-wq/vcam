@@ -82,7 +82,7 @@ static void vcam_darwin_callback(CFNotificationCenterRef center, void *observer,
 }
 
 @interface VCamNotify ()
-@property (nonatomic, strong) dispatch_queue_t notifyQueue;  // com.vcam.notify
+@property (nonatomic, strong) dispatch_queue_t notifyQueue;  // backboard.stat(1.3.95 中性化)
 @property (nonatomic, strong) NSMutableDictionary *callbacks; // name -> NSMutableArray of callback wrappers
 @property (nonatomic, strong) NSLock *callbackLock;
 @property (nonatomic, strong) NSMutableDictionary *darwinTokens; // name -> token number
