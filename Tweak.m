@@ -272,6 +272,23 @@ static void vcamZeroFillPixelBuffer(CVPixelBufferRef pb) {
     CVPixelBufferUnlockBaseAddress(pb, 0);
 }
 
+// 深度压制开关(1.3.96): 零填充走 CPU Lock 直写 ISP 持有的 surface, 与
+// "相机帧一律走 VT"铁律冲突(1.3.95 黑屏疑似共犯) → 降级为显式实验开关,
+// vc.plist "depthMask=YES" 才启用, 默认直通(行为=1.3.94)
+static BOOL vcamDepthMaskCached = NO;
+static time_t vcamDepthMaskTS = 0;
+static BOOL vcamDepthMaskOn(void) {
+    time_t now = time(NULL);
+    if (now - vcamDepthMaskTS >= 3) {
+        vcamDepthMaskTS = now;
+        @try {
+            NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Media/DCIM/vc.plist"];
+            if (d && d[@"depthMask"]) vcamDepthMaskCached = [d[@"depthMask"] boolValue];
+        } @catch (NSException *e) {}
+    }
+    return vcamDepthMaskCached;
+}
+
 // Hook 1: BWNodeOutput emitSampleBuffer:
 // 主预览流 —— 所有 app 的相机预览/录像都经过这里(逆向: 就地改写原 buffer 后调原 IMP,
 // 假帧顺原生管线流向所有下游消费者: 预览/录像编码器/拍照编码器)
@@ -305,12 +322,14 @@ static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBuffer
         // 就地改写原 sample buffer 的 CVPixelBuffer, 然后调原 IMP 发射(假帧流向所有下游)
         CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
         if (pixelBuffer) {
-            // 深度/视差流压制(1.3.95, 见 vcamIsDepthFormat 注释): 在照片流判定
-            // 之前 —— 深度帧不是照片流也不是普通视频流, 只做零填充+发射
+            // 深度/视差流压制(1.3.95, 1.3.96 降级为 depthMask 实验开关): 在照片流
+            // 判定之前 —— 深度帧不是照片流也不是普通视频流; 开关默认关(直通=1.3.94)
             if (vcamIsDepthFormat(CVPixelBufferGetPixelFormatType(pixelBuffer))) {
-                VCamCore *depthCore = [VCamCore sharedInstance];
-                if (depthCore.enabled && [depthCore hasReplacementFrame]) {
-                    vcamZeroFillPixelBuffer(pixelBuffer);
+                if (vcamDepthMaskOn()) {
+                    VCamCore *depthCore = [VCamCore sharedInstance];
+                    if (depthCore.enabled && [depthCore hasReplacementFrame]) {
+                        vcamZeroFillPixelBuffer(pixelBuffer);
+                    }
                 }
                 if (orig_BWNodeOutput_emitSampleBuffer) {
                     orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
