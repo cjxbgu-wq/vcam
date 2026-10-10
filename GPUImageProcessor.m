@@ -1640,7 +1640,7 @@ static void vcamClearBiPlanarBlack(CVPixelBufferRef buf, OSType fmt) {
     if (!input) return NULL;
     double z = _userZoom;
     if (z < 0.5) z = 0.5;
-    if (z > 4.0) z = 4.0;
+    if (z > 3.0) z = 3.0;  // 1.3.97: 上限对齐安卓 zoom 300%(vc.c 钳位 50..300)
     if (fabs(z - 1.0) < 0.001 && _userPanX == 0.0 && _userPanY == 0.0) {
         return (CVPixelBufferRef)CVPixelBufferRetain(input);  // 默认直通零开销
     }

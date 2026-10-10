@@ -38,7 +38,7 @@
 // 预渲染线程 bakeUserTransformIntoCanvas 烘焙进像素(黑底画布合成)
 @property (nonatomic, assign) double userPanX;  // -1..1 归一化水平平移(自由平移; 正=画面屏幕右移)
 @property (nonatomic, assign) double userPanY;  // -1..1 归一化垂直平移(正=画面屏幕下移)
-@property (nonatomic, assign) double userZoom;  // 0.5..4.0 缩放(<1 缩小露黑边, >1 放大, 1=原始)
+@property (nonatomic, assign) double userZoom;  // 0.5..3.0 缩放(1.3.97 对齐安卓 50%~300%; <1 缩小露黑边, >1 放大, 1=原始)
 
 // 当前源帧代数(VCamCore 每帧设置, 单调递增): 私有格式两步法的 staging BGRA
 // 按 (代数, 目标尺寸) 复用 —— 同一源帧被相机多条流重复渲染时缩放只做一次,

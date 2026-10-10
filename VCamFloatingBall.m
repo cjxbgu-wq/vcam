@@ -1909,21 +1909,25 @@ static NSString *vcamLightColorName(uint32_t c) {
 
 #pragma mark - 用户画面变换(箭头/＋/−/复, 1.3.30)
 // 语义: 箭头移动替换后的画面 —— 不需要先放大, 未放大也可自由移动,
-// 画面移出的区域显示黑色; ＋放大/−缩小(0.5..4.0, 每次固定 10%, 缩小时四周露黑边);
-// 复还原为未移动未缩放的原始画面。
+// 画面移出的区域显示黑色; ＋放大/−缩小(缩小时四周露黑边); 复还原为
+// 未移动未缩放的原始画面。
 // 通道: vc.plist userPanX/userPanY/userZoom → mediaserverd 轮询同步到 GPU 管线
 // (预渲染黑底画布合成, 方向为屏幕语义: panX 正=画面右移, panY 正=画面下移)
 // 1.3.66 修复: zoom/pan 参数退回编译期常量 —— SB 进程 T 表解密与 md 不
 // 一致(按钮点击后 SB 无新 T diag, 解密链在 SB 提前 return 垃圾), 导致
 // zoom 范围读出 2^23 级垃圾值/pan 一次点击到 -1.00。这几个交互参数无
-// 保密需求(T 表保护重点是打光颜色/门限, md 端消费已设备验证 ok=1),
-// 按原版值硬编码: zoom 1.0~4.0 步进 ×1.10(1.3.34), pan 步进 5%。
-static double vcamTZoomFactor(void) { return 1.10; }
-// 1.3.82 修复: min 曾误设 1.0 —— 初始 zoom=1.0 时点"−"算出 0.909 被 clamp
-// 回 1.0, 永远无反应(需先"＋"过才能缩)。注释/GPU 侧(bakeUserTransform
-// clamp 0.5..4.0)设计均为 0.5, 恢复 0.5: 默认状态可直接缩小到四周露黑边
+// 保密需求(T 表保护重点是打光颜色/门限, md 端消费已设备验证 ok=1)。
+// 1.3.97 对齐安卓悬浮窗语义(Vcam native vc.c/vcplax.c 权威契约):
+//   - zoom = 百分比, 范围 50%~300%(0.5..3.0), 默认 100%
+//   - 步进 = 固定 ±10 个百分点(加法, 不复利): 1.00→1.10→1.20…→3.00
+//   - >100% 中心放大裁切, <100% 缩小露黑边
+// 旧 iOS 行为(×1.10 复利, 上限 4.0)废止。
+static double vcamTZoomStep(void)    { return 0.10; }
+// 1.3.82 修复: min 曾误设 1.0 —— 初始 zoom=1.0 时点"−"被 clamp 回 1.0
+// 永远无反应。min=0.5: 默认状态可直接缩小到四周露黑边(=安卓 50%)
 static double vcamTZoomMin(void)    { return 0.5; }
-static double vcamTZoomMax(void)    { return 4.0; }
+// 1.3.97: 4.0→3.0 对齐安卓上限 300%(GPU 侧 bakeUserTransform 同步收口)
+static double vcamTZoomMax(void)    { return 3.0; }
 static double vcamTPanStep(void)    { return 0.05; }
 
 static double vcamClamp(double v, double lo, double hi) {
@@ -1946,15 +1950,16 @@ static double vcamClamp(double v, double lo, double hi) {
 - (void)panUpTapped    { [self panByX:0 Y:-vcamTPanStep()]; }  // 画面上移
 - (void)panDownTapped  { [self panByX:0 Y: vcamTPanStep()]; }  // 画面下移
 
+// ＋/−: 安卓口径加法步进(每拍 ±10 个百分点, 钳位 50%~300%)
 - (void)zoomInTapped {
-    double nz = vcamClamp([VCamNotify plistZoom] * vcamTZoomFactor(),
+    double nz = vcamClamp([VCamNotify plistZoom] + vcamTZoomStep(),
                           vcamTZoomMin(), vcamTZoomMax());
     [VCamNotify setPlistZoom:nz];
     vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] zoom in -> %.2f (synced)", nz]);
 }
 
 - (void)zoomOutTapped {
-    double nz = vcamClamp([VCamNotify plistZoom] / vcamTZoomFactor(),
+    double nz = vcamClamp([VCamNotify plistZoom] - vcamTZoomStep(),
                           vcamTZoomMin(), vcamTZoomMax());
     [VCamNotify setPlistZoom:nz];
     vcam_ball_log([NSString stringWithFormat:@"[vcam][btn] zoom out -> %.2f (synced)", nz]);

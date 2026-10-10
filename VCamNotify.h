@@ -63,7 +63,7 @@ typedef void(^VCamNotifyCallback)(NSString *name);
 + (void)setPlistMirrored:(BOOL)mirrored;
 
 // 用户画面变换(悬浮球 箭头/＋/−/复): pan 归一化 -1..1(自由平移),
-// zoom 0.5..4.0(1=原始); mediaserverd 轮询读 → 黑底画布合成
+// zoom 0.5..3.0(1.3.97 对齐安卓 50%~300%, 1=原始); mediaserverd 轮询读 → 黑底画布合成
 + (double)plistPanX;
 + (void)setPlistPanX:(double)panX;
 + (double)plistPanY;
