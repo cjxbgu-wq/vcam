@@ -39,6 +39,11 @@
 //  1.3.104 相机全黑热修: 删除 constructor 预取, 屏参获取挪到 probe 块确认
 //    sharedApplication 之后(主队列 + runloop 已运转的安全时机), sampQ 只读缓存。
 //
+//  1.3.106 打光延迟对齐安卓: 滑窗投票(4/3, ~240ms)整体移除, 换安卓 cd_feed
+//    (v12b)直译 —— 有色单拍立即采用(0 拍确认), 无色 100ms 宽限保持后熄灭;
+//    采样 12.5Hz → 25Hz(定点单拍 ~5ms)。端到端换色延迟 ~320ms → ~60-90ms。
+//    滑窗是 1.3.102 全屏计票时代压抖动手段, 闪旧色真凶(双写者)1.3.105 已修。
+//
 
 #include <dispatch/dispatch.h>
 #include <notify.h>
@@ -221,15 +226,17 @@ static int ug_sample_beat(void) {
         capFn = (UICSIFn)dlsym(RTLD_DEFAULT, ug_uicsi_name());
         if (!capFn) return 0;
     }
-    // cfg 边沿: 重开检测 → 清滑窗(旧窗口残留会让开启后先闪旧色, 同队列读写安全)
+    // cfg 边沿: 重开检测 → 清确认状态(旧输出残留会让开启后先闪旧色)
+    // 1.3.106 滑窗投票整体移除, 换安卓 cd_feed(v12b) 直译: 定点纯色区噪声
+    // 极低, 有色单拍立即采用(0 拍确认 —— 换色延迟从 ~240ms 降到采样相位
+    // + md 轮询 ~60ms); 无色 100ms 宽限保持(防单拍毛刺), 超时熄灭。
+    // (旧滑窗是 1.3.102 全屏计票时代压抖动的手段; 闪旧色真凶是 1.3.95 起
+    //  中继覆盖总线 pid 致 SB tick 复活双写, 1.3.105 已根修)
     static int sPrevOn = 0;
-    static int sWin[4];
-    static int sWinPos = 0;
-    static int sStableSlot = -2;
-    static int sZeroRun = 0;
+    static int sOutSlot = 0;        // 当前输出 slot(0=熄灭)
+    static double sLastHitMs = 0.0; // 最后一次采到有色时刻(ms)
     if (ug_cfg_on && !sPrevOn) {
-        memset(sWin, 0, sizeof(sWin));
-        sWinPos = 0; sStableSlot = -2; sZeroRun = 0;
+        sOutSlot = 0; sLastHitMs = 0.0;
     }
     sPrevOn = ug_cfg_on;
     // cfg 坐标读点(1.3.103 热修): 1.3.102 在 cfg 回调(notify_register_dispatch
@@ -319,27 +326,22 @@ static int ug_sample_beat(void) {
         CFRelease(sub);
 
         int slot = (bestIdx >= 0 && bestIdx < 6) ? bestIdx + 1 : 0;
-        // ===== 滑窗投票 + 灭光滞回(1.3.102 定点口径: 窗口 4 拍@80ms, 3 票翻转,
-        // 连 3 拍 0 灭) —— 定点纯色噪声低, 窗口比旧 6/4/4 缩短: 换色延迟
-        // ~240ms(旧 ~320ms), 闪旧色时间缩短且不再被画面内容干扰 =====
-        sWin[sWinPos] = slot;
-        sWinPos = (sWinPos + 1) % 4;
+        // ===== 1.3.106 安卓 cd_feed(v12b) 直译: 0 拍确认 + 100ms 灭宽限 =====
+        // 有色: 立即采用本拍值(刷新续命时刻); 无色: 100ms 内保持旧色, 超时熄灭。
+        // 时间源与总线 ts 同源(gettimeofday), 单位 ms。
+        struct timeval cdTv;
+        gettimeofday(&cdTv, NULL);
+        double nowMs = (double)cdTv.tv_sec * 1000.0
+                     + (double)cdTv.tv_usec / 1000.0;
+        int det = 0;
         if (slot >= 1 && slot <= 6) {
-            sZeroRun = 0;
-            int cnt[7] = {0};
-            for (int i = 0; i < 4; i++) {
-                if (sWin[i] >= 1 && sWin[i] <= 6) cnt[sWin[i]]++;
-            }
-            int majSlot = 0, majCnt = 0;
-            for (int s = 1; s <= 6; s++) {
-                if (cnt[s] > majCnt) { majCnt = cnt[s]; majSlot = s; }
-            }
-            if (majCnt >= 3 && majSlot != sStableSlot) sStableSlot = majSlot;
-        } else {
-            if (sZeroRun < 3) sZeroRun++;
-            if (sZeroRun >= 3 && sStableSlot != 0) sStableSlot = 0;
+            sLastHitMs = nowMs;
+            det = slot;
+        } else if (sOutSlot >= 1 && nowMs - sLastHitMs < 100.0) {
+            det = sOutSlot;   // 灭宽限: 单拍毛刺不熄(安卓 v12b 同款 100ms)
         }
-        int outSlot = (sStableSlot >= 0 && sStableSlot <= 6) ? sStableSlot : 0;
+        sOutSlot = det;
+        int outSlot = sOutSlot;
         uint32_t outColor = (outSlot >= 1 && outSlot <= 6) ? kKnown[outSlot - 1] : 0;
         // 通道A: mmap 总线直写; 通道B: Darwin slot(保活心跳, 沙盒拒 mmap 时由
         // SB 端中继代写总线)
@@ -390,15 +392,17 @@ static void ugInit(void) {
             // 1.3.104: App 已确认运行(主队列, runloop 已转) → 此处取屏参一次并
             // 缓存, 安全且采样线程(sampQ)此后只读缓存、不再碰 UIScreen
             (void)ug_screen_bounds(1);
-            // App 进程: 主队列 12.5Hz timer(1.3.77 降频口径)
+            // App 进程: 主队列 timer(1.3.106 提频 25Hz —— 安卓检测主循环 10ms
+            // 读 worker 结果; 定点 21×21 采样单拍 ~5ms, 25Hz CPU ~12% 单核,
+            // EMA 退避仍在, 压力大自动降频)
             dispatch_queue_t sampQ = dispatch_queue_create(NULL, DISPATCH_QUEUE_SERIAL);
             dispatch_source_t timer = dispatch_source_create(
                 DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
             static double sDurEma = 0;   // 采样耗时 EMA(1.3.89 CPU 退避)
             static int sSkipLeft = 0;
             dispatch_source_set_timer(timer,
-                dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
-                (uint64_t)(0.08 * NSEC_PER_SEC), (uint64_t)(0.02 * NSEC_PER_SEC));
+                dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
+                (uint64_t)(0.04 * NSEC_PER_SEC), (uint64_t)(0.01 * NSEC_PER_SEC));
             dispatch_source_set_event_handler(timer, ^{
                 if (!ug_cfg_on) return;
                 // 前台判定(执行前双查, 后台竞态防护, 1.3.89 口径)
