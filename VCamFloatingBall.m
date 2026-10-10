@@ -968,12 +968,19 @@ static char kVcamHoldRepeatBlockKey;
             if (r == 2 && c == 1) _playPauseBtn = btn;         // ▶ ↔ ⏸ (play.fill/pause.fill)
             if (r == 3 && c == 1) _mirrorBtn = btn;             // 镜(图标)
             if (r == 3 && c == 2) _replaceBtn = btn;            // 替(图标)
-            // 1.3.98/1.3.98b 箭头/＋/− = 持续按键: 单击一步(原绑定), 按住连发。
-            // 连发步幅: 箭头 1%/拍(精调); ＋/− 2%/拍(用户要求缩放快一些, 单击仍 1%)。
+            // 1.3.109: 单击箭头不再移动画面(用户要求: 仅长按连发移动) ——
+            // 移除单击 TouchUpInside 绑定; 按压高亮(buttonTouchUp:)、双击方向
+            // 补偿切换、长按 0.2s 连发均保留
             BOOL isArrow = (cell.action == @selector(panUpTapped) ||
                             cell.action == @selector(panLeftTapped) ||
                             cell.action == @selector(panDownTapped) ||
                             cell.action == @selector(panRightTapped));
+            if (isArrow) {
+                [btn removeTarget:self action:cell.action
+                   forControlEvents:UIControlEventTouchUpInside];
+            }
+            // 1.3.98/1.3.98b 箭头/＋/− = 持续按键: 按住连发(箭头单击已移除, 见上)。
+            // 连发步幅: 箭头 1%/拍(精调); ＋/− 2%/拍(用户要求缩放快一些, 单击仍 1%)。
             BOOL isZoom = (cell.action == @selector(zoomInTapped) ||
                            cell.action == @selector(zoomOutTapped));
             if (isArrow || isZoom) {
