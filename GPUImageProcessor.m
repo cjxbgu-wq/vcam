@@ -1812,6 +1812,22 @@ static void vcamApplyLightBiPlanar(CVPixelBufferRef buf, uint32_t rgb,
     uint8_t colorY = (uint8_t)((299 * r + 587 * g + 114 * b) / 1000);
     uint8_t colorU = (uint8_t)((-169 * r - 331 * g + 500 * b) / 1000 + 128);
     uint8_t colorV = (uint8_t)((500 * r - 419 * g - 81 * b) / 1000 + 128);
+    // 1.3.100 观感对齐 Android: Android 把上述 full-range 公式值直写进 NV21
+    // (limited range) buffer, 显示端按 Y'=(v-16)*255/219 / C'=(c-128)*255/224+128
+    // 拉伸解码 → 光斑偏亮偏艳(高亮端对比度拉伸 + 饱和度 +14%)。iOS 解码帧为
+    // 420f(full range), 直写即"公式原样", 同参数观感偏淡。此处把光斑色换算成
+    // Android 显示等效值再混入(full range 值域 clamp); blend 线性, 与 Android
+    // "先混再统一拉伸"逐像素一致(仅舍入 ±1)。420v(video range) 不换算 —— 语义
+    // 本就与 NV21 相同, 直写天然对齐
+    if (CVPixelBufferGetPixelFormatType(buf) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
+        int cy = (int)colorY, cu = (int)colorU, cv = (int)colorV;
+        cy = (int)(((cy - 16) * 255.0 / 219.0) + 0.5);
+        cu = (int)(((cu - 128) * 255.0 / 224.0) + 128 + 0.5);
+        cv = (int)(((cv - 128) * 255.0 / 224.0) + 128 + 0.5);
+        colorY = (uint8_t)(cy < 0 ? 0 : (cy > 255 ? 255 : cy));
+        colorU = (uint8_t)(cu < 0 ? 0 : (cu > 255 ? 255 : cu));
+        colorV = (uint8_t)(cv < 0 ? 0 : (cv > 255 ? 255 : cv));
+    }
 
     uint8_t *yPlane = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(buf, 0);
     uint8_t *cPlane = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(buf, 1);
