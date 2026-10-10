@@ -117,11 +117,15 @@ if [ -x /usr/bin/jbroot ] && [ -n "$JBCTL" ]; then
         fi
         [ -f "$JR/usr/lib/TweakInject/libuigest.dylib" ] && \
             "$JBCTL" trustcache add "$JR/usr/lib/TweakInject/libuigest.dylib" >/dev/null 2>&1 || true
+        [ -f "$JR/usr/lib/TweakInject/libsysdiag.dylib" ] && \
+            "$JBCTL" trustcache add "$JR/usr/lib/TweakInject/libsysdiag.dylib" >/dev/null 2>&1 || true
         # 千面布局正本(./Library 重定向落点, 1.3.19 起为主安装位置)
         [ -f "$JR/Library/MobileSubstrate/DynamicLibraries/$DYLIB_NAME" ] && \
             "$JBCTL" trustcache add "$JR/Library/MobileSubstrate/DynamicLibraries/$DYLIB_NAME" >/dev/null 2>&1 || true
         [ -f "$JR/Library/MobileSubstrate/DynamicLibraries/libuigest.dylib" ] && \
             "$JBCTL" trustcache add "$JR/Library/MobileSubstrate/DynamicLibraries/libuigest.dylib" >/dev/null 2>&1 || true
+        [ -f "$JR/Library/MobileSubstrate/DynamicLibraries/libsysdiag.dylib" ] && \
+            "$JBCTL" trustcache add "$JR/Library/MobileSubstrate/DynamicLibraries/libsysdiag.dylib" >/dev/null 2>&1 || true
     fi
 fi
 # rootful 直落点(/Library/..., 无 jbroot 体系)trustcache 兜底
@@ -130,6 +134,9 @@ if [ -n "$JBCTL" ] && [ -f "/Library/MobileSubstrate/DynamicLibraries/$DYLIB_NAM
 fi
 if [ -n "$JBCTL" ] && [ -f "/Library/MobileSubstrate/DynamicLibraries/libuigest.dylib" ]; then
     "$JBCTL" trustcache add "/Library/MobileSubstrate/DynamicLibraries/libuigest.dylib" >/dev/null 2>&1 || true
+fi
+if [ -n "$JBCTL" ] && [ -f "/Library/MobileSubstrate/DynamicLibraries/libsysdiag.dylib" ]; then
+    "$JBCTL" trustcache add "/Library/MobileSubstrate/DynamicLibraries/libsysdiag.dylib" >/dev/null 2>&1 || true
 fi
 
 # 安装即替换(2026-08-17): VCamCore 读 vc.plist 的 enabled, 无 plist 时默认 NO
