@@ -4,6 +4,10 @@ on:
   push:
   workflow_dispatch:
 
+# 产物回传(1.3.95): release 步骤需要写权限(step 级不支持 permissions, 提到 workflow 级)
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-latest
@@ -137,10 +141,8 @@ jobs:
 
       # 产物回传(1.3.95): deb 发布到预发布 tag "build" —— 公开仓库的 release
       # 资产 URL 可匿名下载, 本地无需 GitHub token 即可取包部署(脚本内嵌
-      # token 已过期后的取包通道)
+      # token 已过期后的取包通道)。permissions 在 workflow 级声明。
       - name: Publish deb to release
-        permissions:
-          contents: write
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
