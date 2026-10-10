@@ -6,10 +6,6 @@
 	<dict>
 		<key>Mode</key>
 		<string>Any</string>
-		<key>Bundles</key>
-		<array>
-			<string>com.apple.UIKit</string>
-		</array>
 		<key>Executables</key>
 		<array>
 			<string>mediaserverd</string>

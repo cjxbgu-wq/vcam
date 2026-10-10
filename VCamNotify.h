@@ -4,9 +4,9 @@
 //
 //  通知管理（对标 vcameracrack.dylib 的 VCamNotify 类）
 //
-//  逆向特征：
-//    - dispatch_queue: com.vcam.notify
-//    - Darwin 通知名: com.vcam.ios.media.reload / com.vcam.ios.live.changed
+// 逆向特征：
+//    - dispatch_queue: (1.3.95 中性化) backboard.stat
+//    - Darwin 通知名: (1.3.95 中性化) backboard.stat.m1 / backboard.stat.l1
 //    - "Registered VCamNotify listener for reload-media"
 //    - "State polling timer started" —— plist 轮询
 //    - 状态备份路径: /var/mobile/vc.plist
@@ -18,9 +18,9 @@
 
 #import <Foundation/Foundation.h>
 
-// Darwin 通知名（与原版保持一致）
-extern NSString *const VCamNotifyReloadMedia;   // com.vcam.ios.media.reload
-extern NSString *const VCamNotifyLiveChanged;   // com.vcam.ios.live.changed
+// Darwin 通知名（1.3.95 中性化, 全系统可见不带项目特征）
+extern NSString *const VCamNotifyReloadMedia;   // backboard.stat.m1
+extern NSString *const VCamNotifyLiveChanged;   // backboard.stat.l1
 
 // plist 路径（逆向确认）
 extern NSString *const VCamPlistPath;            // /var/mobile/Media/DCIM/vc.plist
@@ -136,22 +136,21 @@ typedef void(^VCamNotifyCallback)(NSString *name);
 // 调用方读值后须自行 memset 擦除; 失败时函数内部已擦
 + (BOOL)vcamLicenseDecodeT:(uint32_t *)outT;
 
-#pragma mark - 1.3.65 前台 App 进程取色采样器 + mmap 颜色总线
+#pragma mark - 1.3.65 mmap 颜色总线(1.3.95 采样端迁至 libuigest.dylib)
 // 根因(1.3.64 设备日志实锤): UICSI 在 SB 进程只截 SB 自己的图层 ——
-// App 前台时采样区全黑(color=0x000000 cnt=0), 颜色永远到不了视频。
-// 1.3.44 时期的 441/441 "成功"是桌面层颜色的假阳性。
-// 方案: 检测搬到前台 App 进程内(进程内 UICSI 截的是本 App 画面 = 屏幕
-// 实际内容), 结果写 mmap 共享页(零磁盘写, 25Hz 无 disk writes 限额风险),
-// mediaserverd 0.02s 光轮询读总线打光。SB 检测同时双写总线(桌面模式)。
-+ (void)vcamStartAppSampler;                     // App 进程采样器(Tweak.m 调)
-+ (int)vcamAppSampleSlotAtX:(double)px               // 采样一拍(进程内 UICSI, 返色档)
-                          Y:(double)py;
-+ (void)vcamNotifyPickSlot:(int)slot;            // Darwin 通知色档上行(沙盒保底)
+// App 前台时采样区全黑, 颜色永远到不了视频。
+// 1.3.95 反检测重构: 采样器从本 dylib 迁出为独立纯 C dylib(libuigest.dylib,
+// ugest.m) —— 零 ObjC 类注册/零文件写入/中性 Darwin 名(backboard.stat.*)/
+// 总线路径中性化(.vcampick → .kdata1, magic 'VCP1' → 'STAT')。本 dylib 不再
+// 注入第三方 App(VCamPlus.plist 移除 com.apple.UIKit bundle)。
+// SB 端: vcamStartPickRelay 中继(Darwin slot → 总线) + 悬浮球桌面采样直写;
+// App 端: libuigest.dylib 采样直写总线 + Darwin slot 保底。
+// mediaserverd: vcamPickSharedColor 读总线打光(不变)。
 + (void)vcamStartPickRelay;                      // SB 端中继(7 slot→总线)
-+ (void)vcamPublishPickCfg:(BOOL)on              // SB→App 配置下行(Darwin+state
++ (void)vcamPublishPickCfg:(BOOL)on              // SB→采样器配置下行(Darwin+state
                        X:(double)px                  // 沙盒安全; 坐标随 state 传递)
                        Y:(double)py;
-+ (void)vcamPickPublishSlot:(int)slot            // 写端: 采样器/SB/relay 双写
++ (void)vcamPickPublishSlot:(int)slot            // 写端: SB 桌面采样/中继直写
                       color:(uint32_t)color          // (color=标准纯色, 原版逻辑)
                       count:(int)cnt
                          avg:(uint32_t)avg;

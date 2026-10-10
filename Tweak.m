@@ -110,19 +110,15 @@ static void vcam_tweak_log(NSString *msg) {
     } @catch (NSException *e) {}
 }
 
-#pragma mark - 照片过曝: 曝光元数据剥离(metaFix)
+#pragma mark - 照片过曝: 曝光元数据改写(metaFix)
+// 曝光元数据改写(metaFix)
 // 背景(2026-08-15 千面对比实测): 拍照(静止照片/实况封面)过曝 = 照片合成管线基于
 // 真实镜头进光元数据(LuxLevel/ExposureTime 等)做曝光增益, 千面同样过曝。
-// 本实验超越千面: 在 still 管线入口剥离曝光元数据, 下游合成拿不到"暗光"信息
-// 理论上不再拉增益。A/B 开关: vc.plist "metaFix"(默认 YES), 3 秒内生效无需重启。
-
-// metaFix 默认 NO(2026-08-19 UAF 崩溃修复): CMRemoveAttachment 在 CMCapture 管线并发
-// 使用的 attachments 字典上删 key —— emit/scaler/encoder 三个 hook 在不同 Apple 队列
-// 线程并发操作同一物理 buffer 的 attachments(CFDictionary 非线程安全), 竞态 →
-// use-after-free → SIGSEGV → mediaserverd 重启 → 全 App 相机黑屏(设备实证: 3 次同栈
-// 崩溃 vcam_crash.txt, 帧链 CMCapture→hook→strip 遍历循环区, 崩溃时机=进程启动 0-2s
-// ×2 + 18min 周期窗口, 与 still 诊断/剥离的并发窗口完全吻合; runs=82)。
-// 照片过曝实验(千面同样过曝)退居 vc.plist "metaFix=YES" 显式开启。
+// 本实验超越千面: 在 still 管线入口把曝光元数据改写为"光照正常"基线, 下游
+// 合成拿不到"暗光"信息理论上不再拉增益。
+// 1.3.95 由"剥离"改为"改写": 真实照片的 attachments 永远携带这些键, 剥离后
+// 缺键本身就是可检测异常(EXIF 键缺失 = 虚拟摄像头指纹); 改写既阻断暗光增益
+// 又保持元数据完整性。A/B 开关: vc.plist "metaFix"(默认 NO), 3 秒内生效。
 static BOOL vcamMetaFixCached = NO;
 static time_t vcamMetaFixTS = 0;
 static BOOL vcamMetaFixOn(void) {
@@ -137,26 +133,61 @@ static BOOL vcamMetaFixOn(void) {
     return vcamMetaFixCached;
 }
 
-// 曝光相关附件 key(剥离目标; 颜色附件 Primaries/Transfer/Matrix 不在此列, 不受影响)
-static NSArray *vcamExposureKeys(void) {
-    static NSArray *keys;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        keys = @[@"ExposureTime", @"ExposureBiasValue", @"ExposureIndex",
-                 @"Sensitivity", @"ISOSensitivity", @"BrightnessValue",
-                 @"LuxLevel", @"AvgLuma", @"RecommendedAvgLuma",
-                 @"AnalogGain", @"DigitalGain", @"ISPGain", @"SensorGain", @"AGC"];
+// "光照正常"基线键值表(改写目标; 颜色附件 Primaries/Transfer/Matrix 不在此列)。
+// 注意: 不能用静态初始化器持有字符串字面量 —— 混淆构建(gen_obf_src)会把
+// 字面量替换为运行时解密函数调用(OBCS/obfN), 静态初始化器要求编译期常量
+// 会编译失败 → dispatch_once 内惰性构建(键转 CFString 缓存, 帧路径零分配)。
+enum { kVcamNormCount = 11 };
+static void vcamNormTableAt(size_t i, CFStringRef *outKey, double *outVal) {
+    static CFStringRef keys[kVcamNormCount];
+    static double vals[kVcamNormCount];
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        const char *k[kVcamNormCount] = {
+            "ExposureTime", "ExposureBiasValue", "ExposureIndex",
+            "Sensitivity", "ISOSensitivity", "BrightnessValue",
+            "AnalogGain", "DigitalGain", "ISPGain", "SensorGain", "AGC",
+        };
+        const double v[kVcamNormCount] = {
+            0.0166667,  // ExposureTime: 1/60 s
+            0.0,        // ExposureBiasValue
+            100.0,      // ExposureIndex: ISO 100
+            100.0,      // Sensitivity
+            100.0,      // ISOSensitivity
+            5.5,        // BrightnessValue
+            1.0, 1.0, 1.0, 1.0, 1.0,  // 各类增益
+        };
+        for (int j = 0; j < kVcamNormCount; j++) {
+            keys[j] = CFStringCreateWithCString(kCFAllocatorDefault, k[j], kCFStringEncodingUTF8);
+            vals[j] = v[j];
+        }
     });
-    return keys;
+    *outKey = keys[i];
+    *outVal = vals[i];
 }
 
-// 从 CMSampleBuffer + CVPixelBuffer 双侧剥离曝光元数据(任意 mode 全清)
-static void vcamStripExposureMeta(CMSampleBufferRef sb, CVPixelBufferRef pb) {
+// 从 CMSampleBuffer + CVPixelBuffer 双侧改写曝光元数据为基线值(任意 mode 全改)
+// 仅改写【已存在且为 CFNumber】的键: 缺失键不补(避免类型错配), 非 CFNumber
+// (LuxLevel/AvgLuma 等数据块类型)不动 —— 类型未知强写会崩下游消费者。
+// 并发风险与旧剥离版相同(metaFix 默认 NO 显式开启, 见函数头上方历史注释)。
+static void vcamNormalizeExposureMeta(CMSampleBufferRef sb, CVPixelBufferRef pb) {
     if (!vcamMetaFixOn()) return;
-    for (NSString *key in vcamExposureKeys()) {
-        CFStringRef ck = (__bridge CFStringRef)key;
-        if (sb) CMRemoveAttachment(sb, ck);
-        if (pb) CMRemoveAttachment(pb, ck);
+    for (size_t i = 0; i < kVcamNormCount; i++) {
+        CFStringRef ck;
+        double nv;
+        vcamNormTableAt(i, &ck, &nv);
+        if (!ck) continue;
+        for (int side = 0; side < 2; side++) {
+            CFTypeRef holder = (side == 0) ? (CFTypeRef)sb : (CFTypeRef)pb;
+            if (!holder) continue;
+            CFTypeRef cur = CMGetAttachment(holder, ck, NULL);
+            if (!cur || CFGetTypeID(cur) != CFNumberGetTypeID()) continue;
+            CFNumberRef num = CFNumberCreate(kCFAllocatorDefault, kCFNumberDoubleType, &nv);
+            if (num) {
+                CMSetAttachment(holder, ck, num, kCMAttachmentMode_ShouldPropagate);
+                CFRelease(num);
+            }
+        }
     }
 }
 
@@ -206,6 +237,41 @@ static BOOL vcamPhotoStreamThrottled(OSType fmt) {
     return NO;
 }
 
+#pragma mark - 深度/视差流压制(1.3.95)
+// TrueDepth 的 depth/disparity 帧不经合成管线, 内容恒为【真实人脸】——
+// RGB(替换画面)与 Depth(真实人脸)双流比对是人脸活体检测最省事的穿帮点:
+// 位置/尺寸/距离对不上 = 虚拟摄像头实锤。
+// 策略: 替换活跃(enabled 且有替换帧)时把深度/视差平面零填充后【照常发射】
+// —— 帧不丢(丢帧会卡 buffer 池 → 相机冻结), 全 0 = 无有效深度, Vision 在
+// 深度图上取不到人脸 → SDK 判"深度不可用"回退被动活体, 而非"深度与 RGB
+// 不一致"判虚拟摄像头。
+static BOOL vcamIsDepthFormat(OSType f) {
+    return f == 0x68646570 /* 'hdep' DepthFloat16 */
+        || f == 0x66646570 /* 'fdep' DepthFloat32 */
+        || f == 0x68646973 /* 'hdis' DisparityFloat16 */
+        || f == 0x66646973 /* 'fdis' DisparityFloat32 */;
+}
+
+static void vcamZeroFillPixelBuffer(CVPixelBufferRef pb) {
+    if (!pb) return;
+    if (CVPixelBufferLockBaseAddress(pb, 0) != 0) return;  // IOSurface 不可 CPU 映射 → 放行原帧
+    if (CVPixelBufferIsPlanar(pb)) {
+        size_t planes = CVPixelBufferGetPlaneCount(pb);
+        for (size_t i = 0; i < planes; i++) {
+            void *base = CVPixelBufferGetBaseAddressOfPlane(pb, i);
+            size_t h = CVPixelBufferGetHeightOfPlane(pb, i);
+            size_t rb = CVPixelBufferGetBytesPerRowOfPlane(pb, i);
+            if (base && rb > 0) memset(base, 0, rb * h);
+        }
+    } else {
+        void *base = CVPixelBufferGetBaseAddress(pb);
+        size_t h = CVPixelBufferGetHeight(pb);
+        size_t rb = CVPixelBufferGetBytesPerRow(pb);
+        if (base && rb > 0) memset(base, 0, rb * h);
+    }
+    CVPixelBufferUnlockBaseAddress(pb, 0);
+}
+
 // Hook 1: BWNodeOutput emitSampleBuffer:
 // 主预览流 —— 所有 app 的相机预览/录像都经过这里(逆向: 就地改写原 buffer 后调原 IMP,
 // 假帧顺原生管线流向所有下游消费者: 预览/录像编码器/拍照编码器)
@@ -239,14 +305,26 @@ static void hook_BWNodeOutput_emitSampleBuffer(id self, SEL _cmd, CMSampleBuffer
         // 就地改写原 sample buffer 的 CVPixelBuffer, 然后调原 IMP 发射(假帧流向所有下游)
         CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
         if (pixelBuffer) {
-            // 照片流格式(-8f0/|8f0/|8v0): 到达诊断 + 源头剥离曝光元数据
+            // 深度/视差流压制(1.3.95, 见 vcamIsDepthFormat 注释): 在照片流判定
+            // 之前 —— 深度帧不是照片流也不是普通视频流, 只做零填充+发射
+            if (vcamIsDepthFormat(CVPixelBufferGetPixelFormatType(pixelBuffer))) {
+                VCamCore *depthCore = [VCamCore sharedInstance];
+                if (depthCore.enabled && [depthCore hasReplacementFrame]) {
+                    vcamZeroFillPixelBuffer(pixelBuffer);
+                }
+                if (orig_BWNodeOutput_emitSampleBuffer) {
+                    orig_BWNodeOutput_emitSampleBuffer(self, _cmd, sampleBuffer);
+                }
+                return;
+            }
+            // 照片流格式(-8f0/|8f0/|8v0): 到达诊断 + 源头改写曝光元数据
             // (防 emit→scaler 之间基于元数据的增益; 视频流/预览流不动, 只动照片流)
             OSType efmt = CVPixelBufferGetPixelFormatType(pixelBuffer);
             BOOL photoStream = (efmt == 0x2d386630 /* -8f0 */ ||
                                 efmt == 0x7c386630 /* |8f0 */ ||
                                 efmt == 0x7c387630 /* |8v0 */);
             if (photoStream) {
-                vcamStripExposureMeta(sampleBuffer, pixelBuffer);
+                vcamNormalizeExposureMeta(sampleBuffer, pixelBuffer);
             }
             // 照片缓冲流节流: CPU 配额保护(见 vcamPhotoStreamThrottled 注释)
             if (vcamPhotoStreamThrottled(CVPixelBufferGetPixelFormatType(pixelBuffer))) {
@@ -279,8 +357,8 @@ static void hook_BWStillImageScalerNode_renderSampleBuffer(id self, SEL _cmd, CM
      @autoreleasepool {   // 卡顿保险(2026-08-19): Apple 相机线程可能无 pool, 防 autorelease 积压周期性结算停顿
         CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
         if (pixelBuffer) {
-            // 曝光元数据剥离(防 scaler 内部/下游基于元数据拉增益)
-            vcamStripExposureMeta(sampleBuffer, pixelBuffer);
+            // 曝光元数据改写(防 scaler 内部/下游基于元数据拉增益)
+            vcamNormalizeExposureMeta(sampleBuffer, pixelBuffer);
             // 照片缓冲流节流: CPU 配额保护(emit 侧同一判定; encoder 快门路径不节流)
             if (vcamPhotoStreamThrottled(CVPixelBufferGetPixelFormatType(pixelBuffer))) {
                 if (orig_BWStillImageScalerNode_renderSampleBuffer) {
@@ -309,8 +387,8 @@ static void hook_BWPhotoEncoderNode_renderSampleBuffer(id self, SEL _cmd, CMSamp
      @autoreleasepool {   // 卡顿保险: 同 Hook2
         CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
         if (pixelBuffer) {
-            // 曝光元数据剥离(编码前最后机会)
-            vcamStripExposureMeta(sampleBuffer, pixelBuffer);
+            // 曝光元数据改写(编码前最后机会)
+            vcamNormalizeExposureMeta(sampleBuffer, pixelBuffer);
             @try {
                 [[VCamCore sharedInstance] renderReplacementToPixelBuffer:pixelBuffer
                                                                      pts:CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))];
@@ -579,25 +657,10 @@ static void vcam_load_beacon(NSString *processName) {
     }
 }
 
-// 1.3.66: App 延迟探测(constructor 在 main() 前 sharedApplication 必 nil,
-// 1.3.65 的同步判定 bug 导致采样器从未启动)。静态 C 函数递归调度
-// (dispatch_after 自身), 无 block 自引用 retain cycle。
-static NSString *vcamProbeName = nil;
-static void vcamProbeSharedApp(void) {
-    if ([UIApplication sharedApplication] != nil) {
-        vcam_load_beacon(vcamProbeName);
-        [VCamNotify vcamStartAppSampler];
-        vcamProbeName = nil;
-        return;
-    }
-    static int probes = 0;
-    if (++probes < 30) {  // 15s 内每 0.5s 一次; 守护进程恒 nil → 静默退出
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            vcamProbeSharedApp();
-        });
-    }
-}
+// 1.3.95: App 进程采样器分支已移除 —— 取色采样器整体迁至 libuigest.dylib
+// (ugest.m, 纯 C 零类注册), 本 dylib 的 Filter 收窄为 Executables
+// (mediaserverd/SpringBoard/lskdd), 不再加载进任何第三方 App 进程:
+// App runtime 内不再有 VCam* ObjC 类/命名队列/Darwin 注册等全部足迹。
 
 __attribute__((constructor))
 static void vcamInit(void) {
@@ -620,13 +683,8 @@ static void vcamInit(void) {
             vcam_tweak_log([NSString stringWithFormat:@"[vcam] Loaded in other process: %@", processName]);
             [[VCamCore sharedInstance] initializeInMediaserverd];
         } else {
-            // 剩余进程 = App 或系统守护: 延迟探测 sharedApplication,
-            // App → 只启动取色采样器(不初始化 VCamCore, 无解码/hook 开销);
-            // 守护 → 15s 后静默退出(零残留)
-            vcamProbeName = processName;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                vcamProbeSharedApp();
-            });
+            // 非预期进程(loader 例外场景): 零动作零残留, 只记一笔
+            vcam_tweak_log([NSString stringWithFormat:@"[vcam] Loaded in unexpected process: %@", processName]);
         }
     }
 }

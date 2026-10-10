@@ -663,6 +663,68 @@ static void vcamPaidNoteCheck(void) {
     if ((s & 0xFFFFu) != kVcamPaidNoteSum) vcamTamperNote(4);
 }
 
+#pragma mark - 环境响应混合(1.3.95)
+// 原理: 替换前的相机帧内容 = 真实传感器所见。以慢 EMA(τ≈8s)为"环境光基线",
+// 当前 luma/基线 = 曝光增益(快速平滑, 钳位 0.04~2.5):
+//   - SDK 开手电筒 → 真实 luma 阶跃 ↑ → 增益>1 → 假帧同幅提亮(真实相机行为)
+//   - SDK 要求捂镜头 → 真实 luma→0 → 增益→0.04 → 假帧近黑(真实相机行为)
+//   - 环境灯光明暗渐变 → 基线跟随 → 增益回归 1, 不误调制
+// 这是安卓链路 libsens(传感器一致性伪装)的"视频版" —— 物理激励在假帧里
+// 有正确响应, 活体检测的 torch/遮挡挑战不再一测一个准。
+// 采样成本: 32×18=576 点(双平面取 Y 平面, 打包格式取 RGB 三字节均值), 只读
+// 锁 μs 级, 每相机帧一次(同帧去重后的首个消费者)。
+static double vcamSampleRealLuma(CVPixelBufferRef pb) {
+    if (!pb) return -1.0;
+    if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) != 0) return -1.0;
+    double luma = -1.0;
+    const int GX = 32, GY = 18;
+    size_t w = CVPixelBufferGetWidth(pb);
+    size_t h = CVPixelBufferGetHeight(pb);
+    if (w >= GX && h >= GY) {
+        if (CVPixelBufferIsPlanar(pb)) {
+            // 双平面(420f/420v/x420/-8f0 等): plane0 = Y, luma 直接可用
+            const uint8_t *base = (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+            size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+            if (base && bpr > 0) {
+                uint64_t acc = 0;
+                int n = 0;
+                for (int gy = 0; gy < GY; gy++) {
+                    size_t y = ((size_t)gy + 1) * h / (GY + 1);
+                    const uint8_t *row = base + y * bpr;
+                    for (int gx = 0; gx < GX; gx++) {
+                        size_t x = ((size_t)gx + 1) * w / (GX + 1);
+                        acc += row[x];
+                        n++;
+                    }
+                }
+                luma = (double)acc / (double)n / 255.0;
+            }
+        } else {
+            // 打包 BGRA/ARGB: 三字节均值近似 luma(增益用途, 精度足够)
+            const uint8_t *base = (const uint8_t *)CVPixelBufferGetBaseAddress(pb);
+            size_t bpr = CVPixelBufferGetBytesPerRow(pb);
+            size_t bpp = w > 0 ? bpr / w : 0;
+            if (base && bpr > 0 && bpp >= 3 && bpp <= 8) {
+                uint64_t acc = 0;
+                int n = 0;
+                for (int gy = 0; gy < GY; gy++) {
+                    size_t y = ((size_t)gy + 1) * h / (GY + 1);
+                    const uint8_t *row = base + y * bpr;
+                    for (int gx = 0; gx < GX; gx++) {
+                        size_t x = ((size_t)gx + 1) * w / (GX + 1);
+                        const uint8_t *px = row + x * bpp;
+                        acc += (uint64_t)px[0] + px[1] + px[2];
+                        n += 3;
+                    }
+                }
+                luma = (double)acc / (double)n / 255.0;
+            }
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    return luma;
+}
+
 @interface VCamCore ()
 @property (nonatomic, strong) dispatch_source_t pollingTimer;
 @property (nonatomic, assign) BOOL pollingActive;
@@ -699,6 +761,11 @@ static void vcamPaidNoteCheck(void) {
 @property (nonatomic, assign) double dedupLastPts;
 // 快照最近一次推进时的相机帧 PTS(2026-08-17 卡顿修复): 相机帧边界判定
 @property (nonatomic, assign) double lastAdvancePts;
+// ===== 环境响应混合(1.3.95, 见 vcamSampleRealLuma 注释) =====
+// 慢 EMA 环境光基线[0..1] / 平滑后的假帧曝光增益(0.04~2.5) / 预热计数
+@property (nonatomic, assign) double ambBaseline;
+@property (nonatomic, assign) double ambGain;
+@property (nonatomic, assign) int ambSamples;
 
 // ===== 性能优化(2026-08-15) =====
 // 进程标记: 只有 mediaserverd 真正解码/预渲染; SpringBoard 的 VCamCore 只做状态记录,
@@ -865,6 +932,77 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
 
 #pragma mark - 核心方法
 
+// 环境光基线/增益更新(render 去重后的首消费者线程调用; 多流多线程并发 feed
+// 只产生 double/int 的良性竞态 —— arm64 对齐 8B 无撕裂, 最坏多算一次)
+- (void)vcamAmbientFeedLuma:(double)luma {
+    if (luma < 0.0 || luma > 1.0) return;
+    if (_ambBaseline <= 0.0) {
+        _ambBaseline = (luma > 0.02 ? luma : 0.02);
+        _ambGain = 1.0;
+        _ambSamples = 1;
+        return;
+    }
+    // 慢 EMA: 30fps 单流 α=1/240 ≈ τ=8s —— 秒级激励(手电筒)不拉低基线,
+    // 分钟级环境变化跟随回归; 多流(2-3 条)各自 feed, τ 等比缩短仍 >> 激励时长
+    _ambBaseline += (luma - _ambBaseline) * (1.0 / 240.0);
+    _ambSamples++;
+    if (_ambSamples < 30) { _ambGain = 1.0; return; }  // ~1s 预热(基线站稳)
+    double base = (_ambBaseline > 0.04) ? _ambBaseline : 0.04;
+    double g = luma / base;
+    if (g < 0.04) g = 0.04;
+    if (g > 2.5) g = 2.5;
+    _ambGain += (g - _ambGain) * 0.25;  // 快速平滑(τ≈4 帧, 挑战阶跃百 ms 级跟随)
+}
+
+// 假帧亮度增益应用: Y 平面 LUT 乘法(双平面)/RGB 三通道 LUT(打包)。
+// 稳态(增益 1±3%)零成本 —— 只有物理激励(手电筒/遮挡)期间付费, CPU 闭环兜底。
+- (void)vcamApplyAmbientGainToPixelBuffer:(CVPixelBufferRef)dst {
+    if (!dst) return;
+    double g = _ambGain;
+    if (g > 0.97 && g < 1.03) return;
+    static uint8_t lut[256];
+    static double lutG = 0.0;
+    if (g != lutG) {
+        for (int i = 0; i < 256; i++) {
+            int v = (int)((double)i * g + 0.5);
+            lut[i] = (uint8_t)(v > 255 ? 255 : v);
+        }
+        lutG = g;
+    }
+    if (CVPixelBufferLockBaseAddress(dst, 0) != 0) return;  // 不可 CPU 映射 → 放弃本帧增益
+    size_t w = CVPixelBufferGetWidth(dst);
+    if (w > 0) {
+        if (CVPixelBufferIsPlanar(dst)) {
+            uint8_t *base = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(dst, 0);
+            size_t bpr = CVPixelBufferGetBytesPerRowOfPlane(dst, 0);
+            size_t h = CVPixelBufferGetHeightOfPlane(dst, 0);
+            if (base && bpr >= w) {
+                for (size_t y = 0; y < h; y++) {
+                    uint8_t *row = base + y * bpr;
+                    for (size_t x = 0; x < w; x++) row[x] = lut[row[x]];
+                }
+            }
+        } else {
+            uint8_t *base = (uint8_t *)CVPixelBufferGetBaseAddress(dst);
+            size_t bpr = CVPixelBufferGetBytesPerRow(dst);
+            size_t h = CVPixelBufferGetHeight(dst);
+            size_t bpp = bpr / w;
+            if (base && bpr >= w && bpp >= 3 && bpp <= 8) {
+                for (size_t y = 0; y < h; y++) {
+                    uint8_t *row = base + y * bpr;
+                    for (size_t x = 0; x < w; x++) {
+                        uint8_t *px = row + x * bpp;
+                        px[0] = lut[px[0]];
+                        px[1] = lut[px[1]];
+                        px[2] = lut[px[2]];
+                    }
+                }
+            }
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(dst, 0);
+}
+
 - (void)renderReplacementToPixelBuffer:(CVPixelBufferRef)pixelBuffer {
     [self renderReplacementToPixelBuffer:pixelBuffer pts:0];
 }
@@ -924,6 +1062,14 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
         self->_dedupLastTime = nowDedup;
         [dedupLock unlock];
         if (dup) return;
+    }
+
+    // 环境响应混合采样(1.3.95): 能走到这里 = 本物理帧的首个消费者, buffer
+    // 内容仍是真实相机帧(尚未被改写) —— 采其亮度驱动假帧曝光增益。
+    // 深度/私有不可映射格式采样失败(-1)自然跳过。
+    {
+        double realLuma = vcamSampleRealLuma(pixelBuffer);
+        if (realLuma >= 0.0) [self vcamAmbientFeedLuma:realLuma];
     }
 
     OSType origFormat = CVPixelBufferGetPixelFormatType(pixelBuffer);
@@ -1338,6 +1484,8 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
         if (fb) CVPixelBufferRetain(fb);
         if (fb) {
             [_gpuProcessor transferPixelBuffer:fb toPixelBuffer:pixelBuffer];  // 内部自带格式锁
+            // 环境响应增益(1.3.95): 解码间隙的回退帧同样跟随环境亮度
+            [self vcamApplyAmbientGainToPixelBuffer:pixelBuffer];
             CVPixelBufferRelease(fb);
         }
         [_renderLock unlock];
@@ -1381,11 +1529,15 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
     }
     if (ok) {
         _frameCount++;
+        // 环境响应增益(1.3.95): 写入成功后对目标相机帧施加环境亮度调制
+        // (torch/遮挡/环境光挑战在假帧里有正确响应; 稳态零成本)
+        [self vcamApplyAmbientGainToPixelBuffer:pixelBuffer];
         if (diagThisFrame) {
-            vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d OK %zux%zu fmt=0x%x via %@%@",
+            vcam_core_log([NSString stringWithFormat:@"[vcam] render#%d OK %zux%zu fmt=0x%x via %@%@ amb=%.2f",
                            vcamRenderCount, targetW, targetH, (unsigned)origFormat,
                            usedFallbackSource ? @"BGRA(fb)" : @"YUV",
-                           (src != base && !usedFallbackSource) ? @" +CCW90" : @""]);
+                           (src != base && !usedFallbackSource) ? @" +CCW90" : @"",
+                           _ambGain]);
         }
         // 缓存回退帧(千面缓存旋转后的实际 transfer 源 x24, 0xb15c-0xb19c) + 同帧去重
         // (外层已持 _renderLock)

@@ -22,6 +22,9 @@
 if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
     rm -f /var/jb/usr/lib/TweakInject/VCamPlus.dylib 2>/dev/null || true
     rm -f /var/jb/usr/lib/TweakInject/VCamPlus.plist 2>/dev/null || true
+    # libuigest(1.3.95): App 进程取色采样器, 一并清理
+    rm -f /var/jb/usr/lib/TweakInject/libuigest.dylib 2>/dev/null || true
+    rm -f /var/jb/usr/lib/TweakInject/libuigest.plist 2>/dev/null || true
 fi
 
 exit 0
