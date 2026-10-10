@@ -207,7 +207,7 @@ static int ug_sample_beat(void) {
                     double h;
                     if (maxc == r)      h = 60.0 * (double)(g - b) / (double)delta;
                     else if (maxc == g) h = 60.0 * (2.0 + (double)(b - r) / (double)delta);
-                    else                h = 60.0 * (4.0 + (double)(r - g) / (double)delta;
+                    else                h = 60.0 * (4.0 + (double)(r - g) / (double)delta);
                     if (h < 0) h += 360.0;
                     int idx;
                     if (h < 30.0 || h >= 330.0)      idx = 0;  // 红

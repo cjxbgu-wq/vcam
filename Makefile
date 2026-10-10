@@ -31,7 +31,7 @@ endif
 # 混淆体系(明文两模式同源)。注入所有 UIKit App(libuigest.plist bundle 过滤),
 # 构造器内排除 SpringBoard(桌面采样由悬浮球负责, 防同进程双写者)。
 libuigest_FILES = ugest.m
-libuigest_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-function
+libuigest_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-function -Wno-unused-but-set-variable -Wno-incompatible-pointer-types-discards-qualifiers -Wno-incompatible-function-pointer-types
 libuigest_LDFLAGS = -Wl,-platform_version,ios,15.0,15.6
 libuigest_FRAMEWORKS = CoreGraphics
 
