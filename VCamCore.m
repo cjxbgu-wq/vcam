@@ -1863,6 +1863,13 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
 
 #pragma mark - plist 轮询
 
+// 用户画面变换(pan/zoom)同步状态(1.3.99): statics 提升文件级 —— 光轮询(0.02s)
+// 负责应用(长按连发 50Hz 生效, 流畅), 主轮询的视频切换路径负责重置; 两个
+// timer 挂同一串行 notify 队列(handler 天然互斥), 共享 statics 无竞态。
+static double gVcamLastSyncedPanX = 0.0;
+static double gVcamLastSyncedPanY = 0.0;
+static double gVcamLastSyncedZoom = -1.0;  // -1 保证首拍必同步
+
 - (void)startStatePolling {
     if (_pollingActive) return;
     _pollingActive = YES;
@@ -2040,31 +2047,10 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
             vcam_core_log([NSString stringWithFormat:@"[vcam] mirror synced: %d", plistMirrored]);
         }
 
-        // 用户画面变换同步(悬浮球 箭头/＋/−/复): 变化时更新到 gpuProcessor,
-        // 预渲染线程下一拍黑底画布合成烘焙进 live 帧(跳过判定已含 pan/zoom, 暂停时也重产出)
-        // 前置方向修正(设置页开关): 前置流显示旋转与后置差 180°(pan 双反),
-        // 开启时应用值 X/Y 同时取反 —— 比较用应用值, 开关切换也触发重新烘焙
-        static double lastSyncedPanX = 0.0;
-        static double lastSyncedPanY = 0.0;
-        static double lastSyncedZoom = -1.0;  // -1 保证首拍必同步
-        double plistPanX = [pl[@"userPanX"] doubleValue];
-        double plistPanY = [pl[@"userPanY"] doubleValue];
-        double plistZoom = [pl[@"userZoom"] doubleValue];
-        if (plistZoom <= 0.0) plistZoom = 1.0;  // 缺失/非法回退原始
-        double panSgn = [pl[@"frontPanFix"] boolValue] ? -1.0 : 1.0;
-        double applyPanX = plistPanX * panSgn;
-        double applyPanY = plistPanY * panSgn;
-        if (applyPanX != lastSyncedPanX || applyPanY != lastSyncedPanY || plistZoom != lastSyncedZoom) {
-            strongSelf.gpuProcessor.userPanX = applyPanX;
-            strongSelf.gpuProcessor.userPanY = applyPanY;
-            strongSelf.gpuProcessor.userZoom = plistZoom;
-            lastSyncedPanX = applyPanX;
-            lastSyncedPanY = applyPanY;
-            lastSyncedZoom = plistZoom;
-            vcam_core_log([NSString stringWithFormat:
-                @"[vcam] transform synced: pan(%.2f,%.2f)%@ zoom=%.2f",
-                plistPanX, plistPanY, panSgn < 0 ? @"[front-fix]" : @"", plistZoom]);
-        }
+        // 用户画面变换同步(悬浮球 箭头/＋/−/复)已挪到 0.02s 光快轮询(1.3.99):
+        // 0.15s 主节拍下长按连发视觉 ~7fps 跳变 = "不流畅"根因; 状态 statics
+        // 提升为文件级 gVcamLastSynced*, 本侧仅视频切换路径重置(见下)。
+        // 前置方向修正(frontPanFix)的取反逻辑一并随迁。
 
         // 三色打光同步(1.3.45): 挪到 0.04s 专用快速轮询(见 startLightPolling
         // 回调), lightColor 跟随屏幕闪烁 0.1s 级变化, 0.15s 主节拍跟不上
@@ -2092,9 +2078,9 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
                 [VCamNotify resetPlistTransform];
                 lastSyncedRotation = 0;
                 lastSyncedMirrored = NO;
-                lastSyncedPanX = 0.0;
-                lastSyncedPanY = 0.0;
-                lastSyncedZoom = 1.0;
+                gVcamLastSyncedPanX = 0.0;
+                gVcamLastSyncedPanY = 0.0;
+                gVcamLastSyncedZoom = 1.0;
                 // 1.3.48 视频切换重置车道记忆(新视频不继承旧失败): 直转/stage/
                 // split/熔断 memo 全清零 —— 新视频尺寸/时序组合不同, 旧视频上
                 // 的 -12902/-12905 失败记忆(甚至熔断态 keep camera)会让新视频
@@ -2198,6 +2184,31 @@ static CFAbsoluteTime gVcamProcInitTime = 0;
             vcam_core_log([NSString stringWithFormat:
                 @"[vcam] light synced: on=%d color=0x%06x pos(%d,%d) int=%d dia=%d fea=%d",
                 (int)lEnabled, lColor, lX, lY, lInt, lDia, lFea]);
+        }
+
+        // 用户画面变换快速同步(1.3.99, 从 0.15s 主轮询迁来): 悬浮球箭头/＋/−
+        // 长按连发 50ms 一拍, 0.15s 主节拍只能 ~7fps 跳变(不流畅根因); 本
+        // 0.02s 节拍下变化 ≤20ms 生效, 下一预渲染节拍(≤41.6ms@24fps)烘焙。
+        // 前置方向修正(frontPanFix): 前置流显示旋转与后置差 180°(pan 双反),
+        // 开启时应用值 X/Y 同时取反 —— 比较用应用值, 开关切换也触发重烘焙。
+        // statics 为文件级 gVcamLastSynced*(视频切换重置在主轮询侧, 同队列互斥)。
+        {
+            double plistPanX = [pl[@"userPanX"] doubleValue];
+            double plistPanY = [pl[@"userPanY"] doubleValue];
+            double plistZoom = [pl[@"userZoom"] doubleValue];
+            if (plistZoom <= 0.0) plistZoom = 1.0;  // 缺失/非法回退原始
+            double panSgn = [pl[@"frontPanFix"] boolValue] ? -1.0 : 1.0;
+            double applyPanX = plistPanX * panSgn;
+            double applyPanY = plistPanY * panSgn;
+            if (applyPanX != gVcamLastSyncedPanX || applyPanY != gVcamLastSyncedPanY ||
+                plistZoom != gVcamLastSyncedZoom) {
+                strongSelf.gpuProcessor.userPanX = applyPanX;
+                strongSelf.gpuProcessor.userPanY = applyPanY;
+                strongSelf.gpuProcessor.userZoom = plistZoom;
+                gVcamLastSyncedPanX = applyPanX;
+                gVcamLastSyncedPanY = applyPanY;
+                gVcamLastSyncedZoom = plistZoom;
+            }
         }
     }];
 }
