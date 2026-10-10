@@ -170,17 +170,18 @@ static void *hk_dlopen(const char *path, int mode) {
 
 __attribute__((constructor))
 static void sdInit(void) {
-    // ellekit 的 Bundles filter 只匹配已加载 framework 的 bundle id, 主 App
-    // bundle id 不参与注入判定 → plist 用 com.apple.UIKit 保注入, 此处自检
-    // 目标 App(云闪付), 其余 UIKit App 直接退出(dylib 仅短暂驻留, 不 hook)
-    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
-    if (![bid isEqualToString:@"com.unionpay.chsp"]) return;
+    // ellekit 的 Bundles filter 只匹配已加载 framework 的 bundle id → plist
+    // 用 com.apple.UIKit 保注入。目标自检用 getenv("HOME")(容器路径) ——
+    // NSBundle mainBundle / NSHomeDirectory 在 constructor(main 之前)尚未
+    // 初始化返回 nil, 环境变量在 exec 时已就绪(1.3.108 fix3)
+    const char *home = getenv("HOME");
+    if (!home || !strstr(home, "A1B6AB96-3969-4FB5-BDFA-9C51B9055FBE")) return;
 
-    // 日志落 App 容器 tmp/sd.log(沙盒内合法; SSH root 直读)
-    NSString *p = [NSHomeDirectory() stringByAppendingPathComponent:@"tmp/sd.log"];
-    gLog = fopen(p.fileSystemRepresentation, "a");
+    char path[512];
+    snprintf(path, sizeof(path), "%s/tmp/sd.log", home);
+    gLog = fopen(path, "a");
     if (!gLog) return;
-    sdlog("[PRB] probe loaded pid=%d bid=%s", getpid(), [bid UTF8String]);
+    sdlog("[PRB] probe loaded pid=%d home=%s", getpid(), home);
 
     struct hk { void **orig; void *repl; } hks[] = {
         { (void **)&orig_dgni,   (void *)hk_dgni },
