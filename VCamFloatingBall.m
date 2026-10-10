@@ -40,6 +40,7 @@
 #import "btn_icons.h"
 #import "VCamStr.h"
 #import <UIKit/UIKit.h>
+#import <objc/runtime.h>
 
 // 1.3.91 散射复核(定义在 VCamCore.m): 未激活直接返回; 激活态走独立验签路径
 extern BOOL vcamScatterChk(int reason);
@@ -499,9 +500,17 @@ static void *vcamPickCaptureMain(void *ctx) {
 @property (nonatomic, strong) VCamPanelButton *replaceBtn;    // 替(图标, 边框=替换开启)
 @property (nonatomic, strong) VCamPanelButton *mirrorBtn;     // 镜(图标, 边框=镜像开启)
 @property (nonatomic, strong) VCamPanelButton *playPauseBtn;  // ▶ ↔ ⏸
-// pan 方向补偿(1.3.53): 镜像显示的 App(QQ前置等)里 pan 双轴反向, 长按箭头切换
-// frontPanFix(mediaserverd 同步侧双轴翻转); 开启时箭头显示白边框
+// pan 方向补偿(1.3.53; 1.3.98 起改双击箭头切换): 镜像显示的 App(QQ前置等)
+// 里 pan 双轴反向, frontPanFix(mediaserverd 同步侧双轴翻转); 开启时箭头显示白边框
 @property (nonatomic, strong) NSMutableArray<VCamPanelButton *> *panArrowBtns;
+// 持续按键(1.3.98: 箭头/＋/−): 按住 ≥0.25s 起每 50ms 连续触发一拍, 抬指停止;
+// 快速单击 = 一步。动作块经 associated object 挂在按钮上(避免 performSelector
+// 的 -Warc-performSelector-leaks 告警, theos -Werror 下会挡构建)。
+@property (nonatomic, strong) NSTimer *holdRepeatTimer;
+@property (nonatomic, copy) void (^holdRepeatBlock)(void);
+@property (nonatomic, assign) CFAbsoluteTime holdRepeatStart;
+@property (nonatomic, assign) CFAbsoluteTime holdRepeatLastFire;
+@property (nonatomic, assign) BOOL holdRepeatFired;
 @property (nonatomic, assign) BOOL panelVisible;
 @property (nonatomic, assign) BOOL isFloating;
 @property (nonatomic, assign) BOOL isPaused;
@@ -711,6 +720,68 @@ static void *vcamPickCaptureMain(void *ctx) {
     }];
 }
 
+#pragma mark - 持续按键协调器(1.3.98: 箭头/＋/− 长按连续触发)
+// 交互: 快速单击 = 一步(与旧版一致); 按住 ≥0.25s 起每 50ms 一拍连续触发,
+// 抬指(内抬/外滑/取消)停止; 连发过后抬起不再补发单击。
+// 实现: 动作块挂按钮(associated object), TouchDown 起表 → tick 判初始延迟 →
+// 连发; TouchUpInside 时若从未连发则补一步(单击语义)。
+static char kVcamHoldRepeatBlockKey;
+
+- (void)attachHoldRepeat:(UIButton *)btn selector:(SEL)sel block:(void (^)(void))block {
+    objc_setAssociatedObject(btn, &kVcamHoldRepeatBlockKey, block, OBJC_ASSOCIATION_COPY);
+    // makeButton 已把 sel 绑在 TouchUpInside —— 解绑改由协调器接管(视觉反馈保留)
+    [btn removeTarget:self action:sel forControlEvents:UIControlEventTouchUpInside];
+    [btn addTarget:self action:@selector(holdRepeatTouchDown:) forControlEvents:UIControlEventTouchDown];
+    [btn addTarget:self action:@selector(holdRepeatTouchUpInside:) forControlEvents:UIControlEventTouchUpInside];
+    [btn addTarget:self action:@selector(holdRepeatTouchEnded:)
+       forControlEvents:UIControlEventTouchUpOutside | UIControlEventTouchDragExit | UIControlEventTouchCancel];
+}
+
+- (void)holdRepeatStop {
+    [_holdRepeatTimer invalidate];
+    _holdRepeatTimer = nil;
+    _holdRepeatBlock = nil;
+}
+
+- (void)holdRepeatTouchDown:(UIButton *)btn {
+    [self holdRepeatStop];
+    void (^block)(void) = objc_getAssociatedObject(btn, &kVcamHoldRepeatBlockKey);
+    if (!block) return;
+    _holdRepeatBlock = block;
+    _holdRepeatStart = CFAbsoluteTimeGetCurrent();
+    _holdRepeatFired = NO;
+    _holdRepeatLastFire = 0;  // 首拍(延迟后)立即发
+    _holdRepeatTimer = [NSTimer scheduledTimerWithTimeInterval:0.05
+                                                         target:self
+                                                       selector:@selector(holdRepeatTick:)
+                                                       userInfo:nil
+                                                        repeats:YES];
+}
+
+- (void)holdRepeatTick:(NSTimer *)t {
+    (void)t;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now - _holdRepeatStart < 0.25) return;  // 起步延迟: 单击不触发连发
+    // 写节流(≥70ms/拍 ≈14Hz): md 主轮询 0.15s 才读 zoom/pan, 更快的 plist 写纯浪费
+    if (now - _holdRepeatLastFire < 0.07) return;
+    _holdRepeatLastFire = now;
+    _holdRepeatFired = YES;
+    if (_holdRepeatBlock) _holdRepeatBlock();
+}
+
+- (void)holdRepeatTouchUpInside:(UIButton *)btn {
+    (void)btn;
+    BOOL fired = _holdRepeatFired;
+    void (^block)(void) = _holdRepeatBlock;
+    [self holdRepeatStop];
+    if (!fired && block) block();  // 快速单击 = 一步
+}
+
+- (void)holdRepeatTouchEnded:(UIButton *)btn {
+    (void)btn;
+    [self holdRepeatStop];
+}
+
 #pragma mark - 面板创建（三页签 + 灰色主题, 4x4 宫格控制页）
 
 - (void)createPanel {
@@ -901,18 +972,35 @@ static void *vcamPickCaptureMain(void *ctx) {
             if (r == 2 && c == 1) _playPauseBtn = btn;         // ▶ ↔ ⏸ (play.fill/pause.fill)
             if (r == 3 && c == 1) _mirrorBtn = btn;             // 镜(图标)
             if (r == 3 && c == 2) _replaceBtn = btn;            // 替(图标)
-            // 1.3.53 箭头按钮: 记录引用 + 长按 = pan 方向补偿开关(镜像显示 App 用)
-            if (cell.action == @selector(panUpTapped) ||
-                cell.action == @selector(panLeftTapped) ||
-                cell.action == @selector(panDownTapped) ||
-                cell.action == @selector(panRightTapped)) {
+            // 1.3.98 箭头/＋/− = 持续按键: 按住连续触发(每拍 1%), 单击一步。
+            // 动作用块挂按钮(weak self 防环, 球是单例本无环, 卫生起见)。
+            BOOL isArrow = (cell.action == @selector(panUpTapped) ||
+                            cell.action == @selector(panLeftTapped) ||
+                            cell.action == @selector(panDownTapped) ||
+                            cell.action == @selector(panRightTapped));
+            BOOL isZoom = (cell.action == @selector(zoomInTapped) ||
+                           cell.action == @selector(zoomOutTapped));
+            if (isArrow || isZoom) {
+                __weak typeof(self) ws = self;
+                void (^act)(void) = nil;
+                if (cell.action == @selector(panUpTapped))         act = ^{ [ws panUpTapped]; };
+                else if (cell.action == @selector(panLeftTapped))  act = ^{ [ws panLeftTapped]; };
+                else if (cell.action == @selector(panDownTapped))  act = ^{ [ws panDownTapped]; };
+                else if (cell.action == @selector(panRightTapped)) act = ^{ [ws panRightTapped]; };
+                else if (cell.action == @selector(zoomInTapped))   act = ^{ [ws zoomInTapped]; };
+                else if (cell.action == @selector(zoomOutTapped))  act = ^{ [ws zoomOutTapped]; };
+                if (act) [self attachHoldRepeat:btn selector:cell.action block:act];
+            }
+            // 1.3.53 pan 方向补偿开关: 长按箭头(旧) → 1.3.98 改为双击箭头切换
+            // (长按让位给连续移动); 白边框视觉不变
+            if (isArrow) {
                 if (!self.panArrowBtns) self.panArrowBtns = [NSMutableArray array];
                 [self.panArrowBtns addObject:btn];
-                UILongPressGestureRecognizer *lp =
-                    [[UILongPressGestureRecognizer alloc] initWithTarget:self
-                                                                action:@selector(panFlipToggled:)];
-                lp.minimumPressDuration = 0.5;
-                [btn addGestureRecognizer:lp];
+                UITapGestureRecognizer *dt =
+                    [[UITapGestureRecognizer alloc] initWithTarget:self
+                                                              action:@selector(panFlipToggled:)];
+                dt.numberOfTapsRequired = 2;
+                [btn addGestureRecognizer:dt];
             }
         }
     }
@@ -1833,15 +1921,15 @@ static NSString *vcamLightColorName(uint32_t c) {
     }
 }
 
-// 1.3.53 长按任意箭头 = 切换 pan 方向补偿(frontPanFix, mediaserverd 双轴翻转)
+// 1.3.53 pan 方向补偿: 双击任意箭头 = 切换(1.3.98 前是长按, 长按已让位给连续移动)
 // 场景: QQ前置等镜像显示的相机预览, ←向右/↑向下反向; 开启后方向纠正
-- (void)panFlipToggled:(UILongPressGestureRecognizer *)g {
-    if (g.state != UIGestureRecognizerStateBegan) return;
+- (void)panFlipToggled:(UIGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateEnded) return;  // Tap 手势以 Ended 结束
     BOOL on = ![VCamNotify plistFrontPanFix];
     [VCamNotify setPlistFrontPanFix:on];
     [self updatePanArrowVisual];
     vcam_ball_log([NSString stringWithFormat:
-        @"[vcam][btn] pan direction fix toggled -> %@ (long-press, applies both axes)",
+        @"[vcam][btn] pan direction fix toggled -> %@ (double-tap, applies both axes)",
         on ? @"ON" : @"OFF"]);
 }
 
@@ -1922,13 +2010,15 @@ static NSString *vcamLightColorName(uint32_t c) {
 //   - 步进 = 固定 ±10 个百分点(加法, 不复利): 1.00→1.10→1.20…→3.00
 //   - >100% 中心放大裁切, <100% 缩小露黑边
 // 旧 iOS 行为(×1.10 复利, 上限 4.0)废止。
-static double vcamTZoomStep(void)    { return 0.10; }
+// 1.3.98 步进细化为 1%(配合长按连发): zoom 每拍 ±1 个百分点(0.5..3.0),
+// pan 每拍 1%(旧: zoom ±10 / pan 5%)
+static double vcamTZoomStep(void)    { return 0.01; }
 // 1.3.82 修复: min 曾误设 1.0 —— 初始 zoom=1.0 时点"−"被 clamp 回 1.0
 // 永远无反应。min=0.5: 默认状态可直接缩小到四周露黑边(=安卓 50%)
 static double vcamTZoomMin(void)    { return 0.5; }
 // 1.3.97: 4.0→3.0 对齐安卓上限 300%(GPU 侧 bakeUserTransform 同步收口)
 static double vcamTZoomMax(void)    { return 3.0; }
-static double vcamTPanStep(void)    { return 0.05; }
+static double vcamTPanStep(void)    { return 0.01; }
 
 static double vcamClamp(double v, double lo, double hi) {
     if (v < lo) return lo;
