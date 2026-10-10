@@ -170,12 +170,17 @@ static void *hk_dlopen(const char *path, int mode) {
 
 __attribute__((constructor))
 static void sdInit(void) {
+    // ellekit 的 Bundles filter 只匹配已加载 framework 的 bundle id, 主 App
+    // bundle id 不参与注入判定 → plist 用 com.apple.UIKit 保注入, 此处自检
+    // 目标 App(云闪付), 其余 UIKit App 直接退出(dylib 仅短暂驻留, 不 hook)
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+    if (![bid isEqualToString:@"com.unionpay.chsp"]) return;
+
     // 日志落 App 容器 tmp/sd.log(沙盒内合法; SSH root 直读)
     NSString *p = [NSHomeDirectory() stringByAppendingPathComponent:@"tmp/sd.log"];
     gLog = fopen(p.fileSystemRepresentation, "a");
     if (!gLog) return;
-    sdlog("[PRB] probe loaded pid=%d home=%s", getpid(),
-          [NSHomeDirectory() UTF8String]);
+    sdlog("[PRB] probe loaded pid=%d bid=%s", getpid(), [bid UTF8String]);
 
     struct hk { void **orig; void *repl; } hks[] = {
         { (void **)&orig_dgni,   (void *)hk_dgni },

@@ -4,9 +4,11 @@
 <dict>
 	<key>Filter</key>
 	<dict>
+		<key>Mode</key>
+		<string>Any</string>
 		<key>Bundles</key>
 		<array>
-			<string>com.unionpay.chsp</string>
+			<string>com.apple.UIKit</string>
 		</array>
 	</dict>
 </dict>
