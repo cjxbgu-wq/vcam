@@ -518,8 +518,19 @@ static void *vcamPickCaptureMain(void *ctx) {
 @property (nonatomic, assign) CGFloat panelPad;        // 面板内边距
 @property (nonatomic, assign) CGFloat controlPageH;    // 控制页内容高度
 @property (nonatomic, assign) CGFloat settingsPageH;   // 设置页内容高度
-@property (nonatomic, assign) CGFloat lightPageH;      // 打光页内容高度
+@property (nonatomic, assign) CGFloat lightPageH;      // 打光页可视高度
 @property (nonatomic, assign) NSInteger pickerSlot;      // 0=选择视频(vcam.mp4) 2/3=预设槽位
+
+// ===== 打光检测(1.3.101, 复刻安卓 ControllerFragment BlinkRunnable) =====
+@property (nonatomic, strong) UIScrollView *lightScrollView;  // 打光页滚动容器(可滑动)
+@property (nonatomic, strong) VCamPanelButton *blinkTestBtn;  // 打光检测开关按钮
+@property (nonatomic, strong) NSTimer *blinkTimer;            // 0.8s 色条轮换
+@property (nonatomic, assign) int blinkColorIdx;              // 当前 6 彩色下标
+@property (nonatomic, assign) BOOL blinkRunning;
+@property (nonatomic, assign) CGFloat blinkSavedPickX;        // 临时采样点还原
+@property (nonatomic, assign) CGFloat blinkSavedPickY;
+@property (nonatomic, strong) UIView *blinkBarLeft;           // 屏幕左右测试色条
+@property (nonatomic, strong) UIView *blinkBarRight;
 
 // ===== 密钥验证激活页(1.3.54, 设置页入口) =====
 // 设备码展示(点击复制) + 密钥输入 + 激活状态; 激活后永久有效(无月/年),
@@ -784,8 +795,9 @@ static char kVcamHoldRepeatBlockKey;
     CGFloat controlH = cellH * 4 + gridGap * 3;          // 197
     // 设置页内容高度: 选择视频 + 预设2 + 预设3 + 预设4 + 密钥验证 5 整宽(38*5 + 8*4) + 10 + 水印(16)
     CGFloat settingsH = rowH * 5 + gap * 4 + 10 + 16;    // 248
-    // 打光页内容高度(1.3.37): 取色按钮 38 + 6 + 颜色行 22 + 8 + 5 滑块行(30×5 + 6×4) + 4
-    CGFloat lightH = 38 + 6 + 22 + 8 + (30 * 5 + 6 * 4) + 4;  // 252
+    // 打光页可视高度(1.3.37→1.3.101 可滑动): 页面为 UIScrollView, 面板按此高度
+    // 展示, 内容(取色+检测按钮+颜色行+5 滑块 = 298)超出部分滚动查看
+    CGFloat lightH = 252;
     // 面板高度跟随激活页签(2026-08-23): 初始=控制页(默认页), 切页动态动画调整,
     // 消除"设置页加高后控制页下方多出空白一行"
     CGFloat panelH = pageTop + controlH + pad;
@@ -989,12 +1001,21 @@ static char kVcamHoldRepeatBlockKey;
         }
     }
 
-    // ===== 打光页(1.3.37, 复刻 Android 三色打光): 屏幕取色 + 颜色预览 + 5 参数滑块 =====
+    // ===== 打光页(1.3.37, 复刻 Android 三色打光): 屏幕取色 + 打光检测 + 颜色预览 + 5 参数滑块 =====
     // 数据流: 取色点(可拖) → 检测线程 0.1s 截屏采样多数表决 → vc.plist lightColor
     //         → mediaserverd 轮询 → 预渲染圆形渐变光斑注入(公式同 Android vcplax)
-    _lightPageView = [[UIView alloc] initWithFrame:CGRectMake(0, pageTop, panelW, lightH)];
+    // 1.3.101 可滑动(对齐安卓 ControllerFragment 的 ScrollView): 检测按钮加入后
+    // 内容超高, 页面套 UIScrollView 滚动查看; 面板高度仍走可视高度(lightH)
+    CGFloat lightContentH = lightH + rowH + gap;   // 298: 多出打光检测按钮一行
+    _lightScrollView = [[UIScrollView alloc] initWithFrame:CGRectMake(0, pageTop, panelW, lightH)];
+    _lightScrollView.contentSize = CGSizeMake(panelW, lightContentH);
+    _lightScrollView.showsVerticalScrollIndicator = NO;
+    _lightScrollView.bounces = NO;
+    _lightScrollView.backgroundColor = [UIColor clearColor];
+    [_panelView addSubview:_lightScrollView];
+    _lightPageView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, panelW, lightContentH)];
     _lightPageView.backgroundColor = [UIColor clearColor];
-    [_panelView addSubview:_lightPageView];
+    [_lightScrollView addSubview:_lightPageView];
 
     // 屏幕取色总开关: 开 = 取色点显示 + 检测启动 + 打光启用(颜色跟屏幕闪烁)
     // 1.3.71 标题与功能反相(默认关 → 显示"开")
@@ -1004,8 +1025,16 @@ static char kVcamHoldRepeatBlockKey;
     _pickColorBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
     [_lightPageView addSubview:_pickColorBtn];
 
-    // 检测颜色预览行: 色块 + 名称/RGB
-    CGFloat colorRowY = rowH + 6;
+    // 打光检测(1.3.101, 复刻安卓 blink test): 屏幕左右色条 0.8s 轮换 6 彩色,
+    // 采样点临时切到色条 → 端到端验证 检测→总线→md 光斑 链路
+    _blinkTestBtn = [self makeButton:@"打光检测"
+                               frame:CGRectMake(pad, rowH + gap, contentW, rowH)
+                             selector:@selector(blinkTestTapped)];
+    _blinkTestBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    [_lightPageView addSubview:_blinkTestBtn];
+
+    // 检测颜色预览行: 色块 + 名称/RGB (检测按钮行之后)
+    CGFloat colorRowY = (rowH + gap) * 2 + 4;
     _lightColorSwatch = [[UIView alloc] initWithFrame:CGRectMake(pad, colorRowY + 3, 16, 16)];
     _lightColorSwatch.layer.cornerRadius = 3;
     _lightColorSwatch.layer.borderWidth = 1;
@@ -1305,18 +1334,8 @@ static NSString *vcamLightColorName(uint32_t c) {
 // 实际打光关 → 显示"屏幕取色: 开"。(标题与功能状态反相)
 - (void)pickColorTapped {
     BOOL on = ![VCamNotify plistLightEnabled];
-    [VCamNotify setPlistLightEnabled:on];
     if (on) {
-        [VCamNotify setPlistLightColor:0];  // 复位, 检测到颜色再写(避免残留旧色)
-        _lastDetectedColor = 0;
-        _pickSkipCount = 3;  // 跳前 3 拍(Android FRAME_SKIP_ON_START: 避免残留状态误检)
-        [self showPickDot];
-        [self startColorPickup];
-        // 打光功能已开 → 反相标题"关"
-        [_pickColorBtn setTitle:@"屏幕取色: 关" forState:UIControlStateNormal];
-        // 1.3.67: cfg 下行(Darwin, App 沙盒读不了 plist) —— App 采样器开启
-        [VCamNotify vcamPublishPickCfg:YES X:gVcamPick.px Y:gVcamPick.py];
-        vcam_ball_log(@"[vcam][light] screen color pickup ON (title shows off)");
+        [self vcamEnsureLightPipelineOn];
     } else {
         [self stopColorPickup];
         [self hidePickDot];
@@ -1328,6 +1347,131 @@ static NSString *vcamLightColorName(uint32_t c) {
         [VCamNotify vcamPublishPickCfg:NO X:0 Y:0];  // App 采样器停止
         vcam_ball_log(@"[vcam][light] screen color pickup OFF (title shows on)");
     }
+}
+
+// 确保取色检测+打光全链开启(1.3.101 抽自 pickColorTapped 开启分支; 打光检测
+// 按钮开始时同用 —— 对齐安卓 blink test 的 setAutoColorSilently(true) 语义:
+// 闪烁打光依赖三色检测, 检测可能是关闭态, 这里确保开启, 否则只有色条闪、
+// 替换画面不打光)
+- (void)vcamEnsureLightPipelineOn {
+    if ([VCamNotify plistLightEnabled]) return;
+    [VCamNotify setPlistLightEnabled:YES];
+    [VCamNotify setPlistLightColor:0];  // 复位, 检测到颜色再写(避免残留旧色)
+    _lastDetectedColor = 0;
+    _pickSkipCount = 3;  // 跳前 3 拍(Android FRAME_SKIP_ON_START: 避免残留状态误检)
+    [self showPickDot];
+    [self startColorPickup];
+    // 打光功能已开 → 反相标题"关"(1.3.71)
+    [_pickColorBtn setTitle:@"屏幕取色: 关" forState:UIControlStateNormal];
+    // 1.3.67: cfg 下行(Darwin, App 沙盒读不了 plist) —— App 采样器开启
+    [VCamNotify vcamPublishPickCfg:YES X:gVcamPick.px Y:gVcamPick.py];
+    vcam_ball_log(@"[vcam][light] screen color pickup ON (title shows off)");
+}
+
+#pragma mark - 打光检测(1.3.101, 复刻安卓 ControllerFragment BlinkRunnable)
+
+// 白色已移除(安卓同款教训): 白拍被检测饱和度过滤 → color=0 → 光圈熄灭/混合
+// 白灰光, 闪烁测试只保留可通过检测的六彩色
+static const uint32_t kVcamBlinkColors[6] = {
+    0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0x00FFFF, 0xFF00FF
+};
+static const CGFloat kVcamBlinkBarW = 28.0;  // 安卓 28dp 同宽
+
+static UIColor *vcamBlinkUIColor(uint32_t c) {
+    return [UIColor colorWithRed:((c >> 16) & 0xFF) / 255.0
+                           green:((c >> 8) & 0xFF) / 255.0
+                            blue:(c & 0xFF) / 255.0 alpha:1.0];
+}
+
+- (void)blinkTestTapped {
+    if (_blinkRunning) {
+        [self stopBlinkTest];
+    } else {
+        [self startBlinkTest];
+    }
+}
+
+// 采样点 y 候选(屏幕 16%/50%/84%), 避开面板/球(1.3.44 遮挡掩蔽: 采样点被
+// 面板盖住则本拍不检测 —— 色条在屏幕边缘, y 必须选不被悬浮 UI 挡的位置)
+- (CGFloat)vcamBlinkPickY {
+    CGRect sb = _overlayWindow.bounds;
+    CGRect avoidPanel = _panelView ? CGRectInset(_panelView.frame, -10, -10) : CGRectNull;
+    CGRect avoidBall = _ballView ? CGRectInset(_ballView.frame, -10, -10) : CGRectNull;
+    CGFloat cands[3] = {sb.size.height * 0.16, sb.size.height * 0.5, sb.size.height * 0.84};
+    for (int i = 0; i < 3; i++) {
+        CGPoint p = CGPointMake(kVcamBlinkBarW / 2.0, cands[i]);
+        if (!CGRectContainsPoint(avoidPanel, p) && !CGRectContainsPoint(avoidBall, p)) {
+            return cands[i];
+        }
+    }
+    return cands[0];
+}
+
+// 端到端验证打光链路: 左右色条 0.8s 轮换 6 彩色 → 取色检测采样 → .kdata1
+// 总线 → md 光快轮询 → 替换画面出现同色光斑。开始时确保检测开启; 采样点
+// 临时切到左色条(用户取色点默认屏幕中央, 采不到边缘色条), 停止时还原
+- (void)startBlinkTest {
+    _blinkRunning = YES;
+    [self vcamEnsureLightPipelineOn];
+    _blinkSavedPickX = gVcamPick.px;
+    _blinkSavedPickY = gVcamPick.py;
+    gVcamPick.px = kVcamBlinkBarW / 2.0;
+    gVcamPick.py = [self vcamBlinkPickY];
+    _pickSkipCount = 3;  // 色条首拍渲染完成前不采(残留误检防护)
+    [VCamNotify vcamPublishPickCfg:YES X:gVcamPick.px Y:gVcamPick.py];
+
+    if (!_blinkBarLeft) {
+        CGRect sb = _overlayWindow.bounds;
+        _blinkBarLeft = [[UIView alloc] initWithFrame:CGRectMake(0, 0, kVcamBlinkBarW, sb.size.height)];
+        _blinkBarRight = [[UIView alloc] initWithFrame:CGRectMake(sb.size.width - kVcamBlinkBarW, 0,
+                                                                  kVcamBlinkBarW, sb.size.height)];
+        // 纯显示不吞触摸(App 正常使用不受挡); z 序在面板/球之下(取色点同款锚法)
+        _blinkBarLeft.userInteractionEnabled = NO;
+        _blinkBarRight.userInteractionEnabled = NO;
+        if (_panelView) {
+            [_overlayWindow insertSubview:_blinkBarLeft belowSubview:_panelView];
+            [_overlayWindow insertSubview:_blinkBarRight belowSubview:_panelView];
+        } else {
+            [_overlayWindow addSubview:_blinkBarLeft];
+            [_overlayWindow addSubview:_blinkBarRight];
+        }
+    }
+    _blinkBarLeft.hidden = NO;
+    _blinkBarRight.hidden = NO;
+    _blinkColorIdx = 0;
+    [self blinkApplyColor];
+    _blinkTimer = [NSTimer scheduledTimerWithTimeInterval:0.8 target:self
+                                                 selector:@selector(blinkTick:)
+                                                 userInfo:nil repeats:YES];
+    [_blinkTestBtn setTitle:@"停止检测" forState:UIControlStateNormal];
+    vcam_ball_log(@"[vcam][light] blink test started -> color detect on");
+}
+
+- (void)blinkTick:(NSTimer *)t {
+    _blinkColorIdx = (_blinkColorIdx + 1) % 6;
+    [self blinkApplyColor];
+}
+
+- (void)blinkApplyColor {
+    UIColor *c = vcamBlinkUIColor(kVcamBlinkColors[_blinkColorIdx]);
+    _blinkBarLeft.backgroundColor = c;
+    _blinkBarRight.backgroundColor = c;
+}
+
+// 停止闪烁 = 色条隐藏, 检测保持全局运行(安卓语义), 光斑随 slot 宽限自然熄灭;
+// 采样点还原到用户原位置
+- (void)stopBlinkTest {
+    _blinkRunning = NO;
+    [_blinkTimer invalidate];
+    _blinkTimer = nil;
+    _blinkBarLeft.hidden = YES;
+    _blinkBarRight.hidden = YES;
+    gVcamPick.px = _blinkSavedPickX;
+    gVcamPick.py = _blinkSavedPickY;
+    _pickSkipCount = 3;
+    [VCamNotify vcamPublishPickCfg:YES X:gVcamPick.px Y:gVcamPick.py];
+    [_blinkTestBtn setTitle:@"打光检测" forState:UIControlStateNormal];
+    vcam_ball_log(@"[vcam][light] blink test stopped, light will clear via grace window");
 }
 
 // 取色点(空心准星): 中心透明设计 → 截屏采样不受自身污染
