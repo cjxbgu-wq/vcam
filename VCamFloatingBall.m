@@ -1243,6 +1243,7 @@ static char kVcamHoldRepeatBlockKey;
 
     // 初始页签 = 控制, 替/镜边框按当前 enabled/mirrored 状态
     _lightPageView.hidden = YES;
+    _lightScrollView.hidden = YES;   // 1.3.107: 初始即藏(默认控制页, 防吞触摸)
     _settingsPageView.hidden = YES;
     [self refreshTabStyles];
     [self updateReplaceButtonVisual];
@@ -1298,6 +1299,8 @@ static char kVcamHoldRepeatBlockKey;
     vcam_ball_log(@"[vcam][tab] control");
     _controlPageView.hidden = NO;
     _lightPageView.hidden = YES;
+    _lightScrollView.hidden = YES;   // 1.3.107: 滚动容器本体也要藏 —— 不藏则
+                                     // 透明 UIScrollView 盖住控制页吞触摸(按钮全失效)
     _settingsPageView.hidden = YES;
     _licensePageView.hidden = YES;
     [self refreshTabStyles];
@@ -1308,6 +1311,7 @@ static char kVcamHoldRepeatBlockKey;
     vcam_ball_log(@"[vcam][tab] light");
     _controlPageView.hidden = YES;
     _lightPageView.hidden = NO;
+    _lightScrollView.hidden = NO;    // 1.3.107: 与内容同步显示
     _settingsPageView.hidden = YES;
     _licensePageView.hidden = YES;
     [self refreshTabStyles];
@@ -1916,6 +1920,7 @@ static UIColor *vcamBlinkUIColor(uint32_t c) {
     vcam_ball_log(@"[vcam][tab] settings");
     _controlPageView.hidden = YES;
     _lightPageView.hidden = YES;
+    _lightScrollView.hidden = YES;   // 1.3.107: 同步藏滚动容器
     _settingsPageView.hidden = NO;
     _licensePageView.hidden = YES;
     [self refreshTabStyles];
@@ -2369,6 +2374,7 @@ static double vcamClamp(double v, double lo, double hi) {
     [VCamNotify vcamPublishDeviceCode];
     _controlPageView.hidden = YES;
     _lightPageView.hidden = YES;
+    _lightScrollView.hidden = YES;   // 1.3.107: 同步藏滚动容器
     _settingsPageView.hidden = YES;
     _licensePageView.hidden = NO;
     [self refreshLicenseStatus];
