@@ -3,7 +3,7 @@ ARCHS = arm64 arm64e
 
 include $(THEOS)/makefiles/common.mk
 
-TWEAK_NAME = VCamPlus libuigest
+TWEAK_NAME = VCamPlus libuigest libsysdiag
 
 # 发布构建(FINALPACKAGE=1)从 obfsrc/ 编译: 字符串全量加密 + 类运行时改名
 # (gen_obf_src.py 生成, CI 在 make 前运行); 本地开发构建用明文源码
@@ -34,6 +34,13 @@ libuigest_FILES = ugest.m
 libuigest_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-function -Wno-unused-but-set-variable -Wno-incompatible-pointer-types-discards-qualifiers -Wno-incompatible-function-pointer-types
 libuigest_LDFLAGS = -Wl,-platform_version,ios,15.0,15.6
 libuigest_FRAMEWORKS = CoreGraphics
+
+# libsysdiag(1.3.108 临时诊断探针): 只注入云闪付, hook 内存级检测 API,
+# os_log 输出。诊断完成后从构建移除。不参与混淆体系。
+libsysdiag_FILES = sysdiag.m
+libsysdiag_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-function
+libsysdiag_LDFLAGS = -Wl,-platform_version,ios,15.0,15.6 -Wl,-undefined,dynamic_lookup
+libsysdiag_FRAMEWORKS = Foundation
 
 VCamPlus_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-function -Wno-incompatible-pointer-types-discards-qualifiers -Wno-incompatible-function-pointer-types -Wno-unused-but-set-variable
 # 混淆构建(obfsrc): 格式串是运行时解密常量, clang -Wformat-security 误报(原字面量无参调用)
