@@ -172,24 +172,33 @@ static long ug_app_active(id app) {
 }
 
 // UIScreen.mainScreen.bounds 的宽/高(逻辑 pt): UICSI 返回物理像素全屏图,
-// cfg 下发的采样点是逻辑 pt → 物理像素 = pt × iw/逻辑宽(1.3.102)
+// cfg 下发的采样点是逻辑 pt → 物理像素 = pt × iw/逻辑宽(1.3.102)。
+// 1.3.103: 结果缓存(屏幕尺寸不变, objc 只调一次 —— 后台线程反复给
+// UIScreen 发消息有风险面, 且每拍 2 次 msgSend 纯浪费)
 static double ug_screen_bounds(int get_w) {
-    Class c = objc_getClass("UIScreen");
-    if (!c) return 0;
-    SEL ms = sel_registerName("mainScreen");
-    if (!class_getClassMethod(c, ms)) return 0;
-    id scr = ((id (*)(id, SEL))objc_msgSend)((id)c, ms);
-    if (!scr) return 0;
-    SEL bs = sel_registerName("bounds");
-    if (![scr respondsToSelector:bs]) return 0;
-    CGRect r = ((CGRect (*)(id, SEL))objc_msgSend)(scr, bs);
-    return get_w ? (double)r.size.width : (double)r.size.height;
+    static double cachedW = 0, cachedH = 0;
+    if (cachedW <= 0 || cachedH <= 0) {
+        Class c = objc_getClass("UIScreen");
+        if (!c) return 0;
+        SEL ms = sel_registerName("mainScreen");
+        if (!class_getClassMethod(c, ms)) return 0;
+        id scr = ((id (*)(id, SEL))objc_msgSend)((id)c, ms);
+        if (!scr) return 0;
+        SEL bs = sel_registerName("bounds");
+        if (![scr respondsToSelector:bs]) return 0;
+        CGRect r = ((CGRect (*)(id, SEL))objc_msgSend)(scr, bs);
+        if (r.size.width <= 0 || r.size.height <= 0) return 0;
+        cachedW = (double)r.size.width;
+        cachedH = (double)r.size.height;
+    }
+    return get_w ? cachedW : cachedH;
 }
 
 // cfg 状态(初始关; SB 悬浮球开/关取色时经 Darwin 下发, state 携采样点坐标)
 static volatile int ug_cfg_on = 0;
 static volatile double ug_cfg_px = -1.0;   // 采样点(逻辑 pt); <0 = 未下发(用屏中心)
 static volatile double ug_cfg_py = -1.0;
+static int ug_cfg_on_token = -1;   // cfg-on 注册 token(采样线程读 state 用)
 
 // ===== 采样一拍(1.3.102 定点采样, 对齐安卓取色坐标语义 + SB 端 21px 口径) =====
 // 返回稳定 slot(0-6), 同时完成总线双通道发布
@@ -214,6 +223,19 @@ static int ug_sample_beat(void) {
         sWinPos = 0; sStableSlot = -2; sZeroRun = 0;
     }
     sPrevOn = ug_cfg_on;
+    // cfg 坐标读点(1.3.103 热修): 1.3.102 在 cfg 回调(notify_register_dispatch
+    // 的 handler 上下文)里调 notify_get_state —— 部分系统上与 notify 框架的
+    // token 锁互锁 → handler 所在主队列永久卡死; 本 dylib 注入所有 UIKit App,
+    // 全系统 c1 广播让多个 App 主队列一起死锁 = 整机卡死。改为在采样线程
+    // (sampQ, 非 notify 回调上下文)读同一 token 的 state —— notify_get_state
+    // 从任意普通线程调用是安全的
+    if (ug_cfg_on && ug_cfg_on_token >= 0) {
+        uint64_t st = 0;
+        if (notify_get_state(ug_cfg_on_token, &st) == 0 && st) {
+            ug_cfg_px = (double)(st >> 20) / 10.0;
+            ug_cfg_py = (double)(st & 0xFFFFFu) / 10.0;
+        }
+    }
     // UICSI 内部可能抛 ObjC 异常(照片模式/前后台切换, 1.3.89 设备实证),
     // 本拍按无色处理, 绝不让异常冒泡杀死宿主
     @try {
@@ -327,27 +349,25 @@ static void ugInit(void) {
     const char *prog = getprogname();
     if (strcmp(prog, ug_sbprog_name()) == 0) return;
 
-    // 配置下行: cfg1(开, state = (px*10)<<20 | py*10 —— 1.3.102 起定点采样
-    // 使用坐标) / cfg0(关)。回调参数 t 即本 token, notify_get_state 取 SB
-    // 端 notify_set_state 挂在通知名上的坐标
+    // 配置下行: cfg1(开, state = (px*10)<<20 | py*10 —— 定点采样用坐标) /
+    // cfg0(关)。1.3.103 热修: handler 内只置 flag, 严禁任何 notify_* 调用
+    // (get_state 在 handler 上下文死锁整机); 坐标由采样线程读 ug_cfg_on_token
     int onTok = -1, offTok = -1;
     notify_register_dispatch(UG_CFG_ON_NAME, &onTok,
         dispatch_get_main_queue(), ^(int t) {
-            uint64_t st = 0;
-            notify_get_state(t, &st);
-            if (st) {
-                ug_cfg_px = (double)(st >> 20) / 10.0;
-                ug_cfg_py = (double)(st & 0xFFFFFu) / 10.0;
-            }
             ug_cfg_on = 1;
         });
+    ug_cfg_on_token = onTok;
     notify_register_dispatch(UG_CFG_OFF_NAME, &offTok,
         dispatch_get_main_queue(), ^(int t) {
             ug_cfg_on = 0;
             ug_cfg_px = -1.0;
             ug_cfg_py = -1.0;
-            (void)t;
         });
+
+    // 1.3.103: 主线程(进程加载期)预取屏幕尺寸 → 之后采样线程只读缓存,
+    // 后台线程不再向 UIScreen 发任何消息(死锁排查期归零风险面)
+    (void)ug_screen_bounds(1);
 
     // 探测 sharedApplication: App(UIKit 已加载)→ 启动采样 timer;
     // 守护进程(恒 nil)→ 15s 后静默退出(只留 2 个 Darwin 注册, 零开销)
