@@ -31,6 +31,14 @@
 //    抖; 6 拍 4 票滑窗翻转 ~320ms → 换色后旧色光斑残留(闪旧色)。定点后: 区域
 //    纯色噪声极低, 窗口缩 4 拍 3 票(≤240ms), cfg 重开清窗防旧状态残留。
 //
+//  1.3.103 notify 死锁热修: cfg 回调(handler 上下文)调 notify_get_state 与
+//    notify 框架 token 锁互锁 → 注入所有 UIKit App 时全系统广播 = 整机卡死;
+//    改为 handler 只置 flag, 采样线程(sampQ)持 token 读 state。
+//    但同版在 constructor 里加了 UIScreen 预取 → main() 前主线程访问 UIScreen
+//    与 SpringBoard 渲染服务应答互等 → 相机等 App 启动 20s watchdog 击杀(全黑)。
+//  1.3.104 相机全黑热修: 删除 constructor 预取, 屏参获取挪到 probe 块确认
+//    sharedApplication 之后(主队列 + runloop 已运转的安全时机), sampQ 只读缓存。
+//
 
 #include <dispatch/dispatch.h>
 #include <notify.h>
@@ -173,8 +181,9 @@ static long ug_app_active(id app) {
 
 // UIScreen.mainScreen.bounds 的宽/高(逻辑 pt): UICSI 返回物理像素全屏图,
 // cfg 下发的采样点是逻辑 pt → 物理像素 = pt × iw/逻辑宽(1.3.102)。
-// 1.3.103: 结果缓存(屏幕尺寸不变, objc 只调一次 —— 后台线程反复给
-// UIScreen 发消息有风险面, 且每拍 2 次 msgSend 纯浪费)
+// 1.3.103/104: 结果缓存(屏幕尺寸不变, objc 只调一次)。缓存填充时机 =
+// probe 块确认 App 运行后(主队列安全时机); 严禁 constructor 期调用 ——
+// main() 前主线程 UIScreen 访问会与 SpringBoard 应答互等死锁(1.3.103 事故)
 static double ug_screen_bounds(int get_w) {
     static double cachedW = 0, cachedH = 0;
     if (cachedW <= 0 || cachedH <= 0) {
@@ -365,9 +374,12 @@ static void ugInit(void) {
             ug_cfg_py = -1.0;
         });
 
-    // 1.3.103: 主线程(进程加载期)预取屏幕尺寸 → 之后采样线程只读缓存,
-    // 后台线程不再向 UIScreen 发任何消息(死锁排查期归零风险面)
-    (void)ug_screen_bounds(1);
+    // 1.3.104: 删除 constructor 里的 UIScreen 预取(1.3.103 事故) —— constructor
+    // 在 main() 之前于主线程执行, 此时 UIApplication 尚未建立, UIScreen 初始化
+    // 需连 SpringBoard 渲染服务并等其应答, 而应答的派发依赖本进程主 runloop
+    // (尚未起) → 鸡生蛋互等, 主线程永久阻塞, 相机等 UIKit App 启动 20s 被
+    // watchdog 击杀(全黑)。屏参获取挪到下方 probe 块: sharedApplication 探测
+    // 成功后再取(主队列 + runloop 已运转, 安全时机)。
 
     // 探测 sharedApplication: App(UIKit 已加载)→ 启动采样 timer;
     // 守护进程(恒 nil)→ 15s 后静默退出(只留 2 个 Darwin 注册, 零开销)
@@ -375,6 +387,9 @@ static void ugInit(void) {
     __block void (^probe)(void) = ^(void) {
         id app = ug_shared_app();
         if (app) {
+            // 1.3.104: App 已确认运行(主队列, runloop 已转) → 此处取屏参一次并
+            // 缓存, 安全且采样线程(sampQ)此后只读缓存、不再碰 UIScreen
+            (void)ug_screen_bounds(1);
             // App 进程: 主队列 12.5Hz timer(1.3.77 降频口径)
             dispatch_queue_t sampQ = dispatch_queue_create(NULL, DISPATCH_QUEUE_SERIAL);
             dispatch_source_t timer = dispatch_source_create(
