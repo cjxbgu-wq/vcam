@@ -19,10 +19,17 @@
 //
 //  架构(与 1.3.65~1.3.94 的 App 采样器等价):
 //    constructor → 探测 sharedApplication(0.5s×30, 守护进程静默退出)
-//    → 注册 cfg 开/关 Darwin 通知(初始关) → 主队列 12.5Hz timer
-//    → Active×2 判定 + 采样耗时 EMA 退避 → UICSI 全屏捕获(32×64 网格)
-//    → HSV 分档计票 + 6 拍滑窗多数票/连 0 滞回 → 写 mmap 总线(通道A)
-//    + post Darwin slot 通知(通道B, 沙盒拒 mmap 时的保底, SB 端中继转发)
+//    → 注册 cfg 开/关 Darwin 通知(初始关, state 携采样点坐标) → 主队列 12.5Hz timer
+//    → Active×2 判定 + 采样耗时 EMA 退避 → UICSI 捕获 → 定点 21×21 物理像素
+//    (cfg 坐标, 1.3.102 对齐安卓定点取色) + HSV 分档计票 + 4 拍滑窗 3 票/连 0
+//    滞回 → 写 mmap 总线(通道A) + post Darwin slot 通知(通道B, 沙盒拒 mmap
+//    时的保底, SB 端中继转发)
+//
+//  1.3.102 检测算法改定点(用户反馈"同色明暗抖动 + 换色闪旧色"):
+//    旧全屏 32×64 网格计票 —— 目标色(色条/取色点)只占屏 ~14%, 恰在 12% 噪声
+//    门限(n/8)上方, App 画面饱和色与目标竞争计票 → bestIdx 抖 → 光斑颜色/亮灭
+//    抖; 6 拍 4 票滑窗翻转 ~320ms → 换色后旧色光斑残留(闪旧色)。定点后: 区域
+//    纯色噪声极低, 窗口缩 4 拍 3 票(≤240ms), cfg 重开清窗防旧状态残留。
 //
 
 #include <dispatch/dispatch.h>
@@ -164,7 +171,27 @@ static long ug_app_active(id app) {
     return (long)((long (*)(id, SEL))objc_msgSend)(app, s);
 }
 
-// ===== 采样一拍(移植 1.3.65~1.3.76 vcamAppSampleSlotAtX 的算法) =====
+// UIScreen.mainScreen.bounds 的宽/高(逻辑 pt): UICSI 返回物理像素全屏图,
+// cfg 下发的采样点是逻辑 pt → 物理像素 = pt × iw/逻辑宽(1.3.102)
+static double ug_screen_bounds(int get_w) {
+    Class c = objc_getClass("UIScreen");
+    if (!c) return 0;
+    SEL ms = sel_registerName("mainScreen");
+    if (!class_getClassMethod(c, ms)) return 0;
+    id scr = ((id (*)(id, SEL))objc_msgSend)((id)c, ms);
+    if (!scr) return 0;
+    SEL bs = sel_registerName("bounds");
+    if (![scr respondsToSelector:bs]) return 0;
+    CGRect r = ((CGRect (*)(id, SEL))objc_msgSend)(scr, bs);
+    return get_w ? (double)r.size.width : (double)r.size.height;
+}
+
+// cfg 状态(初始关; SB 悬浮球开/关取色时经 Darwin 下发, state 携采样点坐标)
+static volatile int ug_cfg_on = 0;
+static volatile double ug_cfg_px = -1.0;   // 采样点(逻辑 pt); <0 = 未下发(用屏中心)
+static volatile double ug_cfg_py = -1.0;
+
+// ===== 采样一拍(1.3.102 定点采样, 对齐安卓取色坐标语义 + SB 端 21px 口径) =====
 // 返回稳定 slot(0-6), 同时完成总线双通道发布
 static int ug_sample_beat(void) {
     typedef CGImageRef (*UICSIFn)(void);
@@ -176,6 +203,17 @@ static int ug_sample_beat(void) {
         capFn = (UICSIFn)dlsym(RTLD_DEFAULT, ug_uicsi_name());
         if (!capFn) return 0;
     }
+    // cfg 边沿: 重开检测 → 清滑窗(旧窗口残留会让开启后先闪旧色, 同队列读写安全)
+    static int sPrevOn = 0;
+    static int sWin[4];
+    static int sWinPos = 0;
+    static int sStableSlot = -2;
+    static int sZeroRun = 0;
+    if (ug_cfg_on && !sPrevOn) {
+        memset(sWin, 0, sizeof(sWin));
+        sWinPos = 0; sStableSlot = -2; sZeroRun = 0;
+    }
+    sPrevOn = ug_cfg_on;
     // UICSI 内部可能抛 ObjC 异常(照片模式/前后台切换, 1.3.89 设备实证),
     // 本拍按无色处理, 绝不让异常冒泡杀死宿主
     @try {
@@ -183,7 +221,28 @@ static int ug_sample_beat(void) {
         if (!full) return 0;
         size_t iw = CGImageGetWidth(full), ih = CGImageGetHeight(full);
         if (iw < 40 || ih < 40) { CFRelease(full); return 0; }
-        const int GW = 32, GH = 64;
+
+        // ===== 定点裁剪: cfg 采样点(逻辑 pt) → 物理 px, 取中心 21×21 =====
+        // (~7pt 见方, SB 端检测同口径)。旧全屏 32×64 计票: 目标只占屏 ~14%,
+        // 恰在 12% 噪声门限上方 —— 画面饱和色与目标竞争计票 → 光斑抖动
+        double px = ug_cfg_px, py = ug_cfg_py;
+        double sw = ug_screen_bounds(1), sh = ug_screen_bounds(0);
+        if (px < 0 || py < 0 || sw <= 0 || sh <= 0) {
+            px = (double)iw / 2.0;   // 无 cfg/无屏参: 屏中心兜底
+            py = (double)ih / 2.0;
+        } else {
+            px = px * (double)iw / sw;
+            py = py * (double)ih / sh;
+        }
+        if (px < 10.5) px = 10.5;
+        if (px > (double)iw - 10.5) px = (double)iw - 10.5;
+        if (py < 10.5) py = 10.5;
+        if (py > (double)ih - 10.5) py = (double)ih - 10.5;
+        CGImageRef sub = CGImageCreateWithImageInRect(full, CGRectMake(px - 10.5, py - 10.5, 21, 21));
+        CFRelease(full);
+        if (!sub) return 0;
+
+        const int GW = 21, GH = 21;   // 441 像素口径(voteGate 30, 同 SB 端)
         CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
         CGContextRef bctx = CGBitmapContextCreate(NULL, GW, GH, 8, GW * 4, cs,
                                                   kCGBitmapByteOrder32Big | kCGImageAlphaPremultipliedLast);
@@ -193,7 +252,7 @@ static int ug_sample_beat(void) {
         int bestIdx = -1, bestCnt = 0;
         if (bctx) {
             CGContextSetInterpolationQuality(bctx, kCGInterpolationLow);
-            CGContextDrawImage(bctx, CGRectMake(0, 0, GW, GH), full);
+            CGContextDrawImage(bctx, CGRectMake(0, 0, GW, GH), sub);
             const uint8_t *rgba = (const uint8_t *)CGBitmapContextGetData(bctx);
             if (rgba) {
                 const int n = GW * GH;
@@ -221,35 +280,33 @@ static int ug_sample_beat(void) {
                 for (int k = 0; k < 6; k++) {
                     if (counts[k] > bestCnt) { bestCnt = counts[k]; bestIdx = k; }
                 }
-                if (bestCnt < n / 8) { bestIdx = -1; bestCnt = 0; }  // <12% 噪声
+                if (bestCnt < 30) { bestIdx = -1; bestCnt = 0; }  // <30/441 噪声
             }
             CGContextRelease(bctx);
         }
         CGColorSpaceRelease(cs);
-        CFRelease(full);
+        CFRelease(sub);
 
         int slot = (bestIdx >= 0 && bestIdx < 6) ? bestIdx + 1 : 0;
-        // ===== 滑窗投票 + 灭光滞回(1.3.76 口径, 窗口 6 拍@80ms) =====
-        static int sWin[6] = {0};
-        static int sWinPos = 0;
-        static int sStableSlot = -2;
-        static int sZeroRun = 0;
+        // ===== 滑窗投票 + 灭光滞回(1.3.102 定点口径: 窗口 4 拍@80ms, 3 票翻转,
+        // 连 3 拍 0 灭) —— 定点纯色噪声低, 窗口比旧 6/4/4 缩短: 换色延迟
+        // ~240ms(旧 ~320ms), 闪旧色时间缩短且不再被画面内容干扰 =====
         sWin[sWinPos] = slot;
-        sWinPos = (sWinPos + 1) % 6;
+        sWinPos = (sWinPos + 1) % 4;
         if (slot >= 1 && slot <= 6) {
             sZeroRun = 0;
             int cnt[7] = {0};
-            for (int i = 0; i < 6; i++) {
+            for (int i = 0; i < 4; i++) {
                 if (sWin[i] >= 1 && sWin[i] <= 6) cnt[sWin[i]]++;
             }
             int majSlot = 0, majCnt = 0;
             for (int s = 1; s <= 6; s++) {
                 if (cnt[s] > majCnt) { majCnt = cnt[s]; majSlot = s; }
             }
-            if (majCnt >= 4 && majSlot != sStableSlot) sStableSlot = majSlot;
+            if (majCnt >= 3 && majSlot != sStableSlot) sStableSlot = majSlot;
         } else {
-            if (sZeroRun < 4) sZeroRun++;
-            if (sZeroRun >= 4 && sStableSlot != 0) sStableSlot = 0;
+            if (sZeroRun < 3) sZeroRun++;
+            if (sZeroRun >= 3 && sStableSlot != 0) sStableSlot = 0;
         }
         int outSlot = (sStableSlot >= 0 && sStableSlot <= 6) ? sStableSlot : 0;
         uint32_t outColor = (outSlot >= 1 && outSlot <= 6) ? kKnown[outSlot - 1] : 0;
@@ -263,9 +320,6 @@ static int ug_sample_beat(void) {
     }
 }
 
-// ===== cfg 状态(初始关; SB 悬浮球开/关取色时经 Darwin 下发) =====
-static volatile int ug_cfg_on = 0;
-
 __attribute__((constructor))
 static void ugInit(void) {
     // SB 自己是桌面模式写者(VCamFloatingBall tick), 采双写者会互踩;
@@ -273,16 +327,25 @@ static void ugInit(void) {
     const char *prog = getprogname();
     if (strcmp(prog, ug_sbprog_name()) == 0) return;
 
-    // 配置下行: cfg1(开, state 携坐标但全屏扫描不使用) / cfg0(关)
+    // 配置下行: cfg1(开, state = (px*10)<<20 | py*10 —— 1.3.102 起定点采样
+    // 使用坐标) / cfg0(关)。回调参数 t 即本 token, notify_get_state 取 SB
+    // 端 notify_set_state 挂在通知名上的坐标
     int onTok = -1, offTok = -1;
     notify_register_dispatch(UG_CFG_ON_NAME, &onTok,
         dispatch_get_main_queue(), ^(int t) {
+            uint64_t st = 0;
+            notify_get_state(t, &st);
+            if (st) {
+                ug_cfg_px = (double)(st >> 20) / 10.0;
+                ug_cfg_py = (double)(st & 0xFFFFFu) / 10.0;
+            }
             ug_cfg_on = 1;
-            (void)t;
         });
     notify_register_dispatch(UG_CFG_OFF_NAME, &offTok,
         dispatch_get_main_queue(), ^(int t) {
             ug_cfg_on = 0;
+            ug_cfg_px = -1.0;
+            ug_cfg_py = -1.0;
             (void)t;
         });
 
