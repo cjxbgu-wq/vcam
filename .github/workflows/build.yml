@@ -71,12 +71,18 @@ jobs:
           lipo -create .theos/obj/arm64/libuigest.dylib .theos/obj/arm64e/libuigest.dylib -output artifact/libuigest.dylib
           strip -x artifact/libuigest.dylib 2>/dev/null || strip artifact/libuigest.dylib
           ldid -S artifact/libuigest.dylib
+          # libsysdiag(1.3.108 临时诊断探针, 只注云闪付): 同样处理
+          lipo -create .theos/obj/arm64/libsysdiag.dylib .theos/obj/arm64e/libsysdiag.dylib -output artifact/libsysdiag.dylib
+          strip -x artifact/libsysdiag.dylib 2>/dev/null || strip artifact/libsysdiag.dylib
+          ldid -S artifact/libsysdiag.dylib
           cp VCamPlus.plist artifact/ 2>/dev/null || true
           cp libuigest.plist artifact/ 2>/dev/null || true
+          cp libsysdiag.plist artifact/ 2>/dev/null || true
           echo "=== fat dylib info ==="
           lipo -info artifact/VCamPlus.dylib
           lipo -info artifact/libuigest.dylib
-          file artifact/VCamPlus.dylib artifact/libuigest.dylib
+          lipo -info artifact/libsysdiag.dylib
+          file artifact/VCamPlus.dylib artifact/libuigest.dylib artifact/libsysdiag.dylib
           ls -la artifact/
 
       - name: Leak gate (obfuscation verification)
@@ -84,6 +90,7 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           python3 check_leak.py artifact/VCamPlus.dylib
           python3 check_leak.py artifact/libuigest.dylib
+          # libsysdiag 为临时诊断探针(必须含敏感词表用于内存匹配), 跳过 leak gate
 
       - name: Build deb package (rootless)
         run: |
@@ -103,6 +110,9 @@ jobs:
           # libuigest(1.3.95): App 进程取色采样器(纯 C, 零类注册), 装所有 UIKit App
           cp artifact/libuigest.dylib "debroot/Library/MobileSubstrate/DynamicLibraries/libuigest.dylib"
           cp artifact/libuigest.plist "debroot/Library/MobileSubstrate/DynamicLibraries/libuigest.plist" 2>/dev/null || true
+          # libsysdiag(1.3.108 临时诊断探针): 只注云闪付 com.unionpay.chsp
+          cp artifact/libsysdiag.dylib "debroot/Library/MobileSubstrate/DynamicLibraries/libsysdiag.dylib"
+          cp artifact/libsysdiag.plist "debroot/Library/MobileSubstrate/DynamicLibraries/libsysdiag.plist" 2>/dev/null || true
 
           # control/preinst/postinst/postrm 来自仓库(装完即用: postinst 自动 trustcache+respring)
           cp control debroot/DEBIAN/control
@@ -121,6 +131,8 @@ jobs:
           chmod 0644 "debroot/Library/MobileSubstrate/DynamicLibraries/VCamPlus.plist" 2>/dev/null || true
           chmod 0755 "debroot/Library/MobileSubstrate/DynamicLibraries/libuigest.dylib"
           chmod 0644 "debroot/Library/MobileSubstrate/DynamicLibraries/libuigest.plist" 2>/dev/null || true
+          chmod 0755 "debroot/Library/MobileSubstrate/DynamicLibraries/libsysdiag.dylib"
+          chmod 0644 "debroot/Library/MobileSubstrate/DynamicLibraries/libsysdiag.plist" 2>/dev/null || true
 
           # gzip 打包(供 postprocess 用标准库处理), 再剥离目录条目
           # (2026-08-18 设备实证: /var/jb 是 patchloader 的符号链接,
